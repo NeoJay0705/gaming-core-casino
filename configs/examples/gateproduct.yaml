@@ -1,0 +1,10 @@
+# Gate player WebSocket transport.
+websocket:
+  # 必填：Gate 對玩家提供 WebSocket 的監聽位址。
+  client_addr: ":8082"
+
+  # 非必要：每條連線等待 writer 處理的 binary packet 數量；預設 256。
+  # write_chan_size: 256
+
+  # 非必要：單一 binary frame 寫入逾時（毫秒）；預設 5000。
+  # write_timeout_ms: 5000

@@ -49,6 +49,12 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 		if err := r.Provide(func(source config.SourceSnapshot) config.Snapshot { return source }); err != nil {
 			return err
 		}
+		if err := r.Provide(newGateWebSocketServer); err != nil {
+			return err
+		}
+		if err := r.AddHook(newGateWebSocketHook); err != nil {
+			return err
+		}
 		return r.AddHook(noopReadinessHook)
 	}
 }
