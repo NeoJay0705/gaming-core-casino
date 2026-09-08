@@ -1,0 +1,51 @@
+# 共用基礎設施設定；實際服務只會在其 DI graph 使用到資源時才連線。
+
+redis:
+  # 必填：single Redis 設定 addr；和 addrs 只能擇一。
+  addr: "redis:6379"
+
+  # Cluster Redis 改用 addrs，並移除上方 addr。
+  # addrs:
+  #   - "redis-0:6379"
+  #   - "redis-1:6379"
+  #   - "redis-2:6379"
+
+  # 非必要：Redis ACL 使用者與密碼；請透過部署環境覆蓋敏感值。
+  # username: ""
+  # password: ""
+
+  # 非必要：single mode 的 logical DB，預設 0；cluster mode 固定只能是 0。
+  # db: 0
+
+  # 非必要：go-redis connection pool 設定。
+  # pool_size: 100
+  # min_idle_conns: 10
+  # max_idle_conns: 20
+  # pool_timeout: "4s"
+  # dial_timeout: "5s"
+  # read_timeout: "5s"
+  # write_timeout: "5s"
+  # conn_max_idle_time: "5m"
+  # conn_max_lifetime: "30m"
+
+database:
+  # 必填：MySQL/TiDB DSN；請透過部署環境覆蓋帳密。
+  dsn: "app:change-me@tcp(tidb:4000)/gaming?charset=utf8mb4&parseTime=true&loc=UTC"
+
+  # 非必要：database/sql connection pool 設定。
+  # max_open_conns: 100
+  # max_idle_conns: 10
+  # conn_max_lifetime: "30m"
+  # conn_max_idle_time: "5m"
+
+rocketmq:
+  # 必填：RocketMQ 4 nameserver；可用逗號或分號指定多個 host:port。
+  endpoint: "rocketmq-namesrv:9876"
+
+  # 非必要：預設不 retry；只有 consumer 已實作冪等處理時才可提高。
+  # producer_retry_times: 0
+
+  # 非必要：RocketMQ namespace 與 ACL；請透過部署環境覆蓋敏感值。
+  # namespace: ""
+  # access_key: ""
+  # secret_key: ""

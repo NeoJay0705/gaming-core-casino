@@ -8,6 +8,7 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/internal/appbootstrap"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/infra"
 )
 
 type AppOptions struct {
@@ -47,6 +48,9 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 			return err
 		}
 		if err := r.Provide(func(source config.SourceSnapshot) config.Snapshot { return source }); err != nil {
+			return err
+		}
+		if err := infra.Module(r); err != nil {
 			return err
 		}
 		if err := r.Provide(newGateWebSocketServer); err != nil {
