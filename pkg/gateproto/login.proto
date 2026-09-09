@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package gateproto.v1;
+
+option go_package = "github.com/NeoJay0705/gaming-core-casino/pkg/gateproto";
+
+// LoginRequest is the client-to-Gate login payload. Field numbers use the
+// expected legacy Gate protocol values; byte-level compatibility still needs
+// verification against captured legacy fixtures. Authentication is deliberately
+// outside this transport contract.
+message LoginRequest {
+  string login_name = 1;
+  string token = 2;
+  uint32 device_type = 3;
+  string app_version = 4;
+  string phone_type = 5;
+  string phone_name = 6;
+  string phone_os = 7;
+  string browser = 8;
+  string net_type = 9;
+  string screen_resolution = 10;
+  string width_height = 11;
+  string language = 12;
+  // vid keeps the legacy C_LOGIN_REQ field name and wire number. Its business
+  // meaning is intentionally not inferred by this transport-only contract.
+  string vid = 13;
+  string web_channel = 14;
+  string web_site = 15;
+}
+
+// LoginResponse is the Gate-to-client login result. Its field numbers use the
+// expected legacy C_LOGIN_RSP values; byte-level compatibility still needs
+// verification against captured legacy fixtures.
+message LoginResponse {
+  uint32 code = 1;
+  uint64 server_time = 2;
+  uint32 user_flag = 3;
+  double account = 4;
+  string currency = 5;
+  string nickname = 6;
+  uint32 gender = 7;
+  string region = 8;
+  string last_customer_number = 9;
+  bytes session = 10;
+  uint32 confirm = 11;
+  string head_icon = 12;
+  uint32 vip = 13;
+}

@@ -62,6 +62,9 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 		if err := dispatcher.Module(r); err != nil {
 			return err
 		}
+		if err := r.Provide(NewSessionRegistry); err != nil {
+			return err
+		}
 		if err := infra.Module(r); err != nil {
 			return err
 		}

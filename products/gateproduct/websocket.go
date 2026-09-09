@@ -60,12 +60,20 @@ type WebSocketSession interface {
 	SendBinary([]byte) error
 }
 
+// ClosableWebSocketSession is a WebSocket session whose lifecycle can be
+// controlled by the Gate session registry.
+type ClosableWebSocketSession interface {
+	WebSocketSession
+	Close() error
+}
+
 type webSocketServerInputs struct {
 	dig.In
 
 	Snapshot   config.SourceSnapshot
 	Dispatcher *dispatcher.Dispatcher
 	GameClient *gatelink.Client
+	Sessions   *SessionRegistry
 }
 
 // WebSocketServer owns the Gate player-facing WebSocket listener.
@@ -75,6 +83,7 @@ type WebSocketServer struct {
 	enabled    bool
 	dispatcher *dispatcher.Dispatcher
 	gameClient *gatelink.Client
+	registry   *SessionRegistry
 
 	mu       sync.Mutex
 	server   *http.Server
@@ -89,12 +98,16 @@ func newGateWebSocketServer(inputs webSocketServerInputs) (*WebSocketServer, err
 		sessions:   make(map[WebSocketConnectionID]*webSocketConnection),
 		dispatcher: inputs.Dispatcher,
 		gameClient: inputs.GameClient,
+		registry:   inputs.Sessions,
 	}
 	if server.dispatcher == nil {
 		return nil, errors.New("gate websocket: dispatcher is nil")
 	}
 	if server.gameClient == nil {
 		return nil, errors.New("gate websocket: Game client is nil")
+	}
+	if server.registry == nil {
+		return nil, errors.New("gate websocket: session registry is nil")
 	}
 	if inputs.Snapshot == nil {
 		return nil, fmt.Errorf("gate websocket: config snapshot is nil")
@@ -276,6 +289,7 @@ func (s *WebSocketServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (s *WebSocketServer) serveSession(session *webSocketConnection) {
 	defer s.wg.Done()
+	defer s.registry.Remove(session)
 	writerDone := make(chan struct{})
 	go func() {
 		session.writeLoop()
@@ -408,6 +422,20 @@ func (s *webSocketConnection) SendBinary(data []byte) error {
 	default:
 		return errWebSocketWriteQueueFull
 	}
+}
+
+// Close closes this session and cancels all work derived from its context.
+func (s *webSocketConnection) Close() error { return s.close() }
+
+func encodeWebSocketPacket(packet WebSocketPacket) []byte {
+	data := make([]byte, webSocketPacketHeaderSize+len(packet.Payload))
+	binary.BigEndian.PutUint32(data[0:4], packet.CommandID)
+	binary.BigEndian.PutUint32(data[4:8], uint32(len(data)))
+	binary.BigEndian.PutUint32(data[8:12], packet.Sequence)
+	binary.BigEndian.PutUint16(data[12:14], packet.Session)
+	binary.BigEndian.PutUint16(data[14:16], packet.Version)
+	copy(data[webSocketPacketHeaderSize:], packet.Payload)
+	return data
 }
 
 func (s *webSocketConnection) close() error {

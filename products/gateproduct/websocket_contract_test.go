@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -178,6 +179,114 @@ func TestGateWebSocketContractForwardsUnhandledCommandToGame(t *testing.T) {
 	}
 }
 
+func TestGateWebSocketContractBroadcastsAndKicksRegisteredSessions(t *testing.T) {
+	app, server, sessions, registered := newStartedSessionRegistryTestApp(t, writeWebSocketConfig(t))
+	t.Cleanup(func() { _ = app.frameworkApp.Stop(context.Background()) })
+
+	alice, _, err := websocket.DefaultDialer.Dial("ws://"+server.Addr()+"/ws", nil)
+	if err != nil {
+		t.Fatalf("dial alice: %v", err)
+	}
+	defer alice.Close()
+	bob, _, err := websocket.DefaultDialer.Dial("ws://"+server.Addr()+"/ws", nil)
+	if err != nil {
+		t.Fatalf("dial bob: %v", err)
+	}
+	defer bob.Close()
+	registerSession(t, alice, "alice", registered)
+	registerSession(t, bob, "bob", registered)
+	for _, loginName := range []LoginName{"alice", "bob"} {
+		if err := sessions.EnterRoom(loginName, "room-a"); err != nil {
+			t.Fatalf("enter room for %s: %v", loginName, err)
+		}
+	}
+	packet := encodeWebSocketPacket(WebSocketPacket{CommandID: 0xE10006, Payload: []byte("room-broadcast")})
+	if delivered, err := sessions.BroadcastRoom("room-a", packet); err != nil || delivered != 2 {
+		t.Fatalf("broadcast room = delivered:%d error:%v, want 2/nil", delivered, err)
+	}
+	assertWebSocketPacket(t, alice, packet)
+	assertWebSocketPacket(t, bob, packet)
+	if err := sessions.KickLoginName("alice"); err != nil {
+		t.Fatalf("kick alice: %v", err)
+	}
+	assertWebSocketClosed(t, alice)
+	packet = encodeWebSocketPacket(WebSocketPacket{CommandID: 0xE10006, Payload: []byte("bob-only")})
+	if delivered, err := sessions.BroadcastRoom("room-a", packet); err != nil || delivered != 1 {
+		t.Fatalf("broadcast after alice kick = delivered:%d error:%v, want 1/nil", delivered, err)
+	}
+	assertWebSocketPacket(t, bob, packet)
+	if kicked, err := sessions.KickRoom("room-a"); err != nil || kicked != 1 {
+		t.Fatalf("kick room = kicked:%d error:%v, want 1/nil", kicked, err)
+	}
+	assertWebSocketClosed(t, bob)
+}
+
+func TestGateWebSocketContractCleansRegisteredSessionAfterDisconnect(t *testing.T) {
+	app, server, sessions, registered := newStartedSessionRegistryTestApp(t, writeWebSocketConfig(t))
+	t.Cleanup(func() { _ = app.frameworkApp.Stop(context.Background()) })
+	conn, _, err := websocket.DefaultDialer.Dial("ws://"+server.Addr()+"/ws", nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	registerSession(t, conn, "alice", registered)
+	if err := conn.Close(); err != nil {
+		t.Fatalf("close client: %v", err)
+	}
+	assertSessionRemoved(t, sessions, "alice")
+}
+
+func TestGateWebSocketContractCleansRegisteredSessionOnApplicationStop(t *testing.T) {
+	app, server, sessions, registered := newStartedSessionRegistryTestApp(t, writeWebSocketConfig(t))
+	t.Cleanup(func() { _ = app.frameworkApp.Stop(context.Background()) })
+	conn, _, err := websocket.DefaultDialer.Dial("ws://"+server.Addr()+"/ws", nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	registerSession(t, conn, "alice", registered)
+	if err := sessions.EnterRoom("alice", "room-a"); err != nil {
+		t.Fatalf("enter room: %v", err)
+	}
+	if err := app.frameworkApp.Stop(context.Background()); err != nil {
+		t.Fatalf("stop app: %v", err)
+	}
+	assertSessionRemoved(t, sessions, "alice")
+	assertRoomMemberRemoved(t, sessions, "alice", "room-a")
+	assertWebSocketClosed(t, conn)
+}
+
+func TestEncodeWebSocketPacketContract(t *testing.T) {
+	packet := WebSocketPacket{
+		CommandID: 0xE10004,
+		Sequence:  17,
+		Session:   23,
+		Version:   5,
+		Payload:   []byte("response"),
+	}
+	data := encodeWebSocketPacket(packet)
+	if got, want := len(data), webSocketPacketHeaderSize+len(packet.Payload); got != want {
+		t.Fatalf("packet length = %d, want %d", got, want)
+	}
+	if got := binary.BigEndian.Uint32(data[0:4]); got != packet.CommandID {
+		t.Fatalf("command id = %#x, want %#x", got, packet.CommandID)
+	}
+	if got := binary.BigEndian.Uint32(data[4:8]); got != uint32(len(data)) {
+		t.Fatalf("declared packet length = %d, want %d", got, len(data))
+	}
+	if got := binary.BigEndian.Uint32(data[8:12]); got != packet.Sequence {
+		t.Fatalf("sequence = %d, want %d", got, packet.Sequence)
+	}
+	if got := binary.BigEndian.Uint16(data[12:14]); got != packet.Session {
+		t.Fatalf("session = %d, want %d", got, packet.Session)
+	}
+	if got := binary.BigEndian.Uint16(data[14:16]); got != packet.Version {
+		t.Fatalf("version = %d, want %d", got, packet.Version)
+	}
+	if got := data[webSocketPacketHeaderSize:]; string(got) != string(packet.Payload) {
+		t.Fatalf("payload = %q, want %q", got, packet.Payload)
+	}
+}
+
 func TestNewAppRejectsConfiguredWebSocketWithoutClientAddr(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "gate.yaml")
 	if err := os.WriteFile(configPath, []byte("websocket:\n  write_chan_size: 1\n"+gateToGameTestYAML), 0o600); err != nil {
@@ -305,6 +414,108 @@ func newStartedWebSocketTestApp(t *testing.T, configPath string, registrations .
 		t.Fatalf("start app: %v", err)
 	}
 	return app, server
+}
+
+func newStartedSessionRegistryTestApp(t *testing.T, configPath string) (*App, *WebSocketServer, *SessionRegistry, <-chan struct{}) {
+	t.Helper()
+	var server *WebSocketServer
+	var sessions *SessionRegistry
+	registered := make(chan struct{}, 2)
+	app, err := NewApp(context.Background(), AppOptions{Config: config.ConfigInputs{MergedPaths: []string{configPath}}, EnvPrefix: "CORE_CASINO_GATE_SESSION_REGISTRY_TEST__"}, func(r framework.Registry) error {
+		if err := r.Configure(func(registry *SessionRegistry, commandDispatcher *dispatcher.Dispatcher) error {
+			sessions = registry
+			return commandDispatcher.Register(WebSocketChannel, 0xE10005, func(ctx context.Context, payload []byte) error {
+				requestContext, ok := WebSocketRequestContextFrom(ctx)
+				if !ok {
+					return errors.New("missing WebSocket request context")
+				}
+				session, ok := requestContext.Session.(ClosableWebSocketSession)
+				if !ok {
+					return errors.New("WebSocket session cannot be closed")
+				}
+				if err := registry.Register(session, LoginName(payload)); err != nil {
+					return err
+				}
+				registered <- struct{}{}
+				return nil
+			})
+		}); err != nil {
+			return err
+		}
+		return r.AddHook(func(value *WebSocketServer) framework.Hook {
+			server = value
+			return framework.Hook{Name: "session-registry-contract-observer", Phase: framework.PhaseIngress, OnStart: func(context.Context) error { return nil }}
+		})
+	})
+	if err != nil {
+		t.Fatalf("new app: %v", err)
+	}
+	if err := app.frameworkApp.Start(context.Background()); err != nil {
+		t.Fatalf("start app: %v", err)
+	}
+	return app, server, sessions, registered
+}
+
+func assertSessionRemoved(t *testing.T, sessions *SessionRegistry, loginName LoginName) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		sessions.mu.RLock()
+		_, exists := sessions.byLoginName[loginName]
+		sessions.mu.RUnlock()
+		if !exists {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("session %q remained registered after WebSocket disconnect", loginName)
+}
+
+func assertRoomMemberRemoved(t *testing.T, sessions *SessionRegistry, loginName LoginName, roomID RoomID) {
+	t.Helper()
+	sessions.mu.RLock()
+	_, exists := sessions.byRoomID[roomID][loginName]
+	sessions.mu.RUnlock()
+	if exists {
+		t.Fatalf("%q remained in room %q", loginName, roomID)
+	}
+}
+
+func registerSession(t *testing.T, conn *websocket.Conn, loginName string, registered <-chan struct{}) {
+	t.Helper()
+	if err := conn.WriteMessage(websocket.BinaryMessage, testWebSocketPacket(0xE10005, []byte(loginName))); err != nil {
+		t.Fatalf("write registration packet for %s: %v", loginName, err)
+	}
+	select {
+	case <-registered:
+	case <-time.After(time.Second):
+		t.Fatalf("session registration handler was not called for %s", loginName)
+	}
+}
+
+func assertWebSocketPacket(t *testing.T, conn *websocket.Conn, want []byte) {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	messageType, data, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read WebSocket packet: %v", err)
+	}
+	if messageType != websocket.BinaryMessage || string(data) != string(want) {
+		t.Fatalf("WebSocket packet = type:%d data:%x, want binary %x", messageType, data, want)
+	}
+}
+
+func assertWebSocketClosed(t *testing.T, conn *websocket.Conn) {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := conn.ReadMessage(); err == nil {
+		t.Fatal("WebSocket connection remained readable after closure")
+	} else {
+		var networkError net.Error
+		if errors.As(err, &networkError) && networkError.Timeout() {
+			t.Fatalf("WebSocket read timed out; connection was not closed: %v", err)
+		}
+	}
 }
 
 func testWebSocketPacket(commandID uint32, payload []byte) []byte {
