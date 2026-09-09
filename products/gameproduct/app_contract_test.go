@@ -12,6 +12,8 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/observability"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 func TestModuleWithSnapshotBuildsRunnableNoopApp(t *testing.T) {
@@ -47,9 +49,43 @@ func TestNewAppUsesProductModule(t *testing.T) {
 	}
 }
 
+func TestProductModuleCanInjectPrometheusRegisterer(t *testing.T) {
+	var metrics *productMetrics
+	app, err := NewApp(context.Background(), AppOptions{Config: testInputs(t), EnvPrefix: "CORE_CASINO_GAME_METRICS_TEST__"}, func(r framework.Registry) error {
+		if err := r.Provide(func(registerer prometheus.Registerer) (*productMetrics, error) {
+			requests := prometheus.NewCounter(prometheus.CounterOpts{
+				Name: "game_product_contract_requests_total",
+				Help: "Total requests recorded by the game product contract.",
+			})
+			if err := registerer.Register(requests); err != nil {
+				return nil, err
+			}
+			return &productMetrics{Requests: requests}, nil
+		}); err != nil {
+			return err
+		}
+		return r.AddHook(func(value *productMetrics) framework.Hook {
+			metrics = value
+			return framework.Hook{Name: "product-metrics-consumer", Phase: framework.PhaseService, OnStart: func(context.Context) error { return nil }}
+		})
+	})
+	if err != nil {
+		t.Fatalf("new app: %v", err)
+	}
+	if metrics == nil || metrics.Requests == nil {
+		t.Fatal("product metrics were not constructed through DI")
+	}
+	if err := app.frameworkApp.Start(context.Background()); err != nil {
+		t.Fatalf("start app: %v", err)
+	}
+	if err := app.frameworkApp.Stop(context.Background()); err != nil {
+		t.Fatalf("stop app: %v", err)
+	}
+}
+
 func TestNewAppProvidesSnapshotsToProductModule(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "app.yaml")
-	if err := os.WriteFile(path, []byte("product:\n  code: core-casino\ngate_to_game:\n  listen_addr: 127.0.0.1:0\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("observability:\n  listen_addr: 127.0.0.1:0\nproduct:\n  code: core-casino\ngate_to_game:\n  listen_addr: 127.0.0.1:0\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var sourceCode, mergedCode string
@@ -115,7 +151,7 @@ func TestNewAppValidatesFileIntegrityManifest(t *testing.T) {
 			dir := t.TempDir()
 			mergedPath := filepath.Join(dir, "app.yaml")
 			sourcePath := filepath.Join(dir, "planner.yaml")
-			merged := []byte("file_integrity:\n  version: 1\n  sources:\n    - source: planner\n      md5: \"" + test.digest + "\"\ngate_to_game:\n  listen_addr: 127.0.0.1:0\n")
+			merged := []byte("observability:\n  listen_addr: 127.0.0.1:0\nfile_integrity:\n  version: 1\n  sources:\n    - source: planner\n      md5: \"" + test.digest + "\"\ngate_to_game:\n  listen_addr: 127.0.0.1:0\n")
 			if err := os.WriteFile(mergedPath, merged, 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -137,7 +173,7 @@ func TestNewAppValidatesFileIntegrityManifest(t *testing.T) {
 func testInputs(t *testing.T) config.ConfigInputs {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "app.yaml")
-	if err := os.WriteFile(path, []byte("product: {}\ngate_to_game:\n  listen_addr: 127.0.0.1:0\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("observability:\n  listen_addr: 127.0.0.1:0\nproduct: {}\ngate_to_game:\n  listen_addr: 127.0.0.1:0\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return config.ConfigInputs{MergedPaths: []string{path}}
@@ -145,17 +181,28 @@ func testInputs(t *testing.T) config.ConfigInputs {
 
 type contractSnapshot struct{}
 
+const observabilityTestYAML = "observability:\n  listen_addr: 127.0.0.1:0\n"
+
 func (contractSnapshot) Bind(path string, target any, _ ...config.BindOption) error {
+	if path == "observability" {
+		target.(*observability.Config).ListenAddr = "127.0.0.1:0"
+	}
 	if path == "gate_to_game" {
 		target.(*gatelink.ServerConfig).ListenAddr = "127.0.0.1:0"
 	}
 	return nil
 }
-func (contractSnapshot) Has(path string) bool                                       { return path == "gate_to_game" }
+func (contractSnapshot) Has(path string) bool {
+	return path == "gate_to_game" || path == "observability"
+}
 func (contractSnapshot) HasSource(string) bool                                      { return false }
 func (contractSnapshot) BindSource(string, string, any, ...config.BindOption) error { return nil }
 
 type contractNoop struct{}
+
+type productMetrics struct {
+	Requests prometheus.Counter
+}
 
 func testProductModule(called, started, stopped *bool) framework.Module {
 	return func(r framework.Registry) error {

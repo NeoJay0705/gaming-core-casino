@@ -209,7 +209,7 @@ func TestGateWebSocketContractDirectGameReplyReturnsToOriginalConnection(t *test
 	t.Cleanup(func() { _ = registrar.Stop(context.Background()) })
 
 	gameConfig := filepath.Join(t.TempDir(), "game.yaml")
-	gameYAML := "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\ngate_to_game:\n  listen_addr: 127.0.0.1:0\nserver_send:\n  presence:\n    lease_ttl: 30s\n  gate:\n    listen_addr: 127.0.0.1:0\n    endpoint_ttl: 30s\n  broadcast:\n    primary: redis\n"
+	gameYAML := observabilityTestYAML + "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\ngate_to_game:\n  listen_addr: 127.0.0.1:0\nserver_send:\n  presence:\n    lease_ttl: 30s\n  gate:\n    listen_addr: 127.0.0.1:0\n    endpoint_ttl: 30s\n  broadcast:\n    primary: redis\n"
 	if err := os.WriteFile(gameConfig, []byte(gameYAML), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +445,7 @@ func TestEncodeWebSocketPacketContract(t *testing.T) {
 
 func TestNewAppRejectsConfiguredWebSocketWithoutClientAddr(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "gate.yaml")
-	if err := os.WriteFile(configPath, []byte("websocket:\n  write_chan_size: 1\n"+gateToGameTestYAML), 0o600); err != nil {
+	if err := os.WriteFile(configPath, []byte(observabilityTestYAML+"websocket:\n  write_chan_size: 1\n"+gateToGameTestYAML), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	_, err := NewApp(context.Background(), AppOptions{Config: config.ConfigInputs{MergedPaths: []string{configPath}}, EnvPrefix: "CORE_CASINO_GATE_WEBSOCKET_REQUIRED_TEST__"})
@@ -549,7 +549,7 @@ func writeWebSocketConfig(t *testing.T) string {
 func writeWebSocketConfigWithGameTarget(t *testing.T, target string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "gate.yaml")
-	contents := "websocket:\n  client_addr: 127.0.0.1:0\ngate_to_game:\n  target: " + target + "\n"
+	contents := observabilityTestYAML + "websocket:\n  client_addr: 127.0.0.1:0\ngate_to_game:\n  target: " + target + "\n"
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}

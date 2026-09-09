@@ -11,6 +11,7 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/infra"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/observability"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 )
 
@@ -55,6 +56,9 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 			return err
 		}
 		if err := r.Provide(func(source config.SourceSnapshot) config.Snapshot { return source }); err != nil {
+			return err
+		}
+		if err := observability.Module(r); err != nil {
 			return err
 		}
 		grpcConfig, err := gameGateGRPCConfig(snapshot)
@@ -116,14 +120,10 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 		if err := r.AddHook(newGameGateGRPCHook); err != nil {
 			return err
 		}
-		return r.AddHook(noopReadinessHook)
+		return nil
 	}
 }
 
 func gameServerSendNeedsFanout(cfg serversend.Config) bool {
 	return cfg.Broadcast.Primary == "grpc" || cfg.Player.Fallback == "grpc" || cfg.Broadcast.Fallback == "grpc"
-}
-
-func noopReadinessHook() framework.Hook {
-	return framework.Hook{Name: "readiness", Phase: framework.PhaseReadiness, OnStart: func(context.Context) error { return nil }, OnStop: func(context.Context) error { return nil }}
 }

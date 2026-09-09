@@ -17,7 +17,7 @@ import (
 func TestGateServerSendContractManagedRuntimeStartsThroughWebSocketDependency(t *testing.T) {
 	miniRedis := miniredis.RunT(t)
 	path := filepath.Join(t.TempDir(), "gate.yaml")
-	contents := "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\ngate_to_game:\n  target: dns:///gameproduct:9090\nserver_send:\n  presence:\n    lease_ttl: 30s\n  gate:\n    listen_addr: 127.0.0.1:0\n    endpoint_ttl: 30s\n"
+	contents := observabilityTestYAML + "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\ngate_to_game:\n  target: dns:///gameproduct:9090\nserver_send:\n  presence:\n    lease_ttl: 30s\n  gate:\n    listen_addr: 127.0.0.1:0\n    endpoint_ttl: 30s\n"
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestGateServerSendContractManagedRuntimeStartsThroughWebSocketDependency(t 
 func TestGateServerSendContractDoesNotSubscribeToRedisForGRPCPrimary(t *testing.T) {
 	miniRedis := miniredis.RunT(t)
 	path := filepath.Join(t.TempDir(), "gate.yaml")
-	contents := "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\ngate_to_game:\n  target: dns:///gameproduct:9090\nserver_send:\n  broadcast:\n    primary: grpc\n  presence:\n    lease_ttl: 30s\n  gate:\n    listen_addr: 127.0.0.1:0\n    endpoint_ttl: 30s\n"
+	contents := observabilityTestYAML + "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\ngate_to_game:\n  target: dns:///gameproduct:9090\nserver_send:\n  broadcast:\n    primary: grpc\n  presence:\n    lease_ttl: 30s\n  gate:\n    listen_addr: 127.0.0.1:0\n    endpoint_ttl: 30s\n"
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}

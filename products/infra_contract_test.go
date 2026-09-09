@@ -57,7 +57,9 @@ func TestProductAppsProvideManagedInfrastructureToProductModules(t *testing.T) {
 	}
 }
 
-const infraConfigYAML = `redis:
+const infraConfigYAML = `observability:
+  listen_addr: 127.0.0.1:0
+redis:
   addr: redis:6379
   key_prefix: core-casino
 database:

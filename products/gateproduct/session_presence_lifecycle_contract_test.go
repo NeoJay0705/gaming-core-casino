@@ -17,7 +17,7 @@ import (
 func TestGateApplicationStopReleasesSessionPresenceLease(t *testing.T) {
 	miniRedis := miniredis.RunT(t)
 	configPath := filepath.Join(t.TempDir(), "gate.yaml")
-	contents := "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\nwebsocket:\n  client_addr: 127.0.0.1:0\ngate_to_game:\n  target: dns:///gameproduct:9090\nserver_send:\n  presence:\n    lease_ttl: 200ms\n  gate:\n    listen_addr: 127.0.0.1:0\n    endpoint_ttl: 200ms\n"
+	contents := observabilityTestYAML + "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\nwebsocket:\n  client_addr: 127.0.0.1:0\ngate_to_game:\n  target: dns:///gameproduct:9090\nserver_send:\n  presence:\n    lease_ttl: 200ms\n  gate:\n    listen_addr: 127.0.0.1:0\n    endpoint_ttl: 200ms\n"
 	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}

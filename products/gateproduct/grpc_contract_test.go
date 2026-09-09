@@ -15,7 +15,7 @@ import (
 
 func TestGateProductContractProvidesManagedGameRequestClient(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gate.yaml")
-	if err := os.WriteFile(path, []byte("gate_to_game:\n  target: dns:///gameproduct:9090\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(observabilityTestYAML+"gate_to_game:\n  target: dns:///gameproduct:9090\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var client *gatelink.Client
@@ -41,7 +41,7 @@ func TestGateProductContractProvidesManagedGameRequestClient(t *testing.T) {
 
 func TestGateProductRequiresGateToGameConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gate.yaml")
-	if err := os.WriteFile(path, []byte("product: {}\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(observabilityTestYAML+"product: {}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	_, err := NewApp(context.Background(), AppOptions{Config: config.ConfigInputs{MergedPaths: []string{path}}, EnvPrefix: "CORE_CASINO_GATE_GRPC_REQUIRED_CONFIG_TEST__"})
@@ -52,7 +52,7 @@ func TestGateProductRequiresGateToGameConfig(t *testing.T) {
 
 func TestGateProductContractProvidesPresenceRegistryWhenServerSendIsConfigured(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gate.yaml")
-	contents := "redis:\n  addr: redis:6379\n  key_prefix: core-casino\ngate_to_game:\n  target: dns:///gameproduct:9090\nserver_send:\n  presence:\n    lease_ttl: 30s\n  gate:\n    listen_addr: 127.0.0.1:0\n    endpoint_ttl: 30s\n    endpoint_refresh: 10s\n"
+	contents := observabilityTestYAML + "redis:\n  addr: redis:6379\n  key_prefix: core-casino\ngate_to_game:\n  target: dns:///gameproduct:9090\nserver_send:\n  presence:\n    lease_ttl: 30s\n  gate:\n    listen_addr: 127.0.0.1:0\n    endpoint_ttl: 30s\n    endpoint_refresh: 10s\n"
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}

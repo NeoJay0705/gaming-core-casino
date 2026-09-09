@@ -1,5 +1,10 @@
 # 共用基礎設施設定；實際服務只會在其 DI graph 使用到資源時才連線。
 
+observability:
+  # Health、Readiness 與 Prometheus Metrics 共用的 HTTP listener。
+  # Endpoint 固定為 /health、/ready 與 /metrics。
+  listen_addr: ":8081"
+
 redis:
   # 必填：single Redis 設定 addr；和 addrs 只能擇一。
   addr: "redis:6379"

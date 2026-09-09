@@ -22,7 +22,7 @@ import (
 
 func TestGameProductContractRegistersGateRequestHandler(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "game.yaml")
-	if err := os.WriteFile(path, []byte("gate_to_game:\n  listen_addr: 127.0.0.1:0\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(observabilityTestYAML+"gate_to_game:\n  listen_addr: 127.0.0.1:0\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	requests := make(chan gatelink.Request, 1)
@@ -75,7 +75,7 @@ func TestGameProductContractRegistersGateRequestHandler(t *testing.T) {
 
 func TestGameProductAllowsMissingHandlerUntilDispatcherIsInstalled(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "game.yaml")
-	if err := os.WriteFile(path, []byte("gate_to_game:\n  listen_addr: 127.0.0.1:0\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(observabilityTestYAML+"gate_to_game:\n  listen_addr: 127.0.0.1:0\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var server *gatelink.Server
@@ -105,7 +105,7 @@ func TestGameProductAllowsMissingHandlerUntilDispatcherIsInstalled(t *testing.T)
 
 func TestGameProductRequiresGateToGameConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "game.yaml")
-	if err := os.WriteFile(path, []byte("product: {}\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(observabilityTestYAML+"product: {}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	_, err := NewApp(context.Background(), AppOptions{Config: config.ConfigInputs{MergedPaths: []string{path}}, EnvPrefix: "CORE_CASINO_GAME_GRPC_REQUIRED_CONFIG_TEST__"})
@@ -117,7 +117,7 @@ func TestGameProductRequiresGateToGameConfig(t *testing.T) {
 func TestGameProductContractProvidesServerSendPortsWhenConfigured(t *testing.T) {
 	miniRedis := miniredis.RunT(t)
 	path := filepath.Join(t.TempDir(), "game.yaml")
-	contents := "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\ngate_to_game:\n  listen_addr: 127.0.0.1:0\nserver_send:\n  request_timeout: 1s\n  broadcast:\n    primary: redis\n"
+	contents := observabilityTestYAML + "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\ngate_to_game:\n  listen_addr: 127.0.0.1:0\nserver_send:\n  request_timeout: 1s\n  broadcast:\n    primary: redis\n"
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestGameProductContractProvidesServerSendPortsWhenConfigured(t *testing.T) 
 
 func TestGameProductContractProvidesAllServerSendPortsWithoutStartingRedis(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "game.yaml")
-	contents := "redis:\n  addr: redis:6379\n  key_prefix: core-casino\ngate_to_game:\n  listen_addr: 127.0.0.1:0\nserver_send:\n  broadcast:\n    primary: redis\n"
+	contents := observabilityTestYAML + "redis:\n  addr: redis:6379\n  key_prefix: core-casino\ngate_to_game:\n  listen_addr: 127.0.0.1:0\nserver_send:\n  broadcast:\n    primary: redis\n"
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestGameProductContractProvidesAllServerSendPortsWithoutStartingRedis(t *te
 
 func TestGameProductContractRequiresFanoutTargetAndCanUseGRPCBroadcastWithoutRedis(t *testing.T) {
 	missingTargetPath := filepath.Join(t.TempDir(), "missing-target.yaml")
-	missingTarget := "gate_to_game:\n  listen_addr: 127.0.0.1:0\nserver_send:\n  broadcast:\n    primary: grpc\n"
+	missingTarget := observabilityTestYAML + "gate_to_game:\n  listen_addr: 127.0.0.1:0\nserver_send:\n  broadcast:\n    primary: grpc\n"
 	if err := os.WriteFile(missingTargetPath, []byte(missingTarget), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestGameProductContractRequiresFanoutTargetAndCanUseGRPCBroadcastWithoutRed
 	}
 
 	grpcOnlyPath := filepath.Join(t.TempDir(), "grpc-only.yaml")
-	grpcOnly := "gate_to_game:\n  listen_addr: 127.0.0.1:0\nserver_send:\n  fanout:\n    grpc_target: dns:///gate-server-send-headless:9091\n  broadcast:\n    primary: grpc\n"
+	grpcOnly := observabilityTestYAML + "gate_to_game:\n  listen_addr: 127.0.0.1:0\nserver_send:\n  fanout:\n    grpc_target: dns:///gate-server-send-headless:9091\n  broadcast:\n    primary: grpc\n"
 	if err := os.WriteFile(grpcOnlyPath, []byte(grpcOnly), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +204,7 @@ func TestGameProductContractRequiresFanoutTargetAndCanUseGRPCBroadcastWithoutRed
 func TestGameProductContractKeepsPlayerFallbackSeparateFromBroadcastFanout(t *testing.T) {
 	miniRedis := miniredis.RunT(t)
 	path := filepath.Join(t.TempDir(), "game.yaml")
-	contents := "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\ngate_to_game:\n  listen_addr: 127.0.0.1:0\nserver_send:\n  request_timeout: 50ms\n  fanout:\n    grpc_target: dns:///127.0.0.1:1\n  player:\n    fallback: none\n  broadcast:\n    primary: grpc\n"
+	contents := observabilityTestYAML + "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\ngate_to_game:\n  listen_addr: 127.0.0.1:0\nserver_send:\n  request_timeout: 50ms\n  fanout:\n    grpc_target: dns:///127.0.0.1:1\n  player:\n    fallback: none\n  broadcast:\n    primary: grpc\n"
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}

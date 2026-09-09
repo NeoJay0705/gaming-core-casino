@@ -9,6 +9,7 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/infra"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/observability"
 )
 
 type AppOptions struct {
@@ -49,12 +50,12 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 		if err := r.Provide(func(source config.SourceSnapshot) config.Snapshot { return source }); err != nil {
 			return err
 		}
+		if err := observability.Module(r); err != nil {
+			return err
+		}
 		if err := infra.Module(r); err != nil {
 			return err
 		}
-		return r.AddHook(noopReadinessHook)
+		return nil
 	}
-}
-func noopReadinessHook() framework.Hook {
-	return framework.Hook{Name: "readiness", Phase: framework.PhaseReadiness, OnStart: func(context.Context) error { return nil }, OnStop: func(context.Context) error { return nil }}
 }

@@ -8,6 +8,7 @@ import (
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/observability"
 )
 
 func TestModuleWithSnapshotBuildsRunnableNoopApp(t *testing.T) {
@@ -32,10 +33,11 @@ func TestNewAppUsesProductModule(t *testing.T) {
 	if !called {
 		t.Fatal("product module was not used")
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := app.Run(ctx); err != nil {
-		t.Fatalf("run app: %v", err)
+	if err := app.frameworkApp.Start(context.Background()); err != nil {
+		t.Fatalf("start app: %v", err)
+	}
+	if err := app.frameworkApp.Stop(context.Background()); err != nil {
+		t.Fatalf("stop app: %v", err)
 	}
 	if !started || !stopped {
 		t.Fatalf("product module lifecycle not used: started=%t stopped=%t", started, stopped)
@@ -44,7 +46,7 @@ func TestNewAppUsesProductModule(t *testing.T) {
 
 func TestNewAppProvidesSnapshotsToProductModule(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "app.yaml")
-	if err := os.WriteFile(path, []byte("product:\n  code: core-casino\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("observability:\n  listen_addr: 127.0.0.1:0\nproduct:\n  code: core-casino\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var sourceCode, mergedCode string
@@ -76,17 +78,18 @@ func TestNewAppProvidesSnapshotsToProductModule(t *testing.T) {
 	if sourceCode != "core-casino" || mergedCode != "core-casino" {
 		t.Fatalf("snapshot values = source:%q merged:%q", sourceCode, mergedCode)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := app.Run(ctx); err != nil {
-		t.Fatalf("run app: %v", err)
+	if err := app.frameworkApp.Start(context.Background()); err != nil {
+		t.Fatalf("start app: %v", err)
+	}
+	if err := app.frameworkApp.Stop(context.Background()); err != nil {
+		t.Fatalf("stop app: %v", err)
 	}
 }
 
 func testInputs(t *testing.T) config.ConfigInputs {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "app.yaml")
-	if err := os.WriteFile(path, []byte("product: {}\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("observability:\n  listen_addr: 127.0.0.1:0\nproduct: {}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return config.ConfigInputs{MergedPaths: []string{path}}
@@ -94,8 +97,15 @@ func testInputs(t *testing.T) config.ConfigInputs {
 
 type contractSnapshot struct{}
 
-func (contractSnapshot) Bind(string, any, ...config.BindOption) error               { return nil }
-func (contractSnapshot) Has(string) bool                                            { return false }
+func (contractSnapshot) Bind(path string, target any, _ ...config.BindOption) error {
+	if path == "observability" {
+		target.(*observability.Config).ListenAddr = "127.0.0.1:0"
+	}
+	return nil
+}
+func (contractSnapshot) Has(path string) bool {
+	return path == "observability"
+}
 func (contractSnapshot) HasSource(string) bool                                      { return false }
 func (contractSnapshot) BindSource(string, string, any, ...config.BindOption) error { return nil }
 
