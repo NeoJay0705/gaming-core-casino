@@ -19,6 +19,7 @@ import (
 func TestConfigContractInfersSingleAndClusterClients(t *testing.T) {
 	single, err := New(testSnapshot(t, `redis:
   addr: 127.0.0.1:6379
+  key_prefix: core-casino
   pool_size: 12
   min_idle_conns: 3
   dial_timeout: 1s
@@ -32,6 +33,7 @@ func TestConfigContractInfersSingleAndClusterClients(t *testing.T) {
 
 	cluster, err := New(testSnapshot(t, `redis:
   addrs: [redis-0:6379, redis-1:6379]
+  key_prefix: core-casino
   pool_size: 20
 `))
 	if err != nil {
@@ -75,7 +77,7 @@ func TestLifecycleContractPingsAndClosesSingleConnectionPool(t *testing.T) {
 	defer listener.Close()
 	go serveRESPPing(listener)
 
-	client, err := New(testSnapshot(t, fmt.Sprintf("redis:\n  addr: %q\n  pool_size: 7\n", listener.Addr().String())))
+	client, err := New(testSnapshot(t, fmt.Sprintf("redis:\n  addr: %q\n  key_prefix: core-casino\n  pool_size: 7\n", listener.Addr().String())))
 	if err != nil {
 		t.Fatalf("new redis client: %v", err)
 	}
@@ -90,6 +92,22 @@ func TestLifecycleContractPingsAndClosesSingleConnectionPool(t *testing.T) {
 	}
 	if _, err := client.Client(); err == nil {
 		t.Fatal("stopped client remained available")
+	}
+}
+
+func TestConfigContractValidatesApplicationKeyPrefix(t *testing.T) {
+	for _, value := range []string{"", " core-casino", "core-casino ", "core-*"} {
+		body := fmt.Sprintf("redis:\n  addr: redis:6379\n  key_prefix: %q\n", value)
+		if _, err := New(testSnapshot(t, body)); err == nil {
+			t.Fatalf("New() accepted invalid key_prefix %q", value)
+		}
+	}
+	client, err := New(testSnapshot(t, "redis:\n  addr: redis:6379\n  key_prefix: core-casino\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := client.KeyPrefix(); got != KeyPrefix("core-casino") {
+		t.Fatalf("key prefix = %q, want core-casino", got)
 	}
 }
 

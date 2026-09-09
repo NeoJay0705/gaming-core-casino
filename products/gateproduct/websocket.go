@@ -74,6 +74,7 @@ type webSocketServerInputs struct {
 	Dispatcher *dispatcher.Dispatcher
 	GameClient *gatelink.Client
 	Sessions   *SessionRegistry
+	ServerSend *gateServerSendRuntime `optional:"true"`
 }
 
 // WebSocketServer owns the Gate player-facing WebSocket listener.
@@ -84,6 +85,7 @@ type WebSocketServer struct {
 	dispatcher *dispatcher.Dispatcher
 	gameClient *gatelink.Client
 	registry   *SessionRegistry
+	serverSend *gateServerSendRuntime
 
 	mu       sync.Mutex
 	server   *http.Server
@@ -99,6 +101,7 @@ func newGateWebSocketServer(inputs webSocketServerInputs) (*WebSocketServer, err
 		dispatcher: inputs.Dispatcher,
 		gameClient: inputs.GameClient,
 		registry:   inputs.Sessions,
+		serverSend: inputs.ServerSend,
 	}
 	if server.dispatcher == nil {
 		return nil, errors.New("gate websocket: dispatcher is nil")
@@ -321,9 +324,13 @@ func (s *WebSocketServer) dispatchPacket(ctx context.Context, session *webSocket
 	if ctx.Err() != nil {
 		return false
 	}
+	source := gatelink.RequestSource{ConnectionID: string(session.ID())}
+	if s.serverSend != nil {
+		source.GateID = s.serverSend.Route()
+	}
 	ctx = WithWebSocketRequestContext(ctx, WebSocketRequestContext{
 		Request: gatelink.GateRequestContext{
-			Source: gatelink.RequestSource{ConnectionID: string(session.ID())},
+			Source: source,
 		},
 		Session: session,
 		Packet:  packet,
@@ -555,5 +562,5 @@ func newWebSocketConnectionID() WebSocketConnectionID {
 	if _, err := rand.Read(bytes[:]); err == nil {
 		return WebSocketConnectionID(hex.EncodeToString(bytes[:]))
 	}
-	return WebSocketConnectionID(fmt.Sprintf("fallback-%d", time.Now().UnixNano()))
+	return WebSocketConnectionID(fmt.Sprintf("generated-%d", time.Now().UnixNano()))
 }

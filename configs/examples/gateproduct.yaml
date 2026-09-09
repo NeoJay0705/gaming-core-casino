@@ -16,3 +16,18 @@ gate_to_game:
 
   # 非必要：單次轉送 deadline；預設 10s。
   # timeout: "10s"
+
+# Game → Gate 的 Server Send receiver；請和 infra.yaml 的 server_send 合併載入。
+server_send:
+  presence:
+    # 必填：Gate session owner lease；較長 TTL 降低大量在線玩家的 renew write volume。
+    lease_ttl: "5m"
+
+  gate:
+    # 必填：接收 Game server-send gRPC 的監聽位址。
+    listen_addr: ":9091"
+
+    # 必填：Gate endpoint Redis lease TTL。
+    endpoint_ttl: "30s"
+    # 非必要：續租間隔；預設 endpoint_ttl/3。
+    # endpoint_refresh: "10s"

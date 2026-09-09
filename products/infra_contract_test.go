@@ -59,6 +59,7 @@ func TestProductAppsProvideManagedInfrastructureToProductModules(t *testing.T) {
 
 const infraConfigYAML = `redis:
   addr: redis:6379
+  key_prefix: core-casino
 database:
   dsn: app:password@tcp(tidb:4000)/gaming?parseTime=true
 rocketmq:

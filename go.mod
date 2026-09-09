@@ -3,6 +3,7 @@ module github.com/NeoJay0705/gaming-core-casino
 go 1.24
 
 require (
+	github.com/alicebob/miniredis/v2 v2.35.0
 	github.com/apache/rocketmq-client-go/v2 v2.1.2
 	github.com/gorilla/websocket v1.5.3
 	github.com/redis/go-redis/v9 v9.18.0
@@ -37,6 +38,7 @@ require (
 	github.com/tidwall/gjson v1.13.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.0 // indirect
+	github.com/yuin/gopher-lua v1.1.1 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	golang.org/x/crypto v0.37.0 // indirect
 	golang.org/x/net v0.35.0 // indirect

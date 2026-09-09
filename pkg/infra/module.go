@@ -20,6 +20,9 @@ func Module(r framework.Registry) error {
 	if err := r.ProvideManaged("redis", framework.PhaseInfrastructure, redis.New); err != nil {
 		return err
 	}
+	if err := r.Provide(redis.KeyPrefixFromClient); err != nil {
+		return err
+	}
 	if err := r.ProvideManaged("database", framework.PhaseInfrastructure, database.New); err != nil {
 		return err
 	}

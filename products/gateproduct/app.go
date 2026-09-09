@@ -11,6 +11,7 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/infra"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 )
 
 type AppOptions struct {
@@ -62,10 +63,33 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 		if err := dispatcher.Module(r); err != nil {
 			return err
 		}
-		if err := r.Provide(NewSessionRegistry); err != nil {
+		if err := infra.Module(r); err != nil {
 			return err
 		}
-		if err := infra.Module(r); err != nil {
+		serverSendConfig, serverSendEnabled, err := gateServerSendConfig(snapshot)
+		if err != nil {
+			return err
+		}
+		if serverSendEnabled {
+			if err := r.Provide(func() serversend.Config { return serverSendConfig }); err != nil {
+				return err
+			}
+			if err := r.Provide(newServerSendKeyspace); err != nil {
+				return err
+			}
+			if err := r.Provide(serversend.NewRuntimeGateIdentity); err != nil {
+				return err
+			}
+			if err := r.Provide(newGatePresenceRegistry); err != nil {
+				return err
+			}
+			if err := r.Provide(newGateSessionRegistry); err != nil {
+				return err
+			}
+			if err := r.ProvideManaged("gate-server-send", framework.PhaseIngress, newGateServerSendRuntime); err != nil {
+				return err
+			}
+		} else if err := r.Provide(NewSessionRegistry); err != nil {
 			return err
 		}
 		if err := r.ProvideManaged("gate-game-grpc-client", framework.PhaseInfrastructure, newGateGameGRPCClient); err != nil {

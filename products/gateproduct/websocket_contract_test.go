@@ -17,7 +17,11 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
+	"github.com/NeoJay0705/gaming-core-casino/products/gameproduct"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gorilla/websocket"
+	"github.com/redis/go-redis/v9"
 )
 
 const gateToGameTestYAML = "gate_to_game:\n  target: dns:///gameproduct:9090\n"
@@ -179,6 +183,158 @@ func TestGateWebSocketContractForwardsUnhandledCommandToGame(t *testing.T) {
 	}
 }
 
+func TestGateWebSocketContractDirectGameReplyReturnsToOriginalConnection(t *testing.T) {
+	miniRedis := miniredis.RunT(t)
+	deliveryListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryAddress := deliveryListener.Addr().String()
+	if err := deliveryListener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	redisClient := redis.NewClient(&redis.Options{Addr: miniRedis.Addr()})
+	t.Cleanup(func() { _ = redisClient.Close() })
+	keys, err := serversend.NewKeyspace("core-casino")
+	if err != nil {
+		t.Fatal(err)
+	}
+	registrar, err := serversend.NewEndpointRegistrar(redisClient, keys, serversend.GateEndpoint{GateID: "gate-direct-reply", Address: deliveryAddress}, serversend.EndpointRegistrarConfig{TTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registrar.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = registrar.Stop(context.Background()) })
+
+	gameConfig := filepath.Join(t.TempDir(), "game.yaml")
+	gameYAML := "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\ngate_to_game:\n  listen_addr: 127.0.0.1:0\nserver_send:\n  presence:\n    lease_ttl: 30s\n  gate:\n    listen_addr: 127.0.0.1:0\n    endpoint_ttl: 30s\n  broadcast:\n    primary: redis\n"
+	if err := os.WriteFile(gameConfig, []byte(gameYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var requestSender serversend.RequestPlayerSender
+	var gameServer *gatelink.Server
+	gameReady := make(chan struct{})
+	gameApp, err := gameproduct.NewApp(context.Background(), gameproduct.AppOptions{Config: config.ConfigInputs{MergedPaths: []string{gameConfig}}, EnvPrefix: "CORE_CASINO_GATE_DIRECT_REPLY_GAME_TEST__"}, dispatcher.Register(dispatcher.Registration{
+		Channel:   gameproduct.GateRequestChannel,
+		CommandID: 99,
+		Handler: func(ctx context.Context, _ []byte) error {
+			_, err := requestSender.SendToRequestPlayer(ctx, serversend.RequestPlayerMessage{Message: serversend.Message{CommandID: 0xE20010, Payload: []byte("reply")}})
+			return err
+		},
+	}), func(r framework.Registry) error {
+		return r.AddHook(func(sender serversend.RequestPlayerSender, server *gatelink.Server) framework.Hook {
+			requestSender, gameServer = sender, server
+			return framework.Hook{Name: "capture-direct-reply-game-server", Phase: framework.PhaseIngress, OnStart: func(context.Context) error {
+				close(gameReady)
+				return nil
+			}}
+		})
+	})
+	if err != nil {
+		t.Fatalf("new Game app: %v", err)
+	}
+	gameCtx, stopGame := context.WithCancel(context.Background())
+	gameDone := make(chan error, 1)
+	go func() { gameDone <- gameApp.Run(gameCtx) }()
+	select {
+	case <-gameReady:
+	case <-time.After(time.Second):
+		t.Fatal("Game app did not start")
+	}
+	t.Cleanup(func() {
+		stopGame()
+		select {
+		case err := <-gameDone:
+			if err != nil {
+				t.Errorf("stop Game app: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("Game app did not stop")
+		}
+	})
+	if requestSender == nil || gameServer == nil || gameServer.Addr() == "" {
+		t.Fatal("Game server-send direct reply dependencies were not started")
+	}
+
+	gateConfig := writeWebSocketConfigWithGameTarget(t, gameServer.Addr())
+	registered := make(chan struct{}, 1)
+	var gateServer *WebSocketServer
+	gateApp, err := NewApp(context.Background(), AppOptions{Config: config.ConfigInputs{MergedPaths: []string{gateConfig}}, EnvPrefix: "CORE_CASINO_GATE_DIRECT_REPLY_GATE_TEST__"}, func(r framework.Registry) error {
+		if err := r.Configure(func(sessions *SessionRegistry, commandDispatcher *dispatcher.Dispatcher) error {
+			return commandDispatcher.Register(WebSocketChannel, 100, func(ctx context.Context, payload []byte) error {
+				requestContext, ok := WebSocketRequestContextFrom(ctx)
+				if !ok {
+					return errors.New("missing WebSocket request context")
+				}
+				session, ok := requestContext.Session.(ClosableWebSocketSession)
+				if !ok {
+					return errors.New("WebSocket session cannot be registered")
+				}
+				if err := sessions.Register(session, LoginName(payload)); err != nil {
+					return err
+				}
+				registered <- struct{}{}
+				return nil
+			})
+		}); err != nil {
+			return err
+		}
+		if err := r.Provide(func(sessions *SessionRegistry) (*serversend.ReceiverServer, error) {
+			receiver, err := newGateServerSendReceiver(sessions)
+			if err != nil {
+				return nil, err
+			}
+			return serversend.NewReceiverServer(serversend.ReceiverConfig{ListenAddr: deliveryAddress}, receiver)
+		}); err != nil {
+			return err
+		}
+		if err := r.Provide(func() *gateServerSendRuntime {
+			return &gateServerSendRuntime{gateID: "gate-direct-reply", started: true}
+		}); err != nil {
+			return err
+		}
+		if err := r.AddHook(func(receiver *serversend.ReceiverServer) framework.Hook {
+			return framework.Hook{Name: "direct-reply-gate-receiver", Phase: framework.PhaseInfrastructure, OnStart: receiver.Start, OnStop: receiver.Stop}
+		}); err != nil {
+			return err
+		}
+		return r.AddHook(func(server *WebSocketServer) framework.Hook {
+			gateServer = server
+			return framework.Hook{Name: "capture-direct-reply-gate-websocket", Phase: framework.PhaseIngress, OnStart: func(context.Context) error { return nil }}
+		})
+	})
+	if err != nil {
+		t.Fatalf("new Gate app: %v", err)
+	}
+	if err := gateApp.frameworkApp.Start(context.Background()); err != nil {
+		t.Fatalf("start Gate app: %v", err)
+	}
+	t.Cleanup(func() { _ = gateApp.frameworkApp.Stop(context.Background()) })
+	if gateServer == nil || gateServer.Addr() == "" {
+		t.Fatal("Gate WebSocket server did not start")
+	}
+
+	conn, _, err := websocket.DefaultDialer.Dial("ws://"+gateServer.Addr()+"/ws", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.WriteMessage(websocket.BinaryMessage, testWebSocketPacket(100, []byte("alice"))); err != nil {
+		t.Fatalf("register WebSocket session: %v", err)
+	}
+	select {
+	case <-registered:
+	case <-time.After(time.Second):
+		t.Fatal("Gate did not register WebSocket session")
+	}
+	if err := conn.WriteMessage(websocket.BinaryMessage, testWebSocketPacket(99, []byte("request"))); err != nil {
+		t.Fatalf("forward request: %v", err)
+	}
+	assertWebSocketPacket(t, conn, testWebSocketPacket(0xE20010, []byte("reply")))
+}
+
 func TestGateWebSocketContractBroadcastsAndKicksRegisteredSessions(t *testing.T) {
 	app, server, sessions, registered := newStartedSessionRegistryTestApp(t, writeWebSocketConfig(t))
 	t.Cleanup(func() { _ = app.frameworkApp.Stop(context.Background()) })
@@ -299,7 +455,10 @@ func TestNewAppRejectsConfiguredWebSocketWithoutClientAddr(t *testing.T) {
 }
 
 func TestGateProductExampleConfigBuildsApp(t *testing.T) {
-	_, err := NewApp(context.Background(), AppOptions{Config: config.ConfigInputs{MergedPaths: []string{filepath.Join("..", "..", "configs", "examples", "gateproduct.yaml")}}, EnvPrefix: "CORE_CASINO_GATE_EXAMPLE_TEST__"})
+	_, err := NewApp(context.Background(), AppOptions{Config: config.ConfigInputs{MergedPaths: []string{
+		filepath.Join("..", "..", "configs", "examples", "infra.yaml"),
+		filepath.Join("..", "..", "configs", "examples", "gateproduct.yaml"),
+	}}, EnvPrefix: "CORE_CASINO_GATE_EXAMPLE_TEST__"})
 	if err != nil {
 		t.Fatalf("build app from Gate example config: %v", err)
 	}

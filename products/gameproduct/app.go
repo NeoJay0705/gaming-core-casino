@@ -11,6 +11,7 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/infra"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 )
 
 type AppOptions struct {
@@ -69,6 +70,46 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 		if err := infra.Module(r); err != nil {
 			return err
 		}
+		serverSendConfig, serverSendEnabled, err := gameServerSendConfig(snapshot)
+		if err != nil {
+			return err
+		}
+		if serverSendEnabled {
+			if err := r.Provide(func() serversend.Config { return serverSendConfig }); err != nil {
+				return err
+			}
+			if err := r.Provide(newGameServerSendKeyspace); err != nil {
+				return err
+			}
+			if err := r.ProvideManaged("game-server-send-grpc", framework.PhaseInfrastructure, newGameServerSendTransport); err != nil {
+				return err
+			}
+			if err := r.Provide(newGamePresenceResolver); err != nil {
+				return err
+			}
+			if err := r.Provide(newGameGateDirectory); err != nil {
+				return err
+			}
+			if err := r.Provide(newGameRequestPlayerSender); err != nil {
+				return err
+			}
+			if err := r.Provide(newGamePlayerSender); err != nil {
+				return err
+			}
+			if serverSendConfig.Broadcast.Primary == "redis" {
+				if err := r.Provide(newGameRedisBroadcastSender); err != nil {
+					return err
+				}
+			}
+			if gameServerSendNeedsFanout(serverSendConfig) {
+				if err := r.Provide(newGameFanoutSender); err != nil {
+					return err
+				}
+			}
+			if err := r.Provide(newGameBroadcastSender); err != nil {
+				return err
+			}
+		}
 		if err := r.Provide(newGameGateGRPCServer); err != nil {
 			return err
 		}
@@ -78,6 +119,11 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 		return r.AddHook(noopReadinessHook)
 	}
 }
+
+func gameServerSendNeedsFanout(cfg serversend.Config) bool {
+	return cfg.Broadcast.Primary == "grpc" || cfg.Player.Fallback == "grpc" || cfg.Broadcast.Fallback == "grpc"
+}
+
 func noopReadinessHook() framework.Hook {
 	return framework.Hook{Name: "readiness", Phase: framework.PhaseReadiness, OnStart: func(context.Context) error { return nil }, OnStop: func(context.Context) error { return nil }}
 }

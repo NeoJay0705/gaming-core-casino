@@ -3,3 +3,24 @@
 # 尚未由 dispatcher.Register 註冊對應 command 時，request 會回 Unimplemented。
 gate_to_game:
   listen_addr: ":9090"
+
+# Server Send 的 Redis root prefix 與 broadcast primary 請由 infra.yaml 提供。
+# Game business module 可注入 RequestPlayerSender、PlayerSender、BroadcastSender。
+server_send:
+  # 非必要：單次 Game → Gate gRPC deadline；預設 3s。
+  # request_timeout: "3s"
+
+  # player 或 broadcast fallback 使用 grpc 時必填；必須列出每個 Gate
+  # instance 的 headless DNS／Docker tasks DNS，不能是 round-robin VIP。
+  fanout:
+    grpc_target: "dns:///gate-server-send-headless:9091"
+    # 非必要：最多 fan-out Gate 數，預設 256。
+    # max_endpoints: 256
+
+  player:
+    # 非必要：primary route 失敗後的 fallback；可填 grpc 或 none。
+    fallback: grpc
+
+  broadcast:
+    # infra.yaml 的 primary 決定 Redis 或 gRPC；這裡只設定 Game-side fallback。
+    fallback: grpc

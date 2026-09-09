@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package serversend.v1;
+
+option go_package = "github.com/NeoJay0705/gaming-core-casino/pkg/serversend";
+
+// GateDelivery receives Game-originated client messages at one Gate instance.
+// A caller that wants fan-out invokes the same unary method once per endpoint;
+// a normal gRPC round-robin target alone is not a broadcast primitive.
+service GateDelivery {
+  rpc SendToConnection(SendToConnectionRequest) returns (DeliveryResponse);
+  rpc SendToPlayer(SendToPlayerRequest) returns (DeliveryResponse);
+  rpc BroadcastRoom(BroadcastRoomRequest) returns (DeliveryResponse);
+}
+
+message SendToConnectionRequest {
+  string connection_id = 1;
+  // Empty is allowed for pre-login responses. A non-empty value is checked by
+  // Gate against the connection's current authenticated identity.
+  string expected_login_name = 2;
+  uint32 command_id = 3;
+  bytes payload = 4;
+}
+
+message SendToPlayerRequest {
+  string login_name = 1;
+  uint32 command_id = 2;
+  bytes payload = 3;
+}
+
+message BroadcastRoomRequest {
+  string room_id = 1;
+  uint32 command_id = 2;
+  bytes payload = 3;
+}
+
+enum DeliveryStatus {
+  DELIVERY_STATUS_UNSPECIFIED = 0;
+  // Gate accepted the message into its local WebSocket delivery path.
+  DELIVERY_STATUS_DELIVERED = 1;
+  // This Gate has no matching local connection, player, or room member.
+  DELIVERY_STATUS_IGNORED = 2;
+}
+
+message DeliveryResponse {
+  DeliveryStatus status = 1;
+  // Number of local recipients for a room broadcast. Single-target delivery
+  // returns one when delivered and zero when ignored.
+  uint32 delivered_count = 2;
+}
+
+// RedisBroadcastEnvelope carries metadata that gRPC would normally place in
+// headers. Redis Pub/Sub has no request metadata channel.
+message RedisBroadcastEnvelope {
+  BroadcastRoomRequest message = 1;
+  string trace_id = 2;
+}

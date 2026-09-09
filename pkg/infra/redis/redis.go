@@ -20,11 +20,30 @@ const (
 	defaultWriteTimeout = 5 * time.Second
 )
 
+// KeyPrefix is the application-wide Redis namespace root. It is kept as a
+// distinct type so a Server Send keyspace cannot accidentally be built from an
+// unrelated string dependency.
+type KeyPrefix string
+
+// NewKeyPrefix validates the single Redis namespace owned by infrastructure.
+// Subsystems must append their own fixed segments instead of defining another
+// root prefix.
+func NewKeyPrefix(value string) (KeyPrefix, error) {
+	if value == "" || value != strings.TrimSpace(value) {
+		return "", fmt.Errorf("redis config: key_prefix is required and must not have surrounding whitespace")
+	}
+	if strings.ContainsAny(value, "*?[]\\") {
+		return "", fmt.Errorf("redis config: key_prefix contains a Redis pattern character")
+	}
+	return KeyPrefix(value), nil
+}
+
 // Config configures either a single Redis instance or a Redis Cluster.
 // Timeouts use Go duration syntax in YAML, for example "5s".
 type Config struct {
 	Addr            string        `config:"addr" yaml:"addr"`
 	Addrs           []string      `config:"addrs" yaml:"addrs"`
+	KeyPrefix       string        `config:"key_prefix" yaml:"key_prefix"`
 	Username        string        `config:"username" yaml:"username"`
 	Password        string        `config:"password" yaml:"password"`
 	DB              int           `config:"db" yaml:"db"`
@@ -149,6 +168,24 @@ func (c *Client) Client() (redis.UniversalClient, error) {
 	return c.client, nil
 }
 
+// KeyPrefix returns the validated application-wide Redis namespace.
+func (c *Client) KeyPrefix() KeyPrefix {
+	if c == nil {
+		return ""
+	}
+	return KeyPrefix(c.cfg.KeyPrefix)
+}
+
+// KeyPrefixFromClient exposes the validated namespace as a strongly typed DI
+// value. Requiring the Client keeps the prefix source in the infrastructure
+// configuration and avoids a second independent config binding.
+func KeyPrefixFromClient(c *Client) (KeyPrefix, error) {
+	if c == nil {
+		return "", fmt.Errorf("redis config: client is nil")
+	}
+	return c.KeyPrefix(), nil
+}
+
 // Config returns the normalized immutable configuration.
 func (c *Client) Config() Config {
 	if c == nil {
@@ -173,6 +210,9 @@ func (c *Client) fail() {
 
 func validateConfig(cfg *Config) error {
 	cfg.Addr = strings.TrimSpace(cfg.Addr)
+	if _, err := NewKeyPrefix(cfg.KeyPrefix); err != nil {
+		return err
+	}
 	for i, addr := range cfg.Addrs {
 		cfg.Addrs[i] = strings.TrimSpace(addr)
 		if cfg.Addrs[i] == "" {

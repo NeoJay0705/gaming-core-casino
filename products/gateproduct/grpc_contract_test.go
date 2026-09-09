@@ -10,6 +10,7 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 )
 
 func TestGateProductContractProvidesManagedGameRequestClient(t *testing.T) {
@@ -46,5 +47,26 @@ func TestGateProductRequiresGateToGameConfig(t *testing.T) {
 	_, err := NewApp(context.Background(), AppOptions{Config: config.ConfigInputs{MergedPaths: []string{path}}, EnvPrefix: "CORE_CASINO_GATE_GRPC_REQUIRED_CONFIG_TEST__"})
 	if err == nil || !strings.Contains(err.Error(), "gate_to_game is required") {
 		t.Fatalf("new gate app error = %v, want required gate_to_game", err)
+	}
+}
+
+func TestGateProductContractProvidesPresenceRegistryWhenServerSendIsConfigured(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gate.yaml")
+	contents := "redis:\n  addr: redis:6379\n  key_prefix: core-casino\ngate_to_game:\n  target: dns:///gameproduct:9090\nserver_send:\n  presence:\n    lease_ttl: 30s\n  gate:\n    listen_addr: 127.0.0.1:0\n    endpoint_ttl: 30s\n    endpoint_refresh: 10s\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var presence *serversend.GatePresenceRegistry
+	_, err := NewApp(context.Background(), AppOptions{Config: config.ConfigInputs{MergedPaths: []string{path}}, EnvPrefix: "CORE_CASINO_GATE_SERVER_SEND_TEST__"}, func(r framework.Registry) error {
+		return r.AddHook(func(value *serversend.GatePresenceRegistry) framework.Hook {
+			presence = value
+			return framework.Hook{Name: "capture-gate-presence-registry", Phase: framework.PhaseService, OnStart: func(context.Context) error { return nil }}
+		})
+	})
+	if err != nil {
+		t.Fatalf("new app: %v", err)
+	}
+	if presence == nil {
+		t.Fatal("Gate product did not provide GatePresenceRegistry")
 	}
 }
