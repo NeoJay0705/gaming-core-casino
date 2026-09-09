@@ -8,6 +8,7 @@ import (
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 )
 
 func TestModuleWithSnapshotBuildsRunnableNoopApp(t *testing.T) {
@@ -44,7 +45,7 @@ func TestNewAppUsesProductModule(t *testing.T) {
 
 func TestNewAppProvidesSnapshotsToProductModule(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "app.yaml")
-	if err := os.WriteFile(path, []byte("product:\n  code: core-casino\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("product:\n  code: core-casino\ngate_to_game:\n  target: dns:///gameproduct:9090\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var sourceCode, mergedCode string
@@ -86,7 +87,7 @@ func TestNewAppProvidesSnapshotsToProductModule(t *testing.T) {
 func testInputs(t *testing.T) config.ConfigInputs {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "app.yaml")
-	if err := os.WriteFile(path, []byte("product: {}\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("product: {}\ngate_to_game:\n  target: dns:///gameproduct:9090\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return config.ConfigInputs{MergedPaths: []string{path}}
@@ -94,8 +95,13 @@ func testInputs(t *testing.T) config.ConfigInputs {
 
 type contractSnapshot struct{}
 
-func (contractSnapshot) Bind(string, any, ...config.BindOption) error               { return nil }
-func (contractSnapshot) Has(string) bool                                            { return false }
+func (contractSnapshot) Bind(path string, target any, _ ...config.BindOption) error {
+	if path == "gate_to_game" {
+		target.(*gatelink.ClientConfig).Target = "dns:///gameproduct:9090"
+	}
+	return nil
+}
+func (contractSnapshot) Has(path string) bool                                       { return path == "gate_to_game" }
 func (contractSnapshot) HasSource(string) bool                                      { return false }
 func (contractSnapshot) BindSource(string, string, any, ...config.BindOption) error { return nil }
 

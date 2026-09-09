@@ -8,3 +8,11 @@ websocket:
 
   # 非必要：單一 binary frame 寫入逾時（毫秒）；預設 5000。
   # write_timeout_ms: 5000
+
+# 必填：Gate 轉送玩家 binary request 到 Game 的 gRPC client。
+# 應使用可解析多個 Game instance 的 target；client 預設 round_robin。
+gate_to_game:
+  target: "dns:///gameproduct:9090"
+
+  # 非必要：單次轉送 deadline；預設 10s。
+  # timeout: "10s"

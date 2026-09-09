@@ -1,0 +1,5 @@
+# 必填：接收 Gate player binary request 的 gRPC server。
+# transport 只轉交 command、原始 bytes 與 context 中的 trace/source，不負責解碼或 dispatch。
+# 尚未由 dispatcher.Register 註冊對應 command 時，request 會回 Unimplemented。
+gate_to_game:
+  listen_addr: ":9090"

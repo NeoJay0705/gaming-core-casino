@@ -59,7 +59,8 @@ type recordingRegistry struct {
 	constructors []any
 }
 
-func (r *recordingRegistry) Provide(any) error { return nil }
+func (r *recordingRegistry) Provide(any) error   { return nil }
+func (r *recordingRegistry) Configure(any) error { return nil }
 func (r *recordingRegistry) ProvideManaged(name string, phase framework.Phase, constructor any) error {
 	r.names = append(r.names, name)
 	r.phases = append(r.phases, phase)

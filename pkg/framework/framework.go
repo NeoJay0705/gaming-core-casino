@@ -47,10 +47,15 @@ type ManagedResource interface {
 	Stop(context.Context) error
 }
 
-// Registry 提供依賴建構函式與 lifecycle Hook 建構函式的註冊介面。
+// Registry 提供依賴建構函式、組裝期設定函式與 lifecycle Hook 建構函式的註冊介面。
 type Registry interface {
 	Provide(constructor any) error
 	ProvideManaged(name string, phase Phase, constructor any) error
+	// Configure registers a one-shot composition callback. It runs after all
+	// modules have provided their dependencies and before lifecycle hooks are
+	// resolved. Use it to wire shared dependencies (for example, register
+	// command handlers on a Dispatcher); it does not create a lifecycle hook.
+	Configure(constructor any) error
 	AddHook(constructor any) error
 }
 
@@ -110,6 +115,7 @@ type registry struct {
 	container         *dig.Container
 	managed           *managedRegistry
 	managedNames      map[string]struct{}
+	configurers       []reflect.Value
 	registrationIndex int
 }
 
@@ -139,6 +145,17 @@ func (r *managedRegistry) Values() []managedRegistration {
 }
 
 func (r *registry) Provide(constructor any) error { return r.container.Provide(constructor) }
+
+// Configure records a DI callback for application composition. Unlike
+// AddHook, it has no lifecycle presence and is executed before hooks resolve.
+func (r *registry) Configure(constructor any) error {
+	value, err := validateConfigureConstructor(constructor)
+	if err != nil {
+		return err
+	}
+	r.configurers = append(r.configurers, value)
+	return nil
+}
 
 // ProvideManaged registers a lazy DI factory for a resource controlled by the
 // framework lifecycle. The factory is not invoked merely by registration: it
@@ -203,6 +220,19 @@ func validateManagedConstructor(constructor any) (reflect.Value, error) {
 	}
 	if t.NumOut() == 2 && !t.Out(1).Implements(errorType) {
 		return reflect.Value{}, errors.New("managed constructor second return must implement error")
+	}
+	return value, nil
+}
+
+func validateConfigureConstructor(constructor any) (reflect.Value, error) {
+	value := reflect.ValueOf(constructor)
+	if !value.IsValid() || value.Kind() != reflect.Func || value.IsNil() {
+		return reflect.Value{}, errors.New("configure callback must be a non-nil function")
+	}
+	t := value.Type()
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	if t.IsVariadic() || (t.NumOut() != 0 && (t.NumOut() != 1 || !t.Out(0).Implements(errorType))) {
+		return reflect.Value{}, errors.New("configure callback must return nothing or error")
 	}
 	return value, nil
 }
@@ -308,6 +338,11 @@ func newApp(timeout time.Duration, modules ...Module) (*App, error) {
 		}
 		if err := module(r); err != nil {
 			return nil, fmt.Errorf("register module %d: %w", i, err)
+		}
+	}
+	for i, configurer := range r.configurers {
+		if err := c.Invoke(configurer.Interface()); err != nil {
+			return nil, fmt.Errorf("configure framework dependency %d: %w", i, err)
 		}
 	}
 	app := &App{shutdownTimeout: timeout}

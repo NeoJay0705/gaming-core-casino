@@ -7,7 +7,9 @@ import (
 
 	"github.com/NeoJay0705/gaming-core-casino/internal/appbootstrap"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/infra"
 )
 
@@ -50,7 +52,20 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 		if err := r.Provide(func(source config.SourceSnapshot) config.Snapshot { return source }); err != nil {
 			return err
 		}
+		grpcConfig, err := gateGameGRPCConfig(snapshot)
+		if err != nil {
+			return err
+		}
+		if err := r.Provide(func() gatelink.ClientConfig { return grpcConfig }); err != nil {
+			return err
+		}
+		if err := dispatcher.Module(r); err != nil {
+			return err
+		}
 		if err := infra.Module(r); err != nil {
+			return err
+		}
+		if err := r.ProvideManaged("gate-game-grpc-client", framework.PhaseInfrastructure, newGateGameGRPCClient); err != nil {
 			return err
 		}
 		if err := r.Provide(newGateWebSocketServer); err != nil {

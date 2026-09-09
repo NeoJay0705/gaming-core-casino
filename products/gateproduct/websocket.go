@@ -15,7 +15,9 @@ import (
 	"time"
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 	"github.com/gorilla/websocket"
 	"go.uber.org/dig"
 )
@@ -58,28 +60,21 @@ type WebSocketSession interface {
 	SendBinary([]byte) error
 }
 
-// WebSocketIngress is the future Gate business boundary. The base product
-// provides no implementation, so an unconfigured business graph remains a
-// transport-only no-op while callers may supply one from a product module.
-type WebSocketIngress interface {
-	OnConnect(context.Context, WebSocketSession)
-	OnPacket(context.Context, WebSocketSession, WebSocketPacket)
-	OnDisconnect(context.Context, WebSocketSession)
-}
-
 type webSocketServerInputs struct {
 	dig.In
 
-	Snapshot config.SourceSnapshot
-	Ingress  WebSocketIngress `optional:"true"`
+	Snapshot   config.SourceSnapshot
+	Dispatcher *dispatcher.Dispatcher
+	GameClient *gatelink.Client
 }
 
 // WebSocketServer owns the Gate player-facing WebSocket listener.
 // It is inert when the merged configuration has no websocket section.
 type WebSocketServer struct {
-	cfg     WebSocketConfig
-	enabled bool
-	ingress WebSocketIngress
+	cfg        WebSocketConfig
+	enabled    bool
+	dispatcher *dispatcher.Dispatcher
+	gameClient *gatelink.Client
 
 	mu       sync.Mutex
 	server   *http.Server
@@ -90,9 +85,16 @@ type WebSocketServer struct {
 }
 
 func newGateWebSocketServer(inputs webSocketServerInputs) (*WebSocketServer, error) {
-	server := &WebSocketServer{sessions: make(map[WebSocketConnectionID]*webSocketConnection)}
-	if !framework.IsNilDependency(inputs.Ingress) {
-		server.ingress = inputs.Ingress
+	server := &WebSocketServer{
+		sessions:   make(map[WebSocketConnectionID]*webSocketConnection),
+		dispatcher: inputs.Dispatcher,
+		gameClient: inputs.GameClient,
+	}
+	if server.dispatcher == nil {
+		return nil, errors.New("gate websocket: dispatcher is nil")
+	}
+	if server.gameClient == nil {
+		return nil, errors.New("gate websocket: Game client is nil")
 	}
 	if inputs.Snapshot == nil {
 		return nil, fmt.Errorf("gate websocket: config snapshot is nil")
@@ -280,45 +282,84 @@ func (s *WebSocketServer) serveSession(session *webSocketConnection) {
 		close(writerDone)
 	}()
 	ctx := session.Context()
-	if s.callIngress(ctx, session, "connect", func(ingress WebSocketIngress) {
-		ingress.OnConnect(ctx, session)
-	}) {
-		session.readLoop(ctx, func(packet WebSocketPacket) bool {
-			return s.callIngress(ctx, session, "packet", func(ingress WebSocketIngress) {
-				ingress.OnPacket(ctx, session, packet)
-			})
-		})
-	}
+	session.readLoop(ctx, func(packet WebSocketPacket) bool {
+		return s.dispatchPacket(ctx, session, packet)
+	})
 	_ = session.close()
 	<-writerDone
-	s.callIngress(ctx, session, "disconnect", func(ingress WebSocketIngress) {
-		ingress.OnDisconnect(ctx, session)
-	})
 	s.mu.Lock()
 	delete(s.sessions, session.id)
 	s.mu.Unlock()
 }
 
-// callIngress prevents an extension module panic from terminating the Gate
-// process. A panicking callback closes the affected session and is reported to
-// the process log; other sessions continue serving normally.
-func (s *WebSocketServer) callIngress(ctx context.Context, session *webSocketConnection, stage string, call func(WebSocketIngress)) (ok bool) {
-	if s.ingress == nil {
-		return true
-	}
+// dispatchPacket protects the Gate transport from a product handler panic.
+// Locally registered commands stay in Gate; every other command is forwarded
+// to Game through the direct Gate-to-Game channel.
+func (s *WebSocketServer) dispatchPacket(ctx context.Context, session *webSocketConnection, packet WebSocketPacket) (ok bool) {
 	ok = true
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			ok = false
-			log.Printf("[gate websocket] ingress %s panicked: session=%s panic=%v", stage, session.ID(), recovered)
+			log.Printf("[gate websocket] dispatcher panicked: session=%s command=%d panic=%v", session.ID(), packet.CommandID, recovered)
 			_ = session.close()
 		}
 	}()
-	if ctx.Err() != nil && stage != "disconnect" {
+	if ctx.Err() != nil {
 		return false
 	}
-	call(s.ingress)
+	ctx = WithWebSocketRequestContext(ctx, WebSocketRequestContext{
+		Request: gatelink.GateRequestContext{
+			Source: gatelink.RequestSource{ConnectionID: string(session.ID())},
+		},
+		Session: session,
+		Packet:  packet,
+	})
+	handled, err := s.dispatcher.Dispatch(ctx, WebSocketChannel, dispatcher.CommandID(packet.CommandID), packet.Payload)
+	if err != nil {
+		log.Printf("[gate websocket] dispatcher failed: session=%s command=%d err=%v", session.ID(), packet.CommandID, err)
+		_ = session.close()
+		return false
+	}
+	if handled {
+		return true
+	}
+	if err := s.gameClient.Forward(ctx, gatelink.Request{
+		CommandID: packet.CommandID,
+		Payload:   packet.Payload,
+	}); err != nil {
+		log.Printf("[gate websocket] forward to Game failed: session=%s command=%d err=%v", session.ID(), packet.CommandID, err)
+		_ = session.close()
+		return false
+	}
 	return ok
+}
+
+// WebSocketRequestContext is the single context carrier for a WebSocket
+// command. Request holds transport-neutral Gate metadata; Session is the
+// Gate-specific connection used to send a response.
+type WebSocketRequestContext struct {
+	Request gatelink.GateRequestContext
+	Session WebSocketSession
+	Packet  WebSocketPacket
+}
+
+// GateRequestContext makes WebSocketRequestContext usable by the generic
+// Gate-to-Game metadata propagation path.
+func (c WebSocketRequestContext) GateRequestContext() gatelink.GateRequestContext { return c.Request }
+
+// WithWebSocketRequestContext attaches one complete WebSocket request carrier.
+func WithWebSocketRequestContext(ctx context.Context, requestContext WebSocketRequestContext) context.Context {
+	return gatelink.WithRequestContextCarrier(ctx, requestContext)
+}
+
+// WebSocketRequestContextFrom returns the complete WebSocket request carrier.
+func WebSocketRequestContextFrom(ctx context.Context) (WebSocketRequestContext, bool) {
+	carrier, ok := gatelink.RequestContextCarrierFrom(ctx)
+	if !ok {
+		return WebSocketRequestContext{}, false
+	}
+	requestContext, ok := carrier.(WebSocketRequestContext)
+	return requestContext, ok && !framework.IsNilDependency(requestContext.Session)
 }
 
 type webSocketConnection struct {
