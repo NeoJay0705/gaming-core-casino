@@ -10,7 +10,13 @@ Echo 由 Gate forward 至 Game，Game 透過 direct request-player server-send �
 ```sh
 go run ./examples/metrics/game
 go run ./examples/metrics/gate
-go run ./examples/metrics/load -connections 8 -duration 30s
+go run ./examples/metrics/load \
+  -connections 8 \
+  -setup-concurrency 32 \
+  -setup-timeout 2m \
+  -warmup-requests 1 \
+  -request-timeout 10s \
+  -duration 30s
 ```
 
 各服務的 `/metrics` endpoint 分別是 Game `http://127.0.0.1:19080/metrics`、Gate
@@ -38,6 +44,8 @@ go run ./examples/metrics/api
 go run ./examples/metrics/gms
 ```
 
-Load client 是 bounded closed-loop client；`-payload-bytes` 上限保留既有 1 MiB packet 的 framing
-空間，不提供任意 delay、
-錯誤注入或通用 load framework。
+Load client 是 bounded closed-loop client。它先以 `-setup-concurrency` 建立全部 WebSocket connections，
+再完成 Login／EnterRoom 與 `-warmup-requests` 次 Echo，全部 ready 後才進入 `-duration` 的正式測量。
+`duration` 到期只停止新的 Echo；最後一筆 in-flight request 由 `-request-timeout` bounded drain。
+`-setup-timeout` 限制 setup 與 warm-up 總時間；若任一 setup phase 失敗，不會開始正式測量。
+`-payload-bytes` 上限保留既有 1 MiB packet 的 framing 空間，不提供任意 delay、錯誤注入或通用 load framework。

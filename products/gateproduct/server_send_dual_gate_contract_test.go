@@ -50,12 +50,12 @@ func TestGameServerSendContractDeliversAcrossTwoGates(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = transport.Stop(context.Background()) })
 
-	direct, err := serversend.NewDirectRequestPlayerSender(directory, transport)
+	direct, err := serversend.NewDirectRequestPlayerSender(transport)
 	if err != nil {
 		t.Fatal(err)
 	}
 	requestContext := gatelink.WithGateRequestContext(context.Background(), gatelink.GateRequestContext{
-		Source: gatelink.RequestSource{GateID: "gate-a", ConnectionID: "gate-a-alice"},
+		Source: gatelink.RequestSource{GateID: "gate-a", ConnectionID: "gate-a-alice", ReplyEndpoint: gateAEndpoint.Address},
 	})
 	if _, err := direct.SendToRequestPlayer(requestContext, serversend.RequestPlayerMessage{Message: serversend.Message{CommandID: 101, Payload: []byte("direct")}}); err != nil {
 		t.Fatalf("direct request reply: %v", err)

@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/infra/redis"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend/redisstore"
@@ -16,12 +17,13 @@ import (
 // gateServerSendRuntime owns the Gate-side Game-to-Gate listener, endpoint
 // registration, and Redis room broadcast subscription as one lifecycle unit.
 type gateServerSendRuntime struct {
-	receiver *serversend.ReceiverServer
-	local    *gateServerSendReceiver
-	store    *redisstore.Store
-	keys     serversend.Keyspace
-	gateID   serversend.GateID
-	config   serversend.Config
+	receiver      *serversend.ReceiverServer
+	local         *gateServerSendReceiver
+	store         *redisstore.Store
+	keys          serversend.Keyspace
+	gateID        serversend.GateID
+	replyEndpoint string
+	config        serversend.Config
 
 	mu         sync.RWMutex
 	registrar  *serversend.EndpointRegistrar
@@ -109,7 +111,7 @@ func (r *gateServerSendRuntime) Start(ctx context.Context) error {
 		}
 	}
 	r.mu.Lock()
-	r.registrar, r.subscriber, r.started = registrar, subscriber, true
+	r.registrar, r.subscriber, r.replyEndpoint, r.started = registrar, subscriber, advertiseAddress, true
 	r.mu.Unlock()
 	return nil
 }
@@ -120,7 +122,7 @@ func (r *gateServerSendRuntime) Stop(ctx context.Context) error {
 	}
 	r.mu.Lock()
 	registrar, subscriber := r.registrar, r.subscriber
-	r.registrar, r.subscriber, r.started = nil, nil, false
+	r.registrar, r.subscriber, r.replyEndpoint, r.started = nil, nil, "", false
 	r.mu.Unlock()
 	var errs []error
 	if subscriber != nil {
@@ -139,19 +141,19 @@ func (r *gateServerSendRuntime) Stop(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// Route returns the current Gate identity injected into every Gate-to-Game
-// request. The network endpoint is deliberately not placed in request
-// metadata; Game resolves it through its trusted Gate directory.
-func (r *gateServerSendRuntime) Route() string {
+// Route returns the current Gate identity and direct reply endpoint injected
+// into every Gate-to-Game request. Both values come from the managed
+// server-send listener and are unavailable before it starts or after it stops.
+func (r *gateServerSendRuntime) Route() gatelink.RequestSource {
 	if r == nil {
-		return ""
+		return gatelink.RequestSource{}
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if !r.started {
-		return ""
+		return gatelink.RequestSource{}
 	}
-	return string(r.gateID)
+	return gatelink.RequestSource{GateID: string(r.gateID), ReplyEndpoint: r.replyEndpoint}
 }
 
 func newGatePresenceRegistry(identity serversend.RuntimeGateIdentity, cfg serversend.Config, redisClient *redis.Client, keys serversend.Keyspace) (*serversend.GatePresenceRegistry, error) {

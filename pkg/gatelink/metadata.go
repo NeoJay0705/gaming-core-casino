@@ -42,17 +42,21 @@ type Request struct {
 }
 
 // RequestSource identifies the Gate connection that originated Request.
-// GateID is optional until Gate instance identity is configured. ConnectionID
-// is required so downstream code can preserve the player-facing route.
+// GateID and ReplyEndpoint are optional for ordinary Gate-to-Game requests;
+// the direct request-player sender requires both to deliver a reply. The
+// endpoint is produced by Gate's server-send listener, never by the player
+// payload.
 type RequestSource struct {
-	GateID       string
-	ConnectionID string
+	GateID        string
+	ConnectionID  string
+	ReplyEndpoint string
 }
 
 const (
-	traceIDMetadataKey      = "x-gate-request-trace-id"
-	gateIDMetadataKey       = "x-gate-request-gate-id"
-	connectionIDMetadataKey = "x-gate-request-connection-id"
+	traceIDMetadataKey       = "x-gate-request-trace-id"
+	gateIDMetadataKey        = "x-gate-request-gate-id"
+	connectionIDMetadataKey  = "x-gate-request-connection-id"
+	replyEndpointMetadataKey = "x-gate-request-reply-endpoint"
 )
 
 // WithGateRequestContext returns a context carrying metadata for one Gate
@@ -138,6 +142,9 @@ func withOutgoingRequestMetadata(ctx context.Context) (context.Context, error) {
 	if gateID := strings.TrimSpace(requestContext.Source.GateID); gateID != "" {
 		metadataValues.Set(gateIDMetadataKey, gateID)
 	}
+	if replyEndpoint := strings.TrimSpace(requestContext.Source.ReplyEndpoint); replyEndpoint != "" {
+		metadataValues.Set(replyEndpointMetadataKey, replyEndpoint)
+	}
 	return metadata.NewOutgoingContext(ctx, metadataValues), nil
 }
 
@@ -161,9 +168,13 @@ func withIncomingRequestContext(ctx context.Context) (context.Context, error) {
 	if err != nil {
 		return nil, err
 	}
+	replyEndpoint, err := singleMetadataValue(metadataValues, replyEndpointMetadataKey, false)
+	if err != nil {
+		return nil, err
+	}
 	return WithGateRequestContext(ctx, GateRequestContext{
 		TraceID: traceID,
-		Source:  RequestSource{GateID: gateID, ConnectionID: connectionID},
+		Source:  RequestSource{GateID: gateID, ConnectionID: connectionID, ReplyEndpoint: replyEndpoint},
 	}), nil
 }
 

@@ -7,9 +7,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
+	"os"
+	"os/signal"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/NeoJay0705/gaming-core-casino/examples/metrics/internal/protocol"
@@ -23,117 +25,284 @@ import (
 // 超過共用的 1 MiB application packet 上限。
 const maxPayloadBytes = 1024*1024 - 32
 
+const (
+	defaultSetupTimeout     = 2 * time.Minute
+	defaultSetupConcurrency = 32
+	defaultWarmupRequests   = 1
+	defaultRequestTimeout   = 10 * time.Second
+)
+
+type preparedConnection struct {
+	conn     *websocket.Conn
+	sequence uint32
+	name     string
+}
+
 func main() {
 	gateURL := flag.String("gate-url", "ws://127.0.0.1:18080/ws", "Gate WebSocket URL")
 	connections := flag.Int("connections", 1, "number of closed-loop WebSocket connections")
 	duration := flag.Duration("duration", 30*time.Second, "load duration")
 	payloadBytes := flag.Int("payload-bytes", 32, "Echo payload size, bounded to 1 MiB")
 	metricsAddr := flag.String("metrics-addr", "127.0.0.1:22081", "load metrics listen address")
+	setupTimeout := flag.Duration("setup-timeout", defaultSetupTimeout, "timeout for WebSocket setup and warm-up")
+	setupConcurrency := flag.Int("setup-concurrency", defaultSetupConcurrency, "maximum concurrent WebSocket setup operations")
+	warmupRequests := flag.Int("warmup-requests", defaultWarmupRequests, "Echo requests per connection before measurement")
+	requestTimeout := flag.Duration("request-timeout", defaultRequestTimeout, "timeout for one Login, EnterRoom, or Echo round trip")
 	flag.Parse()
-	if *connections <= 0 || *duration <= 0 || *payloadBytes < 0 || *payloadBytes > maxPayloadBytes {
-		log.Fatalf("connections and duration must be positive; payload-bytes must be between 0 and %d", maxPayloadBytes)
+	if *connections <= 0 || *duration <= 0 || *payloadBytes < 0 || *payloadBytes > maxPayloadBytes || *setupTimeout <= 0 || *setupConcurrency <= 0 || *warmupRequests < 0 || *requestTimeout <= 0 {
+		log.Fatalf("connections, duration, setup-timeout, setup-concurrency, and request-timeout must be positive; warmup-requests must not be negative; payload-bytes must be between 0 and %d", maxPayloadBytes)
 	}
-	observer, err := newLoadObserver(*metricsAddr)
-	if err != nil {
-		log.Fatalf("start load metrics observer: %v", err)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := runLoad(ctx, *gateURL, *connections, *duration, *payloadBytes, *metricsAddr, *setupTimeout, *setupConcurrency, *warmupRequests, *requestTimeout); err != nil && ctx.Err() == nil {
+		log.Fatal(err)
 	}
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), *duration)
-	defer cancel()
-	startedAt := time.Now()
-	payload := make([]byte, *payloadBytes)
+func runLoad(ctx context.Context, gateURL string, connectionCount int, duration time.Duration, payloadBytes int, metricsAddr string, setupTimeout time.Duration, setupConcurrency int, warmupRequests int, requestTimeout time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if connectionCount <= 0 || duration <= 0 || payloadBytes < 0 || payloadBytes > maxPayloadBytes || setupTimeout <= 0 || setupConcurrency <= 0 || warmupRequests < 0 || requestTimeout <= 0 {
+		return errors.New("invalid load configuration")
+	}
+	observer, err := newLoadObserver(metricsAddr)
+	if err != nil {
+		return fmt.Errorf("start load metrics observer: %w", err)
+	}
+	prepared := make([]preparedConnection, 0, connectionCount)
+	defer func() {
+		closePreparedConnections(prepared)
+		shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
+		if err := observer.Shutdown(shutdownContext); err != nil {
+			log.Printf("stop load metrics observer: %v", err)
+		}
+		shutdownCancel()
+	}()
+
+	payload := make([]byte, payloadBytes)
 	for i := range payload {
 		payload[i] = byte('a' + i%26)
 	}
+	setupStartedAt := time.Now()
+	setupContext, setupCancel := context.WithTimeout(ctx, setupTimeout)
+	defer setupCancel()
+	prepared, err = prepareConnections(setupContext, gateURL, connectionCount, setupConcurrency)
+	if err != nil {
+		return fmt.Errorf("prepare connections: %w", err)
+	}
+	if err := initializeConnections(setupContext, prepared, setupConcurrency, requestTimeout); err != nil {
+		return fmt.Errorf("initialize connections: %w", err)
+	}
+	if err := warmupConnections(setupContext, prepared, payload, setupConcurrency, warmupRequests, requestTimeout); err != nil {
+		return fmt.Errorf("warm up connections: %w", err)
+	}
+	setupDuration := time.Since(setupStartedAt)
 
 	var (
-		wg           sync.WaitGroup
-		successes    atomic.Uint64
-		failures     atomic.Uint64
-		echoRequests atomic.Uint64
+		measurementStart time.Time
+		admissionEnd     time.Time
 	)
-	runID := startedAt.UnixNano()
-	for i := 0; i < *connections; i++ {
-		loginName := fmt.Sprintf("load-%d-%d", runID, i)
+
+	var (
+		wg                 sync.WaitGroup
+		successfulRequests atomic.Uint64
+		connectionFailures atomic.Uint64
+	)
+	startMeasured := make(chan struct{})
+	for i := range prepared {
 		wg.Add(1)
-		go func(loginName string) {
+		go func(index int) {
 			defer wg.Done()
-			requests, err := runConnection(ctx, *gateURL, payload, loginName, observer.metrics)
-			echoRequests.Add(requests)
+			<-startMeasured
+			requests, err := runMeasuredConnection(ctx, &prepared[index], payload, admissionEnd, requestTimeout, observer.metrics)
+			successfulRequests.Add(requests)
 			if err != nil && !isExpectedLoadTermination(ctx, err) {
-				failures.Add(1)
-				log.Printf("load connection failed: %v", err)
-				return
+				connectionFailures.Add(1)
+				log.Printf("load connection failed: name=%s err=%v", prepared[index].name, err)
 			}
-			successes.Add(1)
-		}(loginName)
+		}(i)
 	}
+	measurementStart = time.Now()
+	admissionEnd = measurementStart.Add(duration)
+	close(startMeasured)
 	wg.Wait()
-	shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
-	if err := observer.Shutdown(shutdownContext); err != nil {
-		log.Printf("stop load metrics observer: %v", err)
-	}
-	shutdownCancel()
-	log.Printf("load complete: connections=%d success=%d failures=%d echo_requests=%d duration=%s", *connections, successes.Load(), failures.Load(), echoRequests.Load(), time.Since(startedAt).Round(time.Millisecond))
+	measurementEnd := time.Now()
+	log.Printf("load complete: connections=%d prepared=%d setup_duration=%s warmup_requests=%d successful_echo_requests=%d connection_failures=%d measurement_start=%s admission_end=%s measurement_end=%s measured_duration=%s", connectionCount, len(prepared), setupDuration.Round(time.Millisecond), warmupRequests, successfulRequests.Load(), connectionFailures.Load(), measurementStart.Format(time.RFC3339Nano), admissionEnd.Format(time.RFC3339Nano), measurementEnd.Format(time.RFC3339Nano), measurementEnd.Sub(measurementStart).Round(time.Millisecond))
+	return nil
 }
 
-// isExpectedLoadTermination 將全域 duration 到期時的 socket timeout 視為正常收尾。
-// deadline timer 與 context cancellation 可能有極小的排程差，因此不能只檢查 ctx.Err。
+// isExpectedLoadTermination 僅將上層 context cancellation 視為正常取消。
+// 單筆 request timeout 是 error；正式 duration 到期不會取消已送出的 request。
 func isExpectedLoadTermination(ctx context.Context, err error) bool {
-	if err == nil {
+	if err == nil || ctx == nil {
 		return false
 	}
-	deadline, ok := ctx.Deadline()
-	if !ok || time.Now().Before(deadline) {
-		return false
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-	var timeoutErr net.Error
-	return errors.As(err, &timeoutErr) && timeoutErr.Timeout()
+	return errors.Is(ctx.Err(), context.Canceled)
 }
 
-func runConnection(ctx context.Context, gateURL string, payload []byte, loginName string, metrics *loadMetrics) (uint64, error) {
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, gateURL, nil)
-	if err != nil {
-		return 0, err
-	}
-	defer closeLoadConnection(conn)
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := conn.SetWriteDeadline(deadline); err != nil {
-			_ = conn.Close()
-			return 0, fmt.Errorf("set write deadline: %w", err)
+func prepareConnections(ctx context.Context, gateURL string, connectionCount int, setupConcurrency int) ([]preparedConnection, error) {
+	prepared := make([]preparedConnection, connectionCount)
+	runID := time.Now().UnixNano()
+	err := runBounded(ctx, connectionCount, setupConcurrency, func(jobContext context.Context, index int) error {
+		loginName := fmt.Sprintf("load-%d-%d", runID, index)
+		conn, _, err := websocket.DefaultDialer.DialContext(jobContext, gateURL, nil)
+		if err != nil {
+			if conn != nil {
+				_ = conn.Close()
+			}
+			return err
 		}
+		if conn == nil {
+			return errors.New("dial returned a nil WebSocket connection")
+		}
+		prepared[index] = preparedConnection{conn: conn, sequence: 1, name: loginName}
+		return nil
+	})
+	if err != nil {
+		closePreparedConnections(prepared)
+		return nil, err
 	}
-	sequence := uint32(1)
-	if err := roundTrip(ctx, conn, gateproto.LoginRequestCommandID, &gateproto.LoginRequest{LoginName: loginName}, gateproto.LoginResponseCommandID, &gateproto.LoginResponse{}, sequence); err != nil {
-		return 0, fmt.Errorf("login: %w", err)
+	return prepared, nil
+}
+
+func initializeConnections(ctx context.Context, prepared []preparedConnection, setupConcurrency int, requestTimeout time.Duration) error {
+	return runBounded(ctx, len(prepared), setupConcurrency, func(jobContext context.Context, index int) error {
+		connection := &prepared[index]
+		if err := setupRoundTrip(jobContext, connection.conn, requestTimeout, gateproto.LoginRequestCommandID, &gateproto.LoginRequest{LoginName: connection.name}, gateproto.LoginResponseCommandID, &gateproto.LoginResponse{}, connection.sequence); err != nil {
+			return fmt.Errorf("login: %w", err)
+		}
+		connection.sequence++
+		if err := setupRoundTrip(jobContext, connection.conn, requestTimeout, protocol.EnterRoomRequestCommandID, &protocol.EnterRoomRequest{RoomId: "load-room"}, protocol.EnterRoomResponseCommandID, &protocol.EnterRoomResponse{}, connection.sequence); err != nil {
+			return fmt.Errorf("enter room: %w", err)
+		}
+		connection.sequence++
+		return nil
+	})
+}
+
+func warmupConnections(ctx context.Context, prepared []preparedConnection, payload []byte, setupConcurrency int, warmupRequests int, requestTimeout time.Duration) error {
+	return runBounded(ctx, len(prepared), setupConcurrency, func(jobContext context.Context, index int) error {
+		connection := &prepared[index]
+		for request := 0; request < warmupRequests; request++ {
+			operationContext, cancel := context.WithTimeout(jobContext, requestTimeout)
+			err := echoRoundTrip(operationContext, connection.conn, payload, connection.sequence, nil)
+			cancel()
+			if err != nil {
+				return fmt.Errorf("warm-up echo %d: %w", request+1, err)
+			}
+			connection.sequence++
+		}
+		return nil
+	})
+}
+
+func runMeasuredConnection(ctx context.Context, connection *preparedConnection, payload []byte, admissionEnd time.Time, requestTimeout time.Duration, metrics *loadMetrics) (uint64, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	sequence++
-	if err := roundTrip(ctx, conn, protocol.EnterRoomRequestCommandID, &protocol.EnterRoomRequest{RoomId: "load-room"}, protocol.EnterRoomResponseCommandID, &protocol.EnterRoomResponse{}, sequence); err != nil {
-		return 0, fmt.Errorf("enter room: %w", err)
-	}
-	sequence++
 	var requests uint64
-	for ctx.Err() == nil {
-		if err := echoRoundTrip(ctx, conn, payload, sequence, metrics); err != nil {
+	for time.Now().Before(admissionEnd) {
+		if err := ctx.Err(); err != nil {
+			return requests, err
+		}
+		operationContext, cancel := context.WithTimeout(ctx, requestTimeout)
+		err := echoRoundTrip(operationContext, connection.conn, payload, connection.sequence, metrics)
+		cancel()
+		if err != nil {
 			return requests, err
 		}
 		requests++
-		sequence++
+		connection.sequence++
 	}
-	return requests, ctx.Err()
+	return requests, nil
+}
+
+func setupRoundTrip(ctx context.Context, conn *websocket.Conn, requestTimeout time.Duration, commandID uint32, request proto.Message, responseCommandID uint32, response proto.Message, sequence uint32) error {
+	operationContext, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+	return roundTrip(operationContext, conn, commandID, request, responseCommandID, response, sequence)
+}
+
+func runBounded(ctx context.Context, count int, concurrency int, job func(context.Context, int) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if count == 0 {
+		return nil
+	}
+	if concurrency <= 0 {
+		return errors.New("setup concurrency must be positive")
+	}
+	if concurrency > count {
+		concurrency = count
+	}
+	childContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	semaphore := make(chan struct{}, concurrency)
+	var (
+		wg       sync.WaitGroup
+		once     sync.Once
+		errorMu  sync.Mutex
+		firstErr error
+	)
+	for index := 0; index < count; index++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			select {
+			case semaphore <- struct{}{}:
+			case <-childContext.Done():
+				return
+			}
+			defer func() { <-semaphore }()
+			if err := childContext.Err(); err != nil {
+				return
+			}
+			if err := job(childContext, index); err != nil {
+				once.Do(func() {
+					errorMu.Lock()
+					firstErr = fmt.Errorf("item %d: %w", index, err)
+					errorMu.Unlock()
+					cancel()
+				})
+			}
+		}(index)
+	}
+	wg.Wait()
+	errorMu.Lock()
+	err := firstErr
+	errorMu.Unlock()
+	if err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
+func closePreparedConnections(prepared []preparedConnection) {
+	for _, connection := range prepared {
+		closeLoadConnection(connection.conn)
+	}
 }
 
 func echoRoundTrip(ctx context.Context, conn *websocket.Conn, payload []byte, sequence uint32, metrics *loadMetrics) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stopClose := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+	})
+	defer stopClose()
 	request := gateproduct.EncodeWebSocketPacket(gateproduct.WebSocketPacket{CommandID: protocol.EchoRequestCommandID, Sequence: sequence, Payload: mustMarshal(&protocol.EchoRequest{Payload: payload})})
 	startedAt := time.Now()
 	metrics.startEcho()
 	defer func() {
+		if err != nil {
+			_ = conn.Close()
+		}
 		metrics.finishEcho(ctx, err, time.Since(startedAt))
 	}()
-	if err = conn.WriteMessage(websocket.BinaryMessage, request); err != nil {
+	if err = writeMessage(ctx, conn, websocket.BinaryMessage, request); err != nil {
 		return err
 	}
 	_, err = readResponse(ctx, conn, protocol.EchoResponseCommandID)
@@ -153,12 +322,24 @@ func closeLoadConnection(conn *websocket.Conn) {
 	_ = conn.Close()
 }
 
-func roundTrip(ctx context.Context, conn *websocket.Conn, commandID uint32, request proto.Message, responseCommandID uint32, response proto.Message, sequence uint32) error {
+func roundTrip(ctx context.Context, conn *websocket.Conn, commandID uint32, request proto.Message, responseCommandID uint32, response proto.Message, sequence uint32) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stopClose := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+	})
+	defer stopClose()
+	defer func() {
+		if err != nil {
+			_ = conn.Close()
+		}
+	}()
 	payload, err := proto.Marshal(request)
 	if err != nil {
 		return err
 	}
-	if err := conn.WriteMessage(websocket.BinaryMessage, gateproduct.EncodeWebSocketPacket(gateproduct.WebSocketPacket{CommandID: commandID, Sequence: sequence, Payload: payload})); err != nil {
+	if err := writeMessage(ctx, conn, websocket.BinaryMessage, gateproduct.EncodeWebSocketPacket(gateproduct.WebSocketPacket{CommandID: commandID, Sequence: sequence, Payload: payload})); err != nil {
 		return err
 	}
 	data, err := readResponse(ctx, conn, responseCommandID)
@@ -168,14 +349,20 @@ func roundTrip(ctx context.Context, conn *websocket.Conn, commandID uint32, requ
 	if response == nil {
 		return nil
 	}
-	return proto.Unmarshal(data, response)
+	err = proto.Unmarshal(data, response)
+	return err
 }
 
 func readResponse(ctx context.Context, conn *websocket.Conn, commandID uint32) ([]byte, error) {
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := conn.SetReadDeadline(deadline); err != nil {
-			return nil, err
-		}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var deadline time.Time
+	if value, ok := ctx.Deadline(); ok {
+		deadline = value
+	}
+	if err := conn.SetReadDeadline(deadline); err != nil {
+		return nil, err
 	}
 	for {
 		messageType, data, err := conn.ReadMessage()
@@ -194,6 +381,20 @@ func readResponse(ctx context.Context, conn *websocket.Conn, commandID uint32) (
 		}
 		return data[16:size], nil
 	}
+}
+
+func writeMessage(ctx context.Context, conn *websocket.Conn, messageType int, data []byte) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var deadline time.Time
+	if value, ok := ctx.Deadline(); ok {
+		deadline = value
+	}
+	if err := conn.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	return conn.WriteMessage(messageType, data)
 }
 
 func mustMarshal(message proto.Message) []byte {

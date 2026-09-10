@@ -344,7 +344,9 @@ func (s *WebSocketServer) dispatchPacket(ctx context.Context, session *webSocket
 	}
 	source := gatelink.RequestSource{ConnectionID: string(session.ID())}
 	if s.serverSend != nil {
-		source.GateID = s.serverSend.Route()
+		route := s.serverSend.Route()
+		source.GateID = route.GateID
+		source.ReplyEndpoint = route.ReplyEndpoint
 	}
 	ctx = WithWebSocketRequestContext(ctx, WebSocketRequestContext{
 		Request: gatelink.GateRequestContext{

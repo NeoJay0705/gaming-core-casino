@@ -18,12 +18,11 @@ func TestDirectRequestPlayerSenderContractUsesOnlyRequestRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = transport.Stop(context.Background()) })
-	directory := testDirectory{byID: map[GateID]GateEndpoint{endpoint.GateID: endpoint}, endpoints: []GateEndpoint{endpoint}}
-	sender, err := NewDirectRequestPlayerSender(directory, transport)
+	sender, err := NewDirectRequestPlayerSender(transport)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := gatelink.WithGateRequestContext(context.Background(), gatelink.GateRequestContext{TraceID: "trace-request-1", Source: gatelink.RequestSource{GateID: string(endpoint.GateID), ConnectionID: "connection-1"}})
+	ctx := gatelink.WithGateRequestContext(context.Background(), gatelink.GateRequestContext{TraceID: "trace-request-1", Source: gatelink.RequestSource{GateID: string(endpoint.GateID), ConnectionID: "connection-1", ReplyEndpoint: endpoint.Address}})
 	if _, err := sender.SendToRequestPlayer(ctx, RequestPlayerMessage{ExpectedLoginName: "alice", Message: Message{CommandID: 1, Payload: []byte("reply")}}); err != nil {
 		t.Fatalf("send direct response: %v", err)
 	}
@@ -48,26 +47,30 @@ func TestDirectRequestPlayerSenderContractUsesOnlyRequestRoute(t *testing.T) {
 	}
 }
 
-func TestDirectRequestPlayerSenderContractRejectsUnknownGateWithoutDialingArbitraryEndpoint(t *testing.T) {
-	receiver, endpoint := newTestReceiverEndpoint(t, "gate-known", DeliveryStatus_DELIVERY_STATUS_DELIVERED)
+func TestDirectRequestPlayerSenderContractRejectsMissingOrMalformedReplyEndpoint(t *testing.T) {
 	transport, err := NewGRPCTransport(TransportConfig{RequestTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = transport.Stop(context.Background()) })
-	directory := testDirectory{byID: map[GateID]GateEndpoint{endpoint.GateID: endpoint}, endpoints: []GateEndpoint{endpoint}}
-	sender, err := NewDirectRequestPlayerSender(directory, transport)
+	sender, err := NewDirectRequestPlayerSender(transport)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := gatelink.WithGateRequestContext(context.Background(), gatelink.GateRequestContext{Source: gatelink.RequestSource{GateID: "unknown-gate", ConnectionID: "connection-1"}})
-	if _, err := sender.SendToRequestPlayer(ctx, RequestPlayerMessage{Message: Message{CommandID: 1}}); !errors.Is(err, ErrGateEndpointNotFound) {
-		t.Fatalf("unknown Gate error = %v, want ErrGateEndpointNotFound", err)
-	}
-	receiver.mu.Lock()
-	defer receiver.mu.Unlock()
-	if receiver.connectionID != "" {
-		t.Fatalf("unknown Gate caused delivery to %q", receiver.connectionID)
+	for _, test := range []struct {
+		name   string
+		source gatelink.RequestSource
+		want   string
+	}{
+		{name: "missing endpoint", source: gatelink.RequestSource{GateID: "gate-a", ConnectionID: "connection-1"}, want: "reply endpoint is required"},
+		{name: "malformed endpoint", source: gatelink.RequestSource{GateID: "gate-a", ConnectionID: "connection-1", ReplyEndpoint: "not-an-endpoint"}, want: "gate address"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := gatelink.WithGateRequestContext(context.Background(), gatelink.GateRequestContext{Source: test.source})
+			if _, err := sender.SendToRequestPlayer(ctx, RequestPlayerMessage{Message: Message{CommandID: 1}}); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("reply route error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 

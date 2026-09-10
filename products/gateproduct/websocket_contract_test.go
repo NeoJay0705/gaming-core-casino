@@ -326,7 +326,7 @@ func TestGateWebSocketContractDirectGameReplyReturnsToOriginalConnection(t *test
 			return err
 		}
 		if err := r.Provide(func() *gateServerSendRuntime {
-			return &gateServerSendRuntime{gateID: "gate-direct-reply", started: true}
+			return &gateServerSendRuntime{gateID: "gate-direct-reply", replyEndpoint: deliveryAddress, started: true}
 		}); err != nil {
 			return err
 		}

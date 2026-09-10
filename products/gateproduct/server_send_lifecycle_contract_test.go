@@ -9,6 +9,7 @@ import (
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
@@ -47,12 +48,20 @@ func TestGateServerSendContractManagedRuntimeStartsThroughWebSocketDependency(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	gateID := serversend.GateID(webSocket.serverSend.Route())
+	route := webSocket.serverSend.Route()
+	gateID := serversend.GateID(route.GateID)
 	if gateID == "" {
 		t.Fatal("server-send runtime did not expose a Gate identity")
 	}
-	if _, err := directory.Resolve(context.Background(), gateID); err != nil {
+	if route.ReplyEndpoint == "" {
+		t.Fatal("server-send runtime did not expose a reply endpoint")
+	}
+	endpoint, err := directory.Resolve(context.Background(), gateID)
+	if err != nil {
 		t.Fatalf("endpoint after app start: %v", err)
+	}
+	if route.ReplyEndpoint != endpoint.Address {
+		t.Fatalf("reply endpoint = %q, registered endpoint = %q", route.ReplyEndpoint, endpoint.Address)
 	}
 	identitySession := &registrySession{id: "identity-contract"}
 	if err := webSocket.registry.Register(identitySession, "alice"); err != nil {
@@ -72,6 +81,9 @@ func TestGateServerSendContractManagedRuntimeStartsThroughWebSocketDependency(t 
 	}
 	if err := app.frameworkApp.Stop(context.Background()); err != nil {
 		t.Fatalf("stop app: %v", err)
+	}
+	if route := webSocket.serverSend.Route(); route != (gatelink.RequestSource{}) {
+		t.Fatalf("server-send route after app stop = %#v, want empty route", route)
 	}
 	if _, err := directory.Resolve(context.Background(), gateID); !errors.Is(err, serversend.ErrGateEndpointNotFound) {
 		t.Fatalf("endpoint after app stop = %v, want ErrGateEndpointNotFound", err)

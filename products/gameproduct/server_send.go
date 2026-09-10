@@ -52,8 +52,8 @@ func newGameFanoutSender(cfg serversend.Config, transport *serversend.GRPCTransp
 	return serversend.NewFanoutSender(directory, transport, serversend.FanoutConfig{MaxEndpoints: cfg.Fanout.MaxEndpoints})
 }
 
-func newGameRequestPlayerSender(directory *serversend.RedisGateDirectory, transport *serversend.GRPCTransport, metrics *gameMetrics) (serversend.RequestPlayerSender, error) {
-	sender, err := serversend.NewDirectRequestPlayerSender(directory, transport)
+func newGameRequestPlayerSender(transport *serversend.GRPCTransport, metrics *gameMetrics) (serversend.RequestPlayerSender, error) {
+	sender, err := serversend.NewDirectRequestPlayerSender(transport)
 	if err != nil {
 		return nil, err
 	}

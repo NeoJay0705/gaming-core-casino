@@ -17,7 +17,9 @@
 ## 2. 測量邊界
 
 測試流程固定為每條 WebSocket connection 先完成 Login → EnterRoom，之後只重複 Echo。Login 與
-EnterRoom 是 setup traffic，不納入 Echo latency 與 Echo request 數量。
+EnterRoom 是 setup traffic，不納入 Echo latency 與 Echo request 數量。Load client 先以 bounded
+`setup-concurrency` 完成全部 WebSocket handshakes，再完成 Login／EnterRoom；所有 session ready 後才執行
+固定次數 warm-up，最後才開始正式 Echo admission window。
 
 ### 2.1 Client-side round trip
 
@@ -27,8 +29,9 @@ EnterRoom 是 setup traffic，不納入 Echo latency 與 Echo request 數量。
 2. 等待同一條 connection 收到預期的 Echo response frame。
 3. frame header 與 command ID 驗證成功後，記錄 `success` 與 `time.Since(startedAt)`。
 4. write、read、frame validation 或 connection error 時，記錄同一筆 request 為 `error` 並結束該
-   connection；若錯誤只因全域測試 duration 到期，則記為 `cancelled`。一筆 request 只能有一個
-   terminal result。
+   connection；正式 duration 到期只停止新 request，當下唯一的 in-flight request 仍以單筆
+   `request-timeout` 收尾。一筆 request 只能有一個 terminal result；只有上層 context cancellation 才記為
+   `cancelled`。
 
 此數值包含 client write、網路、Gate ingress、Gate-to-Game gRPC、Game handler、server-send、Gate
 WebSocket write 與 client read，是玩家角度的 end-to-end latency。
@@ -43,7 +46,7 @@ WebSocket write 與 client read，是玩家角度的 end-to-end latency。
 | Gate command latency | `gaming_core_gate_websocket_command_duration_seconds{route="game",command="forward",result="success"}` |
 | Gate → Game gRPC | `gaming_core_gate_game_grpc_requests_total{code="OK"}`、`gaming_core_gate_game_grpc_duration_seconds{code="OK"}` |
 | Game Echo handler | `gaming_core_game_gate_commands_total{command="4043309073",result="success"}`、`gaming_core_game_gate_command_duration_seconds` |
-| Game request-player | `gaming_core_game_server_send_requests_total{operation="request_player",result="success"}`、`gaming_core_game_server_send_duration_seconds` |
+| Game request-player | `gaming_core_game_server_send_requests_total{operation="request_player",result="success"}`、`gaming_core_game_server_send_duration_seconds`；direct reply 使用 request-scoped `ReplyEndpoint`，不查 Redis |
 | Gate 收到 server-send | `gaming_core_gate_server_send_requests_total{target="connection",result="queued"}` |
 | Gate 寫回 client | `gaming_core_gate_websocket_writes_total{source="server_send",result="success"}` |
 | Gate receive 至 write terminal | `gaming_core_gate_server_send_delivery_duration_seconds{target="connection",result="success"}` |
@@ -62,12 +65,15 @@ Echo request ID `0xF1000011` 的十進位值是 `4043309073`。Gate 使用 bound
 | `gaming_core_example_load_echo_round_trip_duration_seconds` | Histogram `{result}` | Client-side end-to-end latency |
 | `gaming_core_example_load_echo_round_trips_in_flight` | Gauge | 已送出但尚未收到 terminal result 的 Echo 數量 |
 
-只增加一個 loopback metrics listener flag `-metrics-addr 127.0.0.1:22081`，暴露
-`/metrics`。load client 不是 framework product，不需要 `/health`、`/ready`、DI module 或通用 HTTP
-server abstraction。Histogram 第一版沿用 `prometheus.DefBuckets`，待基準壓測顯示 buckets 不適用時再調整。
+load client 使用 loopback metrics listener flag `-metrics-addr 127.0.0.1:22081`，暴露 `/metrics`；另有
+`-setup-timeout`、`-setup-concurrency`、`-warmup-requests` 與 `-request-timeout` 控制 setup、warm-up
+與單筆 request。`-duration` 只表示正式 Echo admission window。load client 不是 framework product，不需要
+`/health`、`/ready`、DI module 或通用 HTTP server abstraction。Histogram 第一版沿用 `prometheus.DefBuckets`，
+待基準壓測顯示 buckets 不適用時再調整。
 
-現有結束 log 的 `echo_requests` 必須保留，並繼續代表成功收到的 Echo response 數；它是單次執行的
-精確完成數。Prometheus time series 用於觀察測試期間的 rate 與分布，不能因 scrape timing 取代最終 log。
+結束 log 應輸出 prepared connections、setup duration、warm-up requests、measurement/admission timestamps、
+successful Echo requests 與 connection failures。successful Echo requests 是正式測量的精確完成數；
+Prometheus time series 用於觀察測試期間的 rate 與分布，不能因 scrape timing 取代最終 log。
 
 不得加入 connection ID、login name、room ID、sequence、payload、error text 或 run ID labels，避免
 cardinality 隨壓測規模成長。
@@ -131,14 +137,19 @@ scrape_configs:
 ```sh
 go run ./examples/metrics/load \
   -connections 1 \
+  -setup-concurrency 1 \
+  -setup-timeout 2m \
+  -warmup-requests 1 \
+  -request-timeout 10s \
   -duration 15s \
   -payload-bytes 32 \
   -metrics-addr 127.0.0.1:22081
 ```
 
-執行前後各保存一次 Gate 與 Game `/metrics` response，以 counter delta 驗證第 5 節。測試結束後至少再
-等待兩個 scrape intervals，讓 Gate／Game 的 terminal gauges 與最後一筆 counter 被收集；Gate 與 Game
-在取完 final snapshot 前保持運行。
+在 load 啟動前保存一次 Gate 與 Game `/metrics` response；warm-up 成功數為
+`W = connections × warmup-requests`。測試結束後至少再等待兩個 scrape intervals，讓 Gate／Game 的
+terminal gauges 與最後一筆 counter 被收集；Gate 與 Game 在取完 final snapshot 前保持運行。以 final delta
+扣除 `W` 後，再依第 5 節核對正式 measured Echo 數量。
 
 ### 4.4 再做 pressure run
 
@@ -147,19 +158,26 @@ correctness run 通過後才逐步增加 connections 或 payload，例如：
 ```sh
 go run ./examples/metrics/load \
   -connections 8 \
+  -setup-concurrency 32 \
+  -setup-timeout 2m \
+  -warmup-requests 1 \
+  -request-timeout 10s \
   -duration 60s \
   -payload-bytes 256 \
   -metrics-addr 127.0.0.1:22081
 ```
 
-每次只改一個主要變因，並記錄 connections、duration、payload bytes、程式版本及測試起訖時間。
+每次只改一個主要變因，並記錄 connections、setup-concurrency、warmup-requests、duration、payload bytes、
+程式版本及測試起訖時間。正式矩陣可使用 `100、200、400、800、1600、3200` connections；server process
+以 `GOMAXPROCS=4` 啟動，setup concurrency 固定為 32，避免把 connection burst 與正式 saturation 混在一起。
 測試環境允許時，load client 與 services 分開執行，避免 load generator 的 CPU 或 file descriptor 壓力
 和 server saturation 混在同一台機器上。
 
 ## 5. Correctness 驗收
 
-以測試前後 counter snapshot 的差值 `Δ` 驗證。若 load 結束 log 的 `echo_requests=N` 且
-`failures=0`，穩定狀態下以下成功 counter delta 都必須等於 `N`：
+以 load 啟動前後 counter snapshot 的差值 `Δ` 驗證。若 warm-up 完整成功、load 結束 log 的
+`successful_echo_requests=N` 且 `connection_failures=0`，令 `W = connections × warmup-requests`，則以下
+每個 server-side success counter 都必須滿足 `Δ - W = N`：
 
 ```text
 load successful Echo round trips
@@ -171,8 +189,9 @@ load successful Echo round trips
   = Gate server-send WebSocket write success
 ```
 
-相對應 success Histogram 的 `_count` delta 也必須等於 `N`。不要比較 `_sum` 或單筆 duration 的精確值；
-duration 只要求非負且 observation 數量正確。
+相對應 server-side success Histogram 的 `_count` delta 也必須滿足 `Δ_count - W = N`；load-private success
+Histogram 的 `_count` 直接等於 `N`。不要比較 `_sum` 或單筆 duration 的精確值；duration 只要求非負且
+observation 數量正確。
 
 Load observer 的 contract test 必須確認
 `gaming_core_example_load_echo_round_trips_in_flight` 在所有 terminal results 後回到 `0`。短生命週期
@@ -197,8 +216,9 @@ load process 結束時會同步關閉 `/metrics`，因此不要求 Prometheus �
 - Gate write queue full
 - 非預期 connection close reasons
 
-全域 duration 到期時，每條 connection 最多可能有一筆 client `result="cancelled"`；這是正常停止，
-不算壓測錯誤。`result="error"` 才表示非預期的 client-side terminal failure。
+正式 duration 到期不應產生因 duration 取消的 `client result="cancelled"`；最後一筆 in-flight request 必須
+在 `request-timeout` 內完成。只有外部 context cancellation 才可產生 `cancelled`；`result="error"` 或
+request timeout 才表示 client-side failure。
 
 正常結束應記為 `client_closed`；若出現 `read_error`、`forward_error`、`write_error`、
 `write_queue_full` 或 `panic`，本次 correctness run 不通過。
@@ -213,14 +233,15 @@ server-send／WebSocket write 是非同步的，短暫不相等是正常現象�
 比較相同窗口的 client completion rate 與各 server stage rate：
 
 ```promql
-rate(gaming_core_example_load_echo_round_trips_total{result="success"}[1m])
-rate(gaming_core_gate_websocket_commands_total{route="game",command="forward",result="success"}[1m])
-rate(gaming_core_game_gate_commands_total{command="4043309073",result="success"}[1m])
-rate(gaming_core_gate_websocket_writes_total{source="server_send",result="success"}[1m])
+rate(gaming_core_example_load_echo_round_trips_total{result="success"}[5s])
+rate(gaming_core_gate_websocket_commands_total{route="game",command="forward",result="success"}[5s])
+rate(gaming_core_game_gate_commands_total{command="4043309073",result="success"}[5s])
+rate(gaming_core_gate_websocket_writes_total{source="server_send",result="success"}[5s])
 ```
 
-若前段 rate 高於後段，沿路檢查 bounded error counters、gRPC code、queue full 與 connection close
-reason。不要用 log error text 建立新 label。
+使用 1 秒 scrape interval 時，排除 measurement 開始後第一個完整 5 秒 lookback window，避免 warm-up samples
+污染 rate。若前段 rate 高於後段，沿路檢查 bounded error counters、gRPC code、queue full 與 connection
+close reason。不要用 log error text 建立新 label。
 
 ### 6.2 Latency
 
@@ -230,7 +251,7 @@ reason。不要用 log error text 建立新 label。
 histogram_quantile(
   0.95,
   sum by (le) (
-    rate(gaming_core_example_load_echo_round_trip_duration_seconds_bucket{result="success"}[1m])
+    rate(gaming_core_example_load_echo_round_trip_duration_seconds_bucket{result="success"}[5s])
   )
 )
 ```
@@ -239,7 +260,7 @@ histogram_quantile(
 相同形式查詢。判讀原則：
 
 - client p95 與 Gate command／gRPC 同時升高：優先檢查 Gate-to-Game 或 Game handler；
-- Game handler 平穩，但 Game server-send 升高：檢查 Redis routing、Gate receiver 或 gRPC transport；
+- Game handler 平穩，但 Game server-send 升高：檢查 request-scoped reply endpoint、Gate receiver 或 gRPC transport；
 - server-send delivery 或 WebSocket write 升高：檢查 write queue、slow client 與 socket write；
 - 所有 server stages 平穩，只有 client round trip 升高：檢查 client、網路或 load generator saturation。
 

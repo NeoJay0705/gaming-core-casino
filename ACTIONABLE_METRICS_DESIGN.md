@@ -179,6 +179,16 @@ Collector 不執行 query、PING 或其他 I/O；scrape 時只讀本機 stats sn
 workflow 註冊與使用；它們不成為 framework product 的公開業務 API。Runnable 範本只負責組裝正式
 product App 與範例 handler，不把假資料邏輯加入四個 product 的預設 module。
 
+### 4.7 `pkg/gatelink` 與 direct request route
+
+`gatelink.RequestSource` 保留 `GateID`、`ConnectionID`，並增加由 Gate server-send listener 產生的
+`ReplyEndpoint`。既有 gRPC metadata interceptor 以固定 `x-gate-request-reply-endpoint` key 傳遞它；一般
+Gate request 可不帶此欄位，只有 `RequestPlayerSender` 要求三者完整。Gate 不接受 player payload 提供 endpoint。
+
+`serversend.DirectRequestPlayerSender` 只依賴既有 `GRPCTransport`，從 request context 組出已驗證的
+`GateEndpoint` 後直接呼叫 `SendToConnection`，不再以 GateID 呼叫 Redis `GateResolver`。`RoutedPlayerSender`
+與 broadcast sender 的 presence/directory route 不變。
+
 ---
 
 ## 5. Metrics 契約
@@ -425,7 +435,8 @@ Login proto 與既有 transport path 是 public contract；EnterRoom/Echo transp
 - 在 `GateRequestChannel` 註冊 example-local Echo command。
 - Unmarshal example-local `EchoRequest`，建立 `EchoResponse`。
 - 使用 `RequestPlayerSender.SendToRequestPlayer` 回到原始 Gate connection。
-- 不使用 Database；Redis 只由既有 Gate directory/server-send route 使用。
+- direct request-player reply 直接使用 Gate request context 的 `ReplyEndpoint`；不為每筆 Echo reply 查 Redis。
+- 不使用 Database；`PlayerSender`／broadcast 仍依既有設定使用 Redis presence/directory route。
 
 ### 7.4 四個 runnable programs
 
@@ -461,10 +472,12 @@ CLI framework。Gate/Game 注入 workflow module；API/GMS 因尚無 handler，�
 格式、example command IDs、Prometheus scrape URLs 與完整 login → enter-room → echo 壓測順序。範例設定不得
 包含真實 credential。
 
-`load/main.go` 是配合此 example protocol 的最小 closed-loop client，不是第五個 product service。它只
-提供 Gate URL、connection 數、執行時間、bounded payload size 與 loopback metrics address flags；每條
-connection 依序 login、enter-room，再於收到上一筆 Echo response 後送下一筆。結束時輸出成功/失敗數與
-實際 duration。
+`load/main.go` 是配合此 example protocol 的最小 closed-loop client，不是第五個 product service。它提供 Gate
+URL、connection 數、正式測量 duration、bounded payload size、setup timeout/concurrency、warm-up request count
+與 loopback metrics address flags。它先以 bounded concurrency 建立全部 WebSocket connections，再依序完成
+Login／EnterRoom 與固定次數 warm-up；全部準備完成後才開始正式 measured Echo。`duration` 是停止送出新
+request 的 admission window，最後一筆 in-flight request 以單筆 request timeout 收尾，並輸出 setup、measurement
+與完成數摘要。
 
 Load 應使用獨立 Prometheus registry，在 `/metrics` 暴露三個 example-local metrics：
 
@@ -473,9 +486,11 @@ Load 應使用獨立 Prometheus registry，在 `/metrics` 暴露三個 example-l
 - `gaming_core_example_load_echo_round_trips_in_flight`。
 
 Client timer 從 Echo `WriteMessage` 前開始，到預期 response frame 完成 validation 後結束。`result` 只允許
-`success`、`error`、`cancelled`；全域 duration 到期造成的最後一筆中止使用 `cancelled`，避免污染服務
-error。Load listener 只提供 `/metrics`，不提供 framework `/health`、`/ready` 或 DI lifecycle。不同
-process 的 Histogram 只在同一時間窗口比較趨勢，不相減 quantile。詳細執行與驗收方式記錄在
+`success`、`error`、`cancelled`；正式 duration 到期只停止新 request，不取消已送出的 request，避免同一筆
+server 已處理而 client 被誤記為 cancelled。單筆 request timeout 記為 `error`；只有上層 context cancellation
+才記為 `cancelled`。warm-up 不寫入 load-private metrics，server-side counter correctness 以測試前 baseline
+扣除已知 warm-up 數後驗證。Load listener 只提供 `/metrics`，不提供 framework `/health`、`/ready` 或 DI
+lifecycle。不同 process 的 Histogram 只在同一時間窗口比較趨勢，不相減 quantile。詳細執行與驗收方式記錄在
 `ACTIONABLE_METRICS_EXAMPLE_VALIDATION.md`。
 
 不加入 arbitrary command、failure injection、distributed workers、HTML report、自製 percentile engine
@@ -574,9 +589,15 @@ read failure 與 application 主動 close 應分開；原始 error 只進 log，
 - `products/gameproduct/grpc.go`
   - 以 dispatcher registration 決定 bounded command label 並記錄 handler metrics。
 - `products/gameproduct/server_send.go`
-  - 只包裝 `RequestPlayerSender`，不改其他 sender 行為。
+  - 只包裝 `RequestPlayerSender`，以 request-scoped reply endpoint 建立 direct sender，不改其他 sender 行為。
 - Game 既有 contract tests
   - 補 registered/unknown/error/server-send metrics contracts。
+- `pkg/gatelink/metadata.go` 與 gatelink contract tests
+  - 在 `RequestSource`／既有 metadata interceptor 傳遞可選 `ReplyEndpoint`，保留一般 request 的相容性。
+- `pkg/serversend/sender.go` 與 sender contract tests
+  - direct request-player sender 直接驗證並使用 request route，不依賴 per-message Redis `GateResolver`。
+- `products/gateproduct/server_send_runtime.go`、`websocket.go` 與受影響 Gate tests
+  - 保存 managed advertise endpoint，注入每筆 forwarded request；停止後清空 route。
 
 ### 10.2 Example wire contract
 
@@ -596,9 +617,13 @@ namespace 使用 `metrics.example.v1`，Go package 使用
 
 - 新增第 7.4 節列出的四個 service `main`、最小 load client、兩個 workflow modules、設定與 README。
 - `examples/metrics/load/metrics.go` 建立 load-private registry、三個 Echo metrics 與可 graceful shutdown
-  的 loopback `/metrics` listener；`main.go` 只把 observer 傳入 Echo round trip。
+  的 loopback `/metrics` listener；`main.go` 以 bounded setup、warm-up、admission window 與 request-timeout
+  drain 管理 Echo round trip。
 - `examples/metrics/load/metrics_test.go` 驗證 success/error/cancelled terminal results、Histogram count、
   實際 Echo round trip、in-flight 歸零、HTTP exposition、非 metrics path 為 404 與 listener shutdown。
+- `examples/metrics/load/main_test.go`
+  - 驗證 setup concurrency、handshake／session／warm-up phase ordering、warm-up 不寫入 metrics，以及 admission
+    window 到期後 drain in-flight request。
 - 新增 `flow_contract_test.go` 覆蓋 Gate/Game full-flow 與兩個 state rejection；API/GMS 由各自 App
   contract 驗證可啟停。
 - 不修改四個 product `NewApp` public signature，不把 example handler 放入預設 module。
@@ -635,6 +660,10 @@ namespace 使用 `metrics.example.v1`，Go package 使用
 12. Observability：每個 App 都含 Go/process collectors，兩個 App registry 仍互相隔離。
 13. Load observer：每筆 Echo 只有一個 `success`、`error` 或 `cancelled` terminal result，Histogram
     count 對應 Counter、in-flight 歸零，且 private `/metrics` listener 可停止。
+14. Direct request route：metadata 保留 GateID／connection／reply endpoint；sender 不查 Redis，malformed
+    endpoint 在 delivery 前失敗。
+15. Load phases：所有 handshake 完成後才送 Login，所有 session ready 後才 warm-up，admission window 到期
+    不取消既有 in-flight request，setup concurrency 不超過設定。
 
 Counter/Histogram 以 Prometheus `testutil` 或 gather result 驗證，不依賴 sleep 判斷 duration exact value；
 只驗證 sample count、label 與值大於等於零。Concurrency tests 需可在 `-race` 下穩定重複。
@@ -703,9 +732,9 @@ framework product 的公開 package。其 payload bounded、無資料庫 side ef
 
 ### 12.5 不全面 instrument 所有 infra/serversend operation
 
-目前壓測流程只使用 direct request-player reply；先包裝這條 sender path 即可定位需求描述中的
-server-send stage。Player/broadcast sender、Redis commands 與 SQL statements 尚無 workload/SLO，
-現在加入只會增加未被驗證的 metric surface。
+目前壓測流程只使用 direct request-player reply；直接攜帶 Gate request 的 reply endpoint 即可定位需求描述
+中的 server-send stage，且不必為每筆 reply 查 Redis。Player/broadcast sender、Redis commands 與 SQL
+statements 尚無 workload/SLO，現在加入只會增加未被驗證的 metric surface。
 
 ---
 
@@ -722,7 +751,8 @@ server-send stage。Player/broadcast sender、Redis commands 與 SQL statements 
   仍保留 collector，但該部分可能沒有 samples。
 - 未提供 alert/dashboard 或通用 load framework；最小 client 只支援本次固定 workflow。
 - Load client 的 metrics listener 只供 Prometheus pull，不提供 product health/readiness，也不持久化最終
-  report；單次精確完成數仍以 load 結束 log 為準。
+  report；單次精確完成數仍以 load 結束 log 為準。Load 先 bounded 建立 connections、初始化 session 與
+  warm-up，再以 duration 作 request admission window；最後一筆 request 由單筆 timeout bounded drain。
 - 未來新增 sender metrics 時沿用同一 `operation` bounded set，但不在本次預先建立通用 middleware。
 
 ---
@@ -777,8 +807,9 @@ server-send stage。Player/broadcast sender、Redis commands 與 SQL statements 
 ### 14.4 最終範圍判定
 
 Review 後的修改沒有刪減已確認需求。所有新增 production metrics 都能對應 Rate、Error、Duration 或
-Saturation，且每個 label 都有封閉來源。額外程式結構只用於三個現存缺口：判斷 dispatcher
-registration、讀取 canonical session state、把 server-send receive time 帶到 asynchronous writer。
+Saturation，且每個 label 都有封閉來源。額外程式結構只用於現存缺口：判斷 dispatcher registration、讀取
+canonical session state、把 server-send receive time 帶到 asynchronous writer、攜帶 direct reply endpoint
+以及讓 load setup 與 measured window 可分離。
 
 若再移除其中任一項，會失去 command cardinality 安全、狀態 contract、指定 latency 邊界、pool
 saturation 或可執行驗證之一；上述明確排除項若加入，則會超出目前 workload 與需求。因此本設計是
@@ -795,7 +826,8 @@ saturation 或可執行驗證之一；上述明確排除項若加入，則會超
 5. 新增 example-local EnterRoom/Echo proto、generated files 與 schema contracts。
 6. 新增 Gate/Game workflow modules 與 full-flow integration contract。
 7. 新增四個 runnable service mains、最小 load client、configs 與 README，確認全部 examples 可編譯。
-8. 執行完整 test/race/vet，最後核對 diff 只包含第 10 節列出的必要範圍。
+8. 完成 request-scoped direct reply route 與 load setup/warm-up/admission phases 的 contract tests。
+9. 執行完整 test/race/vet，最後核對 diff 只包含第 10 節列出的必要範圍。
 
 若實作中發現既有 API 無法維持本文件定義的 enqueue、lazy lifecycle 或 App-local registry 契約，應先
 更新本設計說明原決策、實際問題、調整與取捨，再修改程式；不得以便利為由靜默擴大範圍。

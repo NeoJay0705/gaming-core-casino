@@ -29,10 +29,10 @@ func TestLoadMetricsRecordsTerminalResultsAndReturnsInFlightToZero(t *testing.T)
 	metrics.finishEcho(context.Background(), nil, time.Millisecond)
 	metrics.startEcho()
 	metrics.finishEcho(context.Background(), errors.New("read failed"), 2*time.Millisecond)
-	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
-	t.Cleanup(cancel)
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
 	metrics.startEcho()
-	metrics.finishEcho(expired, context.DeadlineExceeded, 3*time.Millisecond)
+	metrics.finishEcho(cancelled, errors.New("connection closed"), 3*time.Millisecond)
 
 	for _, result := range []string{loadResultSuccess, loadResultError, loadResultCancelled} {
 		if got := counterSampleValue(t, registry, "gaming_core_example_load_echo_round_trips_total", result); got != 1 {
