@@ -16,6 +16,10 @@ go run ./examples/metrics/load -connections 8 -duration 30s
 各服務的 `/metrics` endpoint 分別是 Game `http://127.0.0.1:19080/metrics`、Gate
 `http://127.0.0.1:18081/metrics`、API `http://127.0.0.1:20081/metrics`、GMS
 `http://127.0.0.1:21081/metrics`；同一 listener 也提供 `/health` 與 `/ready`。
+Load client 另外在 `http://127.0.0.1:22081/metrics` 暴露 example-local Echo round-trip Counter、
+Histogram 與 in-flight Gauge，可用 `-metrics-addr` 調整 listener。這個 endpoint 只觀測壓測端，
+不屬於 framework product；完整的 client／Gate／Game 比對方法見 repository root 的
+`ACTIONABLE_METRICS_EXAMPLE_VALIDATION.md`。
 只要更換 `-config` 即可調整 listener 或 Redis 設定；範例 login 是 in-memory policy，不能
 當成正式 authentication。EnterRoom 與 Echo 的 protobuf 與 command IDs 位於
 `examples/metrics/internal/protocol`，只屬於本範例，不是 product 的 production API；正式服務應

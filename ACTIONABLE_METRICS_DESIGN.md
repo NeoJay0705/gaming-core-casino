@@ -439,6 +439,8 @@ examples/metrics/
   api/main.go
   gms/main.go
   load/main.go
+  load/metrics.go
+  load/metrics_test.go
   internal/protocol/
     command.go
     room.proto
@@ -459,11 +461,25 @@ CLI framework。Gate/Game 注入 workflow module；API/GMS 因尚無 handler，�
 格式、example command IDs、Prometheus scrape URLs 與完整 login → enter-room → echo 壓測順序。範例設定不得
 包含真實 credential。
 
-`load/main.go` 是配合此 example protocol 的最小 closed-loop client，不是第五個服務。它只提供 Gate URL、
-connection 數、執行時間與 bounded payload size flags；每條 connection 依序 login、enter-room，再於
-收到上一筆 Echo response 後送下一筆。結束時輸出成功/失敗數與實際 duration，server-side latency 與
-瓶頸仍以 Prometheus metrics 為準。不加入 arbitrary command、failure injection、distributed workers、
-HTML report 或自製 percentile engine。
+`load/main.go` 是配合此 example protocol 的最小 closed-loop client，不是第五個 product service。它只
+提供 Gate URL、connection 數、執行時間、bounded payload size 與 loopback metrics address flags；每條
+connection 依序 login、enter-room，再於收到上一筆 Echo response 後送下一筆。結束時輸出成功/失敗數與
+實際 duration。
+
+Load 應使用獨立 Prometheus registry，在 `/metrics` 暴露三個 example-local metrics：
+
+- `gaming_core_example_load_echo_round_trips_total{result}`；
+- `gaming_core_example_load_echo_round_trip_duration_seconds{result}`；
+- `gaming_core_example_load_echo_round_trips_in_flight`。
+
+Client timer 從 Echo `WriteMessage` 前開始，到預期 response frame 完成 validation 後結束。`result` 只允許
+`success`、`error`、`cancelled`；全域 duration 到期造成的最後一筆中止使用 `cancelled`，避免污染服務
+error。Load listener 只提供 `/metrics`，不提供 framework `/health`、`/ready` 或 DI lifecycle。不同
+process 的 Histogram 只在同一時間窗口比較趨勢，不相減 quantile。詳細執行與驗收方式記錄在
+`ACTIONABLE_METRICS_EXAMPLE_VALIDATION.md`。
+
+不加入 arbitrary command、failure injection、distributed workers、HTML report、自製 percentile engine
+或 high-cardinality labels。
 
 本次不加入 Docker Compose；部署編排尚未被需求定義。最小 load client 是必要項，因通用 HTTP/gRPC
 壓測工具不能直接產生本 repository 的 WebSocket binary header 與 protobuf payload。
@@ -579,6 +595,10 @@ namespace 使用 `metrics.example.v1`，Go package 使用
 ### 10.3 Runnable examples
 
 - 新增第 7.4 節列出的四個 service `main`、最小 load client、兩個 workflow modules、設定與 README。
+- `examples/metrics/load/metrics.go` 建立 load-private registry、三個 Echo metrics 與可 graceful shutdown
+  的 loopback `/metrics` listener；`main.go` 只把 observer 傳入 Echo round trip。
+- `examples/metrics/load/metrics_test.go` 驗證 success/error/cancelled terminal results、Histogram count、
+  實際 Echo round trip、in-flight 歸零、HTTP exposition、非 metrics path 為 404 與 listener shutdown。
 - 新增 `flow_contract_test.go` 覆蓋 Gate/Game full-flow 與兩個 state rejection；API/GMS 由各自 App
   contract 驗證可啟停。
 - 不修改四個 product `NewApp` public signature，不把 example handler 放入預設 module。
@@ -613,6 +633,8 @@ namespace 使用 `metrics.example.v1`，Go package 使用
 10. DB/Redis collectors：已啟動時正確轉譯 stats，未啟動/已停止時 scrape 仍成功。
 11. Infra lazy contract：沒有 component 使用 pool 時不建立 client、不出現 pool metrics；使用時才出現。
 12. Observability：每個 App 都含 Go/process collectors，兩個 App registry 仍互相隔離。
+13. Load observer：每筆 Echo 只有一個 `success`、`error` 或 `cancelled` terminal result，Histogram
+    count 對應 Counter、in-flight 歸零，且 private `/metrics` listener 可停止。
 
 Counter/Histogram 以 Prometheus `testutil` 或 gather result 驗證，不依賴 sleep 判斷 duration exact value；
 只驗證 sample count、label 與值大於等於零。Concurrency tests 需可在 `-race` 下穩定重複。
@@ -641,7 +663,7 @@ instance，不為 examples 增加 production address-discovery API。
 
 ```text
 go test ./...
-go test -race ./pkg/observability ./pkg/dispatcher ./pkg/infra/... ./products/...
+go test -race ./examples/metrics/... ./pkg/observability ./pkg/dispatcher ./pkg/infra/... ./products/...
 go vet ./...
 ```
 
@@ -699,6 +721,8 @@ server-send stage。Player/broadcast sender、Redis commands 與 SQL statements 
 - `collectors.NewProcessCollector` 依作業系統支援度提供 process samples；不支援 proc/Windows 的平台
   仍保留 collector，但該部分可能沒有 samples。
 - 未提供 alert/dashboard 或通用 load framework；最小 client 只支援本次固定 workflow。
+- Load client 的 metrics listener 只供 Prometheus pull，不提供 product health/readiness，也不持久化最終
+  report；單次精確完成數仍以 load 結束 log 為準。
 - 未來新增 sender metrics 時沿用同一 `operation` bounded set，但不在本次預先建立通用 middleware。
 
 ---
@@ -720,6 +744,7 @@ server-send stage。Player/broadcast sender、Redis commands 與 SQL statements 
 | Example 測試 proto | EnterRoom/Echo schema 與 stable IDs | 符合 |
 | 四個可啟動範本 | 四個 mains、workflow modules、configs、README | 符合 |
 | 可直接進行簡單壓測 | bounded closed-loop load client | 符合 |
+| Client 與 server 分開觀測 | load-private Echo metrics 與相同 Prometheus window 分析 | 符合 |
 | Redis/DB pool | lazy lifecycle-safe collectors | 符合 |
 
 ### 14.2 必要性 review 後保留的調整
@@ -733,6 +758,8 @@ server-send stage。Player/broadcast sender、Redis commands 與 SQL statements 
   compatibility；直接自動 resolve pools 或改 framework 都不正確。
 - Example-local EnterRoom/Echo proto 與 runnable handlers：沒有可重現的 wire contract 就只能測 transport
   toy path，無法驗證使用者指定的狀態與完整 server-send 流程；它們不需要成為 product 公開 API。
+- Load-private Echo metrics：framework stages 無法代表玩家端 round-trip；獨立 registry 可觀測 client
+  latency，又不會擴大 product metric contract。
 
 ### 14.3 Review 後刪除或拒絕的非必要項目
 

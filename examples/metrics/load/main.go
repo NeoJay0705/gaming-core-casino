@@ -28,9 +28,14 @@ func main() {
 	connections := flag.Int("connections", 1, "number of closed-loop WebSocket connections")
 	duration := flag.Duration("duration", 30*time.Second, "load duration")
 	payloadBytes := flag.Int("payload-bytes", 32, "Echo payload size, bounded to 1 MiB")
+	metricsAddr := flag.String("metrics-addr", "127.0.0.1:22081", "load metrics listen address")
 	flag.Parse()
 	if *connections <= 0 || *duration <= 0 || *payloadBytes < 0 || *payloadBytes > maxPayloadBytes {
 		log.Fatalf("connections and duration must be positive; payload-bytes must be between 0 and %d", maxPayloadBytes)
+	}
+	observer, err := newLoadObserver(*metricsAddr)
+	if err != nil {
+		log.Fatalf("start load metrics observer: %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *duration)
@@ -53,7 +58,7 @@ func main() {
 		wg.Add(1)
 		go func(loginName string) {
 			defer wg.Done()
-			requests, err := runConnection(ctx, *gateURL, payload, loginName)
+			requests, err := runConnection(ctx, *gateURL, payload, loginName, observer.metrics)
 			echoRequests.Add(requests)
 			if err != nil && !isExpectedLoadTermination(ctx, err) {
 				failures.Add(1)
@@ -64,6 +69,11 @@ func main() {
 		}(loginName)
 	}
 	wg.Wait()
+	shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
+	if err := observer.Shutdown(shutdownContext); err != nil {
+		log.Printf("stop load metrics observer: %v", err)
+	}
+	shutdownCancel()
 	log.Printf("load complete: connections=%d success=%d failures=%d echo_requests=%d duration=%s", *connections, successes.Load(), failures.Load(), echoRequests.Load(), time.Since(startedAt).Round(time.Millisecond))
 }
 
@@ -84,7 +94,7 @@ func isExpectedLoadTermination(ctx context.Context, err error) bool {
 	return errors.As(err, &timeoutErr) && timeoutErr.Timeout()
 }
 
-func runConnection(ctx context.Context, gateURL string, payload []byte, loginName string) (uint64, error) {
+func runConnection(ctx context.Context, gateURL string, payload []byte, loginName string, metrics *loadMetrics) (uint64, error) {
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, gateURL, nil)
 	if err != nil {
 		return 0, err
@@ -107,17 +117,27 @@ func runConnection(ctx context.Context, gateURL string, payload []byte, loginNam
 	sequence++
 	var requests uint64
 	for ctx.Err() == nil {
-		request := gateproduct.EncodeWebSocketPacket(gateproduct.WebSocketPacket{CommandID: protocol.EchoRequestCommandID, Sequence: sequence, Payload: mustMarshal(&protocol.EchoRequest{Payload: payload})})
-		if err := conn.WriteMessage(websocket.BinaryMessage, request); err != nil {
-			return requests, err
-		}
-		if _, err := readResponse(ctx, conn, protocol.EchoResponseCommandID); err != nil {
+		if err := echoRoundTrip(ctx, conn, payload, sequence, metrics); err != nil {
 			return requests, err
 		}
 		requests++
 		sequence++
 	}
 	return requests, ctx.Err()
+}
+
+func echoRoundTrip(ctx context.Context, conn *websocket.Conn, payload []byte, sequence uint32, metrics *loadMetrics) (err error) {
+	request := gateproduct.EncodeWebSocketPacket(gateproduct.WebSocketPacket{CommandID: protocol.EchoRequestCommandID, Sequence: sequence, Payload: mustMarshal(&protocol.EchoRequest{Payload: payload})})
+	startedAt := time.Now()
+	metrics.startEcho()
+	defer func() {
+		metrics.finishEcho(ctx, err, time.Since(startedAt))
+	}()
+	if err = conn.WriteMessage(websocket.BinaryMessage, request); err != nil {
+		return err
+	}
+	_, err = readResponse(ctx, conn, protocol.EchoResponseCommandID)
+	return err
 }
 
 func closeLoadConnection(conn *websocket.Conn) {
