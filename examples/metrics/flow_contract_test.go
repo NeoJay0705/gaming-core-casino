@@ -126,6 +126,21 @@ server_send:
 	if string(echo.GetPayload()) != string(echoPayload) {
 		t.Fatalf("Echo payload = %q, want %q", echo.GetPayload(), echoPayload)
 	}
+	localPayload := []byte("metrics-local")
+	if err := writeFlowPacket(conn, protocol.LocalEchoRequestCommandID, 4, mustFlowMarshal(&protocol.EchoRequest{Payload: localPayload})); err != nil {
+		t.Fatalf("write local Echo: %v", err)
+	}
+	localResponse, err := readFlowPacket(conn, protocol.LocalEchoResponseCommandID)
+	if err != nil {
+		t.Fatalf("read local Echo response: %v", err)
+	}
+	localEcho := new(protocol.EchoResponse)
+	if err := proto.Unmarshal(localResponse, localEcho); err != nil {
+		t.Fatalf("decode local Echo response: %v", err)
+	}
+	if string(localEcho.GetPayload()) != string(localPayload) {
+		t.Fatalf("local Echo payload = %q, want %q", localEcho.GetPayload(), localPayload)
+	}
 
 	unauthenticated, _, err := websocket.DefaultDialer.Dial("ws://"+gateAddr+"/ws", nil)
 	if err != nil {
@@ -138,6 +153,18 @@ server_send:
 		t.Fatalf("unauthenticated EnterRoom close: %v", err)
 	}
 	_ = unauthenticated.Close()
+
+	localUnauthenticated, _, err := websocket.DefaultDialer.Dial("ws://"+gateAddr+"/ws", nil)
+	if err != nil {
+		t.Fatalf("dial local unauthenticated client: %v", err)
+	}
+	if err := writeFlowPacket(localUnauthenticated, protocol.LocalEchoRequestCommandID, 1, mustFlowMarshal(&protocol.EchoRequest{Payload: []byte("unauthenticated-local")})); err != nil {
+		t.Fatalf("write unauthenticated local Echo: %v", err)
+	}
+	if err := expectFlowConnectionClose(localUnauthenticated); err != nil {
+		t.Fatalf("unauthenticated local Echo close: %v", err)
+	}
+	_ = localUnauthenticated.Close()
 
 	loginOnly, _, err := websocket.DefaultDialer.Dial("ws://"+gateAddr+"/ws", nil)
 	if err != nil {
@@ -153,12 +180,27 @@ server_send:
 		t.Fatalf("login-only Echo close: %v", err)
 	}
 	_ = loginOnly.Close()
+
+	localLoginOnly, _, err := websocket.DefaultDialer.Dial("ws://"+gateAddr+"/ws", nil)
+	if err != nil {
+		t.Fatalf("dial local login-only client: %v", err)
+	}
+	if err := flowRoundTrip(localLoginOnly, gateproto.LoginRequestCommandID, &gateproto.LoginRequest{LoginName: "local-login-only"}, gateproto.LoginResponseCommandID); err != nil {
+		t.Fatalf("local login-only flow: %v", err)
+	}
+	if err := writeFlowPacket(localLoginOnly, protocol.LocalEchoRequestCommandID, 2, mustFlowMarshal(&protocol.EchoRequest{Payload: []byte("blocked-local")})); err != nil {
+		t.Fatalf("write local login-only Echo: %v", err)
+	}
+	if err := expectFlowConnectionClose(localLoginOnly); err != nil {
+		t.Fatalf("local login-only Echo close: %v", err)
+	}
+	_ = localLoginOnly.Close()
 	closeFlowConnection(conn)
 	waitForGaugeZero(t, gateRegisterer, "gaming_core_gate_websocket_connections")
 
 	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_commands_total", map[string]string{
 		"route": "local", "command": strconv.FormatUint(uint64(gateproto.LoginRequestCommandID), 10), "result": "success",
-	}, 2)
+	}, 3)
 	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_commands_total", map[string]string{
 		"route": "local", "command": strconv.FormatUint(uint64(protocol.EnterRoomRequestCommandID), 10), "result": "success",
 	}, 1)
@@ -171,12 +213,18 @@ server_send:
 	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_commands_total", map[string]string{
 		"route": "game", "command": "forward", "result": "error",
 	}, 1)
+	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_commands_total", map[string]string{
+		"route": "local", "command": strconv.FormatUint(uint64(protocol.LocalEchoRequestCommandID), 10), "result": "success",
+	}, 1)
+	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_commands_total", map[string]string{
+		"route": "local", "command": strconv.FormatUint(uint64(protocol.LocalEchoRequestCommandID), 10), "result": "error",
+	}, 2)
 	assertCounterSample(t, gateRegisterer, "gaming_core_gate_game_grpc_requests_total", map[string]string{"code": "OK"}, 1)
-	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_writes_total", map[string]string{"source": "handler", "result": "success"}, 3)
+	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_writes_total", map[string]string{"source": "handler", "result": "success"}, 5)
 	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_writes_total", map[string]string{"source": "server_send", "result": "success"}, 1)
 	assertHistogramSample(t, gateRegisterer, "gaming_core_gate_server_send_delivery_duration_seconds", map[string]string{"target": "connection", "result": "success"}, 1)
-	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_connection_closes_total", map[string]string{"reason": "login_required"}, 1)
-	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_connection_closes_total", map[string]string{"reason": "room_required"}, 1)
+	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_connection_closes_total", map[string]string{"reason": "login_required"}, 2)
+	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_connection_closes_total", map[string]string{"reason": "room_required"}, 2)
 	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_connection_closes_total", map[string]string{"reason": "client_closed"}, 1)
 	assertGatheredFamily(t, gateRegisterer, "gaming_core_gate_websocket_commands_total")
 	assertGatheredFamily(t, gateRegisterer, "gaming_core_gate_server_send_delivery_duration_seconds")

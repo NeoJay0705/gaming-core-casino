@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -18,6 +19,14 @@ const (
 	loadResultError     = "error"
 	loadResultCancelled = "cancelled"
 )
+
+// roundTripDurationBuckets 覆蓋壓測端觀察到的微秒至秒級 round-trip，
+// 避免 DefBuckets 的 5ms 起點掩蓋低延遲分布。
+var roundTripDurationBuckets = []float64{
+	0.0001, 0.00025, 0.0005,
+	0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
+	0.1, 0.25, 0.5, 1, 2.5, 5, 10,
+}
 
 // loadMetrics 只觀測壓測端看到的 Echo round trip，不與 framework product
 // registry 混用，也不把 connection 或 request identity 放入 labels。
@@ -39,7 +48,7 @@ func newLoadMetrics(registerer prometheus.Registerer) (*loadMetrics, error) {
 		echoRoundTripDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "gaming_core_example_load_echo_round_trip_duration_seconds",
 			Help:    "Load-client Echo end-to-end round-trip duration in seconds.",
-			Buckets: prometheus.DefBuckets,
+			Buckets: roundTripDurationBuckets,
 		}, []string{"result"}),
 		echoRoundTripsInFlight: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "gaming_core_example_load_echo_round_trips_in_flight",
@@ -92,6 +101,14 @@ func newLoadObserver(listenAddr string) (*loadObserver, error) {
 		return nil, errors.New("load metrics: listen address is required")
 	}
 	registry := prometheus.NewRegistry()
+	for _, collector := range []prometheus.Collector{
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	} {
+		if err := registry.Register(collector); err != nil {
+			return nil, fmt.Errorf("register load runtime collector: %w", err)
+		}
+	}
 	metrics, err := newLoadMetrics(registry)
 	if err != nil {
 		return nil, err

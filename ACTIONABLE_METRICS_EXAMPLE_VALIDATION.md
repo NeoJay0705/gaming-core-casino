@@ -12,7 +12,8 @@
 相減，也不把 client-side metrics 加入 framework product。
 
 現有 Gate／Game metrics 已足以觀測 server-side 路徑，不需要新增 product metrics。Load example
-使用獨立 Prometheus registry 記錄第 3 節的 Echo round-trip，並保留結束時的精確完成總數。
+使用獨立 Prometheus registry 記錄第 3 節的 Echo round-trip，並在同一 registry 提供 Go runtime 與
+process collectors，以先排除壓測端自身 saturation；同時保留結束時的精確完成總數。
 
 ## 2. 測量邊界
 
@@ -66,10 +67,13 @@ Echo request ID `0xF1000011` 的十進位值是 `4043309073`。Gate 使用 bound
 | `gaming_core_example_load_echo_round_trips_in_flight` | Gauge | 已送出但尚未收到 terminal result 的 Echo 數量 |
 
 load client 使用 loopback metrics listener flag `-metrics-addr 127.0.0.1:22081`，暴露 `/metrics`；另有
-`-setup-timeout`、`-setup-concurrency`、`-warmup-requests` 與 `-request-timeout` 控制 setup、warm-up
-與單筆 request。`-duration` 只表示正式 Echo admission window。load client 不是 framework product，不需要
-`/health`、`/ready`、DI module 或通用 HTTP server abstraction。Histogram 第一版沿用 `prometheus.DefBuckets`，
-待基準壓測顯示 buckets 不適用時再調整。
+`-setup-timeout`、`-setup-concurrency`、`-warmup-requests`、`-request-timeout` 與 `-echo-route` 控制
+setup、warm-up、單筆 request 與 Echo 路徑。`-echo-route=game`（預設）走完整 Gate → Game → Gate；
+`-echo-route=local` 使用相同 WebSocket、Login、EnterRoom 與 payload，但由 Gate local handler 回覆，不呼叫
+Game。非法 route 在建立 observer 或 connection 前失敗。`-duration` 只表示正式 Echo admission window。
+load client 不是 framework product，不需要 `/health`、`/ready`、DI module 或通用 HTTP server abstraction。
+Histogram 已依基準 latency 改用 diagnosis design 指定的 request/E2E 與 fine-grained buckets，不再使用
+`prometheus.DefBuckets`。
 
 結束 log 應輸出 prepared connections、setup duration、warm-up requests、measurement/admission timestamps、
 successful Echo requests 與 connection failures。successful Echo requests 是正式測量的精確完成數；
@@ -143,6 +147,23 @@ go run ./examples/metrics/load \
   -request-timeout 10s \
   -duration 15s \
   -payload-bytes 32 \
+  -echo-route game \
+  -metrics-addr 127.0.0.1:22081
+```
+
+完成 game correctness run 後，用完全相同的 connection、duration、payload、warm-up、setup 與 timeout
+設定再執行一次 local 對照，只替換 route：
+
+```sh
+go run ./examples/metrics/load \
+  -connections 1 \
+  -setup-concurrency 1 \
+  -setup-timeout 2m \
+  -warmup-requests 1 \
+  -request-timeout 10s \
+  -duration 15s \
+  -payload-bytes 32 \
+  -echo-route local \
   -metrics-addr 127.0.0.1:22081
 ```
 
@@ -170,12 +191,15 @@ go run ./examples/metrics/load \
 每次只改一個主要變因，並記錄 connections、setup-concurrency、warmup-requests、duration、payload bytes、
 程式版本及測試起訖時間。正式矩陣可使用 `100、200、400、800、1600、3200` connections；server process
 以 `GOMAXPROCS=4` 啟動，setup concurrency 固定為 32，避免把 connection burst 與正式 saturation 混在一起。
+每個 connection level 都要分別以 `-echo-route=game` 與 `-echo-route=local` 執行；兩次 run 的 load metrics
+與 Gate／Game snapshots 必須使用相同 scrape window。若 load metrics listener 使用固定 port，兩輪之間
+先確認前一個 load process 已 graceful shutdown。
 測試環境允許時，load client 與 services 分開執行，避免 load generator 的 CPU 或 file descriptor 壓力
 和 server saturation 混在同一台機器上。
 
 ## 5. Correctness 驗收
 
-以 load 啟動前後 counter snapshot 的差值 `Δ` 驗證。若 warm-up 完整成功、load 結束 log 的
+對 `game` run，以 load 啟動前後 counter snapshot 的差值 `Δ` 驗證。若 warm-up 完整成功、load 結束 log 的
 `successful_echo_requests=N` 且 `connection_failures=0`，令 `W = connections × warmup-requests`，則以下
 每個 server-side success counter 都必須滿足 `Δ - W = N`：
 
@@ -225,6 +249,10 @@ request timeout 才表示 client-side failure。
 Counter delta 的相等關係只用於停止送流並完成收尾後的 final snapshots。測試進行中因 scrape 時序及
 Gate enqueue／WebSocket write 是非同步的，短暫不相等是正常現象；request-player reply 本身會在原始
 Gate-to-Game unary response 中同步返回。
+
+local run 不會產生 Game handler、Game request-player 或 Gate gRPC success samples；它只應增加 Gate local
+command 與 handler write samples。這是 route contract，不應把缺少 Game samples 誤判為 error。game 與 local
+都必須各自符合 client terminal result、Gate write 與 in-flight 收尾條件。
 
 ## 6. 綜合分析方式
 
@@ -277,6 +305,34 @@ Histogram quantile 是不同事件集合的統計結果，不能用「client p95
 - Go goroutines、heap／GC、process CPU、resident memory 與 file descriptors；
 - load observer 的 in-flight 是否長時間等於 configured connections。
 
+Load、Gate、Game 的 process/runtime collectors 可用下列最小查詢排除壓測端或單一 service 先飽和：
+
+```promql
+rate(process_cpu_seconds_total{job="metrics-example-load"}[1m])
+process_resident_memory_bytes{job="metrics-example-load"}
+go_goroutines{job="metrics-example-load"}
+go_sched_gomaxprocs_threads{job="metrics-example-load"}
+go_memstats_heap_alloc_bytes{job="metrics-example-load"}
+rate(go_gc_duration_seconds_count{job="metrics-example-load"}[1m])
+```
+
+將 `job` 替換為 `metrics-example-gate` 或 `metrics-example-game`，再與同一窗口的 RPS、latency、queue
+與 in-flight 一起判讀。`process_cpu_seconds_total` 是 process 累積 CPU，不是整機 CPU；整機／container quota
+仍由 node 或 container exporter 提供；process collector 在 Linux、Windows 與 macOS 提供主要 series，其他
+平台是否可用取決於 procfs 與 `client_golang` 支援。`go_goroutines`、GOMAXPROCS、heap 與 GC 是診斷訊號，
+不設定固定閾值；先比較 game/local 與 run-to-run baseline。
+
+### 6.4 Game/local 對照
+
+使用相同設定至少交錯執行三輪，不以固定百分比預先定義「明顯」：
+
+| 觀察 | 可支持的判斷 |
+|---|---|
+| local 與 game RPS、client p95 接近 | 優先檢查 load client、WebSocket、Gate 共用 writer/queue 或 host |
+| local RPS 明顯高於 game，且 load process 未飽和 | 瓶頸位於被移除的 gRPC/Game 路徑；再看 Gate gRPC 與 Game handler |
+| 只有 game 的 Gate gRPC／Game handler latency 或 error 上升 | 問題集中在 Game 路徑，不能直接指定 grpc-go 某一 function |
+| 兩者 delivery/write/queue 同時上升 | Gate outbound 或 slow client 壓力，不應歸因 Game handler |
+
 Echo workflow 不使用 Database，不應為這個測試虛構 DB 流量。Database pool metrics 由其獨立 contract
 或實際使用 Database 的業務流程驗證。
 
@@ -284,4 +340,5 @@ Echo workflow 不使用 Database，不應為這個測試虛構 DB 流量。Datab
 
 本方法不新增 distributed tracing、跨 process request ID、Grafana dashboard、alert threshold、failure
 injection、distributed load workers 或通用 benchmark framework。第一輪目標是確認 metric contract 與
-觀測鏈完整；容量上限、SLO 與 Histogram buckets 必須根據後續基準資料決定。
+觀測鏈完整；容量上限與 SLO 仍須根據後續基準資料決定，Histogram buckets 已固定為
+`ACTIONABLE_METRICS_BOTTLENECK_DIAGNOSIS_DESIGN.md` 所記錄的目前基準 schema。

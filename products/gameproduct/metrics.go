@@ -11,6 +11,15 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+// handlerDurationBuckets 保留 Game handler 微秒級 latency 的解析度，並
+// 涵蓋慢 request 的秒級結果；不使用 DefBuckets 的 5ms 起點。
+var handlerDurationBuckets = []float64{
+	0.000001, 0.0000025, 0.000005, 0.00001,
+	0.000025, 0.00005, 0.0001, 0.00025, 0.0005,
+	0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
+	0.1, 0.25, 0.5, 1, 2.5, 5,
+}
+
 type gameMetrics struct {
 	gateCommands         *prometheus.CounterVec
 	gateCommandDuration  *prometheus.HistogramVec
@@ -38,7 +47,7 @@ func newGameMetrics(registerer prometheus.Registerer) (*gameMetrics, error) {
 		gateCommandDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "gaming_core_game_gate_command_duration_seconds",
 			Help:    "Game command handler duration in seconds.",
-			Buckets: prometheus.DefBuckets,
+			Buckets: handlerDurationBuckets,
 		}, []string{"command", "result"}),
 		gateCommandsInFlight: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "gaming_core_game_gate_commands_in_flight",

@@ -19,11 +19,16 @@ go run ./examples/metrics/load \
   -duration 30s
 ```
 
+Load 預設使用完整的 `game` Echo 路徑；若要隔離 Gate WebSocket 與 local handler，可用相同設定另跑
+`-echo-route=local`。兩種 route 都會先 Login、EnterRoom，再以相同 payload 執行 warm-up 與正式 Echo；
+local route 只在 Gate 回覆，不呼叫 Game。每次執行只選一種 route，結束 log 會輸出 `echo_route`，方便與
+Prometheus snapshots 對照。
+
 各服務的 `/metrics` endpoint 分別是 Game `http://127.0.0.1:19080/metrics`、Gate
 `http://127.0.0.1:18081/metrics`、API `http://127.0.0.1:20081/metrics`、GMS
 `http://127.0.0.1:21081/metrics`；同一 listener 也提供 `/health` 與 `/ready`。
 Load client 另外在 `http://127.0.0.1:22081/metrics` 暴露 example-local Echo round-trip Counter、
-Histogram 與 in-flight Gauge，可用 `-metrics-addr` 調整 listener。這個 endpoint 只觀測壓測端，
+Histogram、in-flight Gauge，以及 Go runtime/process collectors，可用 `-metrics-addr` 調整 listener。這個 endpoint 只觀測壓測端，
 不屬於 framework product；完整的 client／Gate／Game 比對方法見 repository root 的
 `ACTIONABLE_METRICS_EXAMPLE_VALIDATION.md`。
 只要更換 `-config` 即可調整 listener 或 Redis 設定；範例 login 是 in-memory policy，不能
@@ -35,7 +40,7 @@ WebSocket application frame 沿用既有 16-byte big-endian header：`command_id
 `total_length uint32`、`sequence uint32`、`session uint16`、`version uint16`，後面接 protobuf
 payload。範本 command IDs 為 Login request/response `0xC00002`/`0xC00003`、EnterRoom
 request/response `0xF1000001`/`0xF1000002`、Echo request/response
-`0xF1000011`/`0xF1000012`。
+`0xF1000011`/`0xF1000012`；Gate-local Echo request/response `0xF1000021`/`0xF1000022`。
 
 API/GMS：
 

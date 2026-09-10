@@ -16,6 +16,8 @@ func TestExampleCommandContractIDsAndDescriptors(t *testing.T) {
 		{name: "EnterRoomResponse", got: EnterRoomResponseCommandID, want: 0xF1000002},
 		{name: "EchoRequest", got: EchoRequestCommandID, want: 0xF1000011},
 		{name: "EchoResponse", got: EchoResponseCommandID, want: 0xF1000012},
+		{name: "LocalEchoRequest", got: LocalEchoRequestCommandID, want: 0xF1000021},
+		{name: "LocalEchoResponse", got: LocalEchoResponseCommandID, want: 0xF1000022},
 	}
 	seen := make(map[uint32]struct{}, len(ids))
 	for _, item := range ids {

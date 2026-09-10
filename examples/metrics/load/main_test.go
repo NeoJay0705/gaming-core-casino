@@ -21,6 +21,48 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+func TestParseEchoRoute(t *testing.T) {
+	tests := []struct {
+		name           string
+		value          string
+		wantRoute      echoRoute
+		wantRequestID  uint32
+		wantResponseID uint32
+		wantError      bool
+	}{
+		{name: "game default", value: "game", wantRoute: echoRouteGame, wantRequestID: protocol.EchoRequestCommandID, wantResponseID: protocol.EchoResponseCommandID},
+		{name: "local", value: "local", wantRoute: echoRouteLocal, wantRequestID: protocol.LocalEchoRequestCommandID, wantResponseID: protocol.LocalEchoResponseCommandID},
+		{name: "trimmed game", value: "  game ", wantRoute: echoRouteGame, wantRequestID: protocol.EchoRequestCommandID, wantResponseID: protocol.EchoResponseCommandID},
+		{name: "trimmed local", value: "\tlocal\n", wantRoute: echoRouteLocal, wantRequestID: protocol.LocalEchoRequestCommandID, wantResponseID: protocol.LocalEchoResponseCommandID},
+		{name: "empty", value: "", wantError: true},
+		{name: "unknown", value: "other", wantError: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseEchoRoute(test.value)
+			if test.wantError {
+				if err == nil {
+					t.Fatal("parseEchoRoute() error = nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseEchoRoute() error = %v", err)
+			}
+			if got.route != test.wantRoute || got.requestCommandID != test.wantRequestID || got.responseCommandID != test.wantResponseID {
+				t.Fatalf("parseEchoRoute() = %+v, want route=%q request=%#x response=%#x", got, test.wantRoute, test.wantRequestID, test.wantResponseID)
+			}
+		})
+	}
+}
+
+func TestRunLoadRejectsInvalidEchoRouteBeforeObserver(t *testing.T) {
+	err := runLoad(context.Background(), "", 1, time.Second, 8, ":invalid", time.Second, 1, 0, time.Second, "invalid")
+	if err == nil || !strings.Contains(err.Error(), `echo-route must be "game" or "local"`) {
+		t.Fatalf("runLoad() error = %v, want invalid echo-route error", err)
+	}
+}
+
 func TestRunBoundedRespectsConcurrencyLimit(t *testing.T) {
 	const (
 		count       = 8
@@ -133,7 +175,7 @@ func TestLoadSetupPhasesCompleteBeforeNextPhaseAndWarmupIsUnobserved(t *testing.
 	if got := testServer.logins.Load(); got != connectionCount {
 		t.Fatalf("login requests = %d, want %d", got, connectionCount)
 	}
-	if err := warmupConnections(setupContext, prepared, []byte("warmup"), connectionCount, 1, time.Second); err != nil {
+	if err := warmupConnections(setupContext, prepared, []byte("warmup"), connectionCount, 1, time.Second, testEchoCommands(t, string(echoRouteGame))); err != nil {
 		t.Fatalf("warmupConnections() error = %v", err)
 	}
 	if got := testServer.enters.Load(); got != connectionCount {
@@ -156,7 +198,7 @@ func TestLoadSetupPhasesCompleteBeforeNextPhaseAndWarmupIsUnobserved(t *testing.
 	if got := countMetricFamilies(t, registry, "gaming_core_example_load_echo_round_trips_total"); got != 0 {
 		t.Fatalf("warm-up metric families = %d, want 0", got)
 	}
-	requests, err := runMeasuredConnection(context.Background(), &prepared[0], []byte("measured"), time.Now().Add(20*time.Millisecond), time.Second, metrics)
+	requests, err := runMeasuredConnection(context.Background(), &prepared[0], []byte("measured"), time.Now().Add(20*time.Millisecond), time.Second, testEchoCommands(t, string(echoRouteGame)), metrics)
 	if err != nil {
 		t.Fatalf("runMeasuredConnection() error = %v", err)
 	}
@@ -165,6 +207,28 @@ func TestLoadSetupPhasesCompleteBeforeNextPhaseAndWarmupIsUnobserved(t *testing.
 	}
 	if got := counterSampleValue(t, registry, "gaming_core_example_load_echo_round_trips_total", loadResultSuccess); got != float64(requests) {
 		t.Fatalf("measured success counter = %v, want %d", got, requests)
+	}
+}
+
+func TestRunLoadSupportsLocalEchoRoute(t *testing.T) {
+	testServer := newLoadProtocolTestServer(t, 1)
+	err := runLoad(context.Background(), testServer.serverURL(), 1, 50*time.Millisecond, 8, "127.0.0.1:0", 2*time.Second, 1, 1, time.Second, string(echoRouteLocal))
+	if err != nil {
+		t.Fatalf("runLoad() error = %v", err)
+	}
+	if got := testServer.firstEchoCommand.Load(); got != protocol.LocalEchoRequestCommandID {
+		t.Fatalf("first Echo command = %#x, want local %#x", got, protocol.LocalEchoRequestCommandID)
+	}
+	if got := testServer.lastEchoCommand.Load(); got != protocol.LocalEchoRequestCommandID {
+		t.Fatalf("last Echo command = %#x, want local %#x", got, protocol.LocalEchoRequestCommandID)
+	}
+	if got := testServer.echoes.Load(); got < 2 {
+		t.Fatalf("Echo requests = %d, want warm-up plus measurement", got)
+	}
+	select {
+	case err := <-testServer.violations:
+		t.Fatal(err)
+	default:
 	}
 }
 
@@ -198,7 +262,7 @@ func TestMeasuredConnectionDrainsRequestAfterAdmissionEnd(t *testing.T) {
 		err      error
 	}, 1)
 	go func() {
-		requests, err := runMeasuredConnection(context.Background(), &prepared, []byte("drain"), admissionEnd, time.Second, nil)
+		requests, err := runMeasuredConnection(context.Background(), &prepared, []byte("drain"), admissionEnd, time.Second, testEchoCommands(t, string(echoRouteGame)), nil)
 		done <- struct {
 			requests uint64
 			err      error
@@ -260,7 +324,7 @@ func TestMeasuredRequestTimeoutRecordsErrorAndClosesConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newLoadMetrics() error = %v", err)
 	}
-	requests, err := runMeasuredConnection(context.Background(), &preparedConnection{conn: connection, sequence: 1}, []byte("timeout"), time.Now().Add(time.Second), 20*time.Millisecond, metrics)
+	requests, err := runMeasuredConnection(context.Background(), &preparedConnection{conn: connection, sequence: 1}, []byte("timeout"), time.Now().Add(time.Second), 20*time.Millisecond, testEchoCommands(t, string(echoRouteGame)), metrics)
 	if err == nil {
 		t.Fatal("runMeasuredConnection() error = nil, want request timeout")
 	}
@@ -325,7 +389,7 @@ func TestMeasuredRoundTripOverwritesPreviousDeadlines(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := echoRoundTrip(ctx, connection, []byte("deadline"), 1, nil); err != nil {
+	if err := echoRoundTrip(ctx, connection, []byte("deadline"), 1, testEchoCommands(t, string(echoRouteGame)), nil); err != nil {
 		t.Fatalf("echoRoundTrip() error = %v, want deadline reset to succeed", err)
 	}
 }
@@ -376,7 +440,7 @@ func TestRunLoadSetupFailureClosesConnectionsAndSkipsMeasurement(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	err := runLoad(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http"), 2, 20*time.Millisecond, 8, "127.0.0.1:0", 2*time.Second, 2, 1, 100*time.Millisecond)
+	err := runLoad(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http"), 2, 20*time.Millisecond, 8, "127.0.0.1:0", 2*time.Second, 2, 1, 100*time.Millisecond, string(echoRouteGame))
 	if err == nil {
 		t.Fatal("runLoad() error = nil, want setup failure")
 	}
@@ -443,7 +507,7 @@ func TestRunLoadStartsMeasurementAfterWarmup(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- runLoad(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http"), 1, 20*time.Millisecond, 8, "127.0.0.1:0", 2*time.Second, 1, 1, time.Second)
+		done <- runLoad(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http"), 1, 20*time.Millisecond, 8, "127.0.0.1:0", 2*time.Second, 1, 1, time.Second, string(echoRouteGame))
 	}()
 	select {
 	case <-warmupReceived:
@@ -479,15 +543,17 @@ func TestRunLoadStartsMeasurementAfterWarmup(t *testing.T) {
 }
 
 type loadProtocolTestServer struct {
-	server         *httptest.Server
-	expected       int
-	handshakes     atomic.Int32
-	messages       atomic.Int32
-	logins         atomic.Int32
-	enters         atomic.Int32
-	echoes         atomic.Int32
-	violations     chan error
-	handshakeReady chan struct{}
+	server           *httptest.Server
+	expected         int
+	handshakes       atomic.Int32
+	messages         atomic.Int32
+	logins           atomic.Int32
+	enters           atomic.Int32
+	echoes           atomic.Int32
+	firstEchoCommand atomic.Uint32
+	lastEchoCommand  atomic.Uint32
+	violations       chan error
+	handshakeReady   chan struct{}
 }
 
 func newLoadProtocolTestServer(t *testing.T, expected int) *loadProtocolTestServer {
@@ -528,9 +594,15 @@ func newLoadProtocolTestServer(t *testing.T, expected int) *loadProtocolTestServ
 			case protocol.EnterRoomRequestCommandID:
 				testServer.enters.Add(1)
 				responseCommandID = protocol.EnterRoomResponseCommandID
-			case protocol.EchoRequestCommandID:
+			case protocol.EchoRequestCommandID, protocol.LocalEchoRequestCommandID:
 				if testServer.enters.Load() != int32(testServer.expected) {
 					testServer.report(errors.New("Echo arrived before all EnterRoom responses"))
+				}
+				testServer.lastEchoCommand.Store(commandID)
+				if first := testServer.firstEchoCommand.Load(); first == 0 {
+					testServer.firstEchoCommand.CompareAndSwap(0, commandID)
+				} else if first != commandID {
+					testServer.report(fmt.Errorf("Echo command changed from %#x to %#x", first, commandID))
 				}
 				var echo protocol.EchoRequest
 				if err := proto.Unmarshal(data[16:], &echo); err != nil {
@@ -539,6 +611,9 @@ func newLoadProtocolTestServer(t *testing.T, expected int) *loadProtocolTestServ
 				}
 				testServer.echoes.Add(1)
 				responseCommandID = protocol.EchoResponseCommandID
+				if commandID == protocol.LocalEchoRequestCommandID {
+					responseCommandID = protocol.LocalEchoResponseCommandID
+				}
 				responsePayload, err = proto.Marshal(&protocol.EchoResponse{Payload: echo.GetPayload()})
 				if err != nil {
 					testServer.report(err)
@@ -566,6 +641,15 @@ func (s *loadProtocolTestServer) report(err error) {
 
 func (s *loadProtocolTestServer) serverURL() string {
 	return "ws" + strings.TrimPrefix(s.server.URL, "http")
+}
+
+func testEchoCommands(t *testing.T, route string) echoCommands {
+	t.Helper()
+	commands, err := parseEchoRoute(route)
+	if err != nil {
+		t.Fatalf("parseEchoRoute(%q): %v", route, err)
+	}
+	return commands
 }
 
 func countMetricFamilies(t *testing.T, gatherer prometheus.Gatherer, name string) int {

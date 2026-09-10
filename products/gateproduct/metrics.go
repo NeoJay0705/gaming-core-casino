@@ -26,6 +26,23 @@ const (
 	serverSendTargetRoom       serverSendTarget = "room"
 )
 
+// requestDurationBuckets 覆蓋一般 command、gRPC 與 client round-trip 的
+// 微秒至秒級延遲；不使用 DefBuckets，避免 5ms 以下的 quantile 失真。
+var requestDurationBuckets = []float64{
+	0.0001, 0.00025, 0.0005,
+	0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
+	0.1, 0.25, 0.5, 1, 2.5, 5, 10,
+}
+
+// fineDurationBuckets 給 handler、delivery 與 WebSocket write 使用，保留
+// 微秒級路徑的可觀測解析度，同時涵蓋慢 client 的秒級結果。
+var fineDurationBuckets = []float64{
+	0.000001, 0.0000025, 0.000005, 0.00001,
+	0.000025, 0.00005, 0.0001, 0.00025, 0.0005,
+	0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
+	0.1, 0.25, 0.5, 1, 2.5, 5,
+}
+
 func gateCommandRouteAndLabel(commandDispatcher *dispatcher.Dispatcher, commandID uint32) (route, command string) {
 	if commandDispatcher != nil && commandDispatcher.IsRegistered(WebSocketChannel, dispatcher.CommandID(commandID)) {
 		return "local", strconv.FormatUint(uint64(commandID), 10)
@@ -91,7 +108,7 @@ func newGateMetrics(registerer prometheus.Registerer) (*gateMetrics, error) {
 		websocketCommandDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "gaming_core_gate_websocket_command_duration_seconds",
 			Help:    "Gate WebSocket command processing duration in seconds.",
-			Buckets: prometheus.DefBuckets,
+			Buckets: requestDurationBuckets,
 		}, []string{"route", "command", "result"}),
 		websocketCommandsInFlight: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "gaming_core_gate_websocket_commands_in_flight",
@@ -104,7 +121,7 @@ func newGateMetrics(registerer prometheus.Registerer) (*gateMetrics, error) {
 		gameGRPCDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "gaming_core_gate_game_grpc_duration_seconds",
 			Help:    "Gate-to-Game gRPC request duration in seconds.",
-			Buckets: prometheus.DefBuckets,
+			Buckets: requestDurationBuckets,
 		}, []string{"code"}),
 		gameGRPCInFlight: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "gaming_core_gate_game_grpc_in_flight",
@@ -117,7 +134,7 @@ func newGateMetrics(registerer prometheus.Registerer) (*gateMetrics, error) {
 		websocketWriteDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "gaming_core_gate_websocket_write_duration_seconds",
 			Help:    "Gate WebSocket application binary write duration in seconds.",
-			Buckets: prometheus.DefBuckets,
+			Buckets: fineDurationBuckets,
 		}, []string{"source", "result"}),
 		websocketWritesInFlight: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "gaming_core_gate_websocket_writes_in_flight",
@@ -142,7 +159,7 @@ func newGateMetrics(registerer prometheus.Registerer) (*gateMetrics, error) {
 		serverSendDeliveryDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "gaming_core_gate_server_send_delivery_duration_seconds",
 			Help:    "Gate server-send receive-to-write terminal duration in seconds.",
-			Buckets: prometheus.DefBuckets,
+			Buckets: fineDurationBuckets,
 		}, []string{"target", "result"}),
 	}
 	collectors := []prometheus.Collector{

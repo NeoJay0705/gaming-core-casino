@@ -9,4 +9,9 @@ const (
 	EchoRequestCommandID uint32 = 0xF1000011
 	// EchoResponseCommandID 是範例 Game-to-client 結果。
 	EchoResponseCommandID uint32 = 0xF1000012
+	// LocalEchoRequestCommandID 是 Gate-local 對照路徑的 request；payload
+	// 沿用 EchoRequest，只用於與 Game Echo 隔離瓶頸。
+	LocalEchoRequestCommandID uint32 = 0xF1000021
+	// LocalEchoResponseCommandID 是 Gate-local 對照路徑的 response。
+	LocalEchoResponseCommandID uint32 = 0xF1000022
 )

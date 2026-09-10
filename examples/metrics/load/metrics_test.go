@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -76,7 +77,7 @@ func TestEchoRoundTripRecordsClientMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newLoadMetrics() error = %v", err)
 	}
-	if err := echoRoundTrip(context.Background(), connection, []byte("echo"), 1, metrics); err != nil {
+	if err := echoRoundTrip(context.Background(), connection, []byte("echo"), 1, testEchoCommands(t, string(echoRouteGame)), metrics); err != nil {
 		t.Fatalf("echoRoundTrip() error = %v", err)
 	}
 	if err := <-serverResult; err != nil {
@@ -140,6 +141,17 @@ func TestLoadObserverExposesOnlyMetricsAndShutsDown(t *testing.T) {
 	}
 	if !strings.Contains(string(body), `gaming_core_example_load_echo_round_trips_total{result="success"} 1`) {
 		t.Fatalf("GET /metrics body does not contain successful Echo counter:\n%s", body)
+	}
+	if !strings.Contains(string(body), "go_goroutines ") {
+		t.Fatalf("GET /metrics body does not contain Go runtime metrics:\n%s", body)
+	}
+	if !strings.Contains(string(body), "go_sched_gomaxprocs_threads ") {
+		t.Fatalf("GET /metrics body does not contain GOMAXPROCS metrics:\n%s", body)
+	}
+	if runtime.GOOS == "linux" || runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		if !strings.Contains(string(body), "process_cpu_seconds_total ") {
+			t.Fatalf("GET /metrics body does not contain process metrics:\n%s", body)
+		}
 	}
 
 	response, err = client.Get("http://" + observer.Addr() + "/ready")

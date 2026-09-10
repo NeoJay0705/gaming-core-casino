@@ -25,8 +25,13 @@ func GateModule() framework.Module {
 			}); err != nil {
 				return err
 			}
-			return commandDispatcher.Register(gateproduct.WebSocketChannel, dispatcher.CommandID(protocol.EnterRoomRequestCommandID), func(ctx context.Context, payload []byte) error {
+			if err := commandDispatcher.Register(gateproduct.WebSocketChannel, dispatcher.CommandID(protocol.EnterRoomRequestCommandID), func(ctx context.Context, payload []byte) error {
 				return enterRoomHandler(registry, ctx, payload)
+			}); err != nil {
+				return err
+			}
+			return commandDispatcher.Register(gateproduct.WebSocketChannel, dispatcher.CommandID(protocol.LocalEchoRequestCommandID), func(ctx context.Context, payload []byte) error {
+				return localEchoHandler(registry, ctx, payload)
 			})
 		})
 	}
@@ -88,6 +93,29 @@ func enterRoomHandler(registry *gateproduct.SessionRegistry, ctx context.Context
 		return err
 	}
 	return sendResponse(requestContext, protocol.EnterRoomResponseCommandID, &protocol.EnterRoomResponse{})
+}
+
+func localEchoHandler(registry *gateproduct.SessionRegistry, ctx context.Context, payload []byte) error {
+	request := new(protocol.EchoRequest)
+	if err := proto.Unmarshal(payload, request); err != nil {
+		return fmt.Errorf("decode local echo request: %w", err)
+	}
+	requestContext, ok := gateproduct.WebSocketRequestContextFrom(ctx)
+	if !ok {
+		return fmt.Errorf("websocket request context is required")
+	}
+	if registry == nil {
+		return fmt.Errorf("session registry is required")
+	}
+	state, exists := registry.State(requestContext.Session.ID())
+	if !exists || state.LoginName == "" {
+		return gateproduct.ErrLoginRequired
+	}
+	if state.RoomID == "" {
+		return gateproduct.ErrRoomRequired
+	}
+	response := &protocol.EchoResponse{Payload: append([]byte(nil), request.GetPayload()...)}
+	return sendResponse(requestContext, protocol.LocalEchoResponseCommandID, response)
 }
 
 func sendResponse(request gateproduct.WebSocketRequestContext, commandID uint32, message proto.Message) error {
