@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -50,7 +51,10 @@ func TestConfigContractValidatesListenAddress(t *testing.T) {
 }
 
 func TestHTTPServerContractServesHealthReadinessAndMetrics(t *testing.T) {
-	owner := newRegistryOwner()
+	owner, err := newRegistryOwner()
+	if err != nil {
+		t.Fatalf("newRegistryOwner() error = %v", err)
+	}
 	counter := prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "observability_contract_events_total",
 		Help: "Total events recorded by the observability contract test.",
@@ -91,8 +95,11 @@ func TestHTTPServerContractServesHealthReadinessAndMetrics(t *testing.T) {
 		if !strings.Contains(body, "observability_contract_events_total 2") {
 			t.Fatalf("metrics body does not contain registered counter: %q", body)
 		}
-		if strings.Contains(body, "go_goroutines") || strings.Contains(body, "process_cpu_seconds_total") {
-			t.Fatalf("custom registry unexpectedly exposed default collectors: %q", body)
+		if !strings.Contains(body, "go_goroutines") {
+			t.Fatalf("custom registry does not expose Go collector: %q", body)
+		}
+		if (runtime.GOOS == "linux" || runtime.GOOS == "windows") && !strings.Contains(body, "process_cpu_seconds_total") {
+			t.Fatalf("custom registry does not expose process collector: %q", body)
 		}
 	})
 	t.Run("unknown route", func(t *testing.T) {
@@ -105,7 +112,14 @@ func TestHTTPServerContractServesHealthReadinessAndMetrics(t *testing.T) {
 }
 
 func TestRegistryContractIsAppLocalAndReportsDuplicateRegistration(t *testing.T) {
-	first, second := newRegistryOwner(), newRegistryOwner()
+	first, err := newRegistryOwner()
+	if err != nil {
+		t.Fatalf("newRegistryOwner(first) error = %v", err)
+	}
+	second, err := newRegistryOwner()
+	if err != nil {
+		t.Fatalf("newRegistryOwner(second) error = %v", err)
+	}
 	firstMetric := prometheus.NewCounter(prometheus.CounterOpts{Name: "same_app_local_total", Help: "App-local counter."})
 	secondMetric := prometheus.NewCounter(prometheus.CounterOpts{Name: "same_app_local_total", Help: "App-local counter."})
 	if err := first.registry.Register(firstMetric); err != nil {
@@ -115,7 +129,7 @@ func TestRegistryContractIsAppLocalAndReportsDuplicateRegistration(t *testing.T)
 		t.Fatalf("register same metric in second registry: %v", err)
 	}
 	duplicate := prometheus.NewCounter(prometheus.CounterOpts{Name: "same_app_local_total", Help: "App-local counter."})
-	err := first.registry.Register(duplicate)
+	err = first.registry.Register(duplicate)
 	if err == nil {
 		t.Fatal("duplicate registration error = nil")
 	}
@@ -140,7 +154,11 @@ func TestHTTPServerStartRejectsOccupiedAddress(t *testing.T) {
 	}
 	defer listener.Close()
 
-	server, err := newHTTPServer(Config{ListenAddr: listener.Addr().String()}, newRegistryOwner())
+	owner, err := newRegistryOwner()
+	if err != nil {
+		t.Fatalf("newRegistryOwner() error = %v", err)
+	}
+	server, err := newHTTPServer(Config{ListenAddr: listener.Addr().String()}, owner)
 	if err != nil {
 		t.Fatalf("newHTTPServer() error = %v", err)
 	}
@@ -153,7 +171,11 @@ func TestHTTPServerStartRejectsOccupiedAddress(t *testing.T) {
 }
 
 func TestHTTPServerStopIsIdempotent(t *testing.T) {
-	server, err := newHTTPServer(Config{ListenAddr: "127.0.0.1:0"}, newRegistryOwner())
+	owner, err := newRegistryOwner()
+	if err != nil {
+		t.Fatalf("newRegistryOwner() error = %v", err)
+	}
+	server, err := newHTTPServer(Config{ListenAddr: "127.0.0.1:0"}, owner)
 	if err != nil {
 		t.Fatalf("newHTTPServer() error = %v", err)
 	}
@@ -343,7 +365,11 @@ func TestModuleRollsBackListenerWhenInfrastructureStartupFails(t *testing.T) {
 }
 
 func TestHTTPServerStopForcesCloseWhenContextIsCancelled(t *testing.T) {
-	server, err := newHTTPServer(Config{ListenAddr: "127.0.0.1:0"}, newRegistryOwner())
+	owner, err := newRegistryOwner()
+	if err != nil {
+		t.Fatalf("newRegistryOwner() error = %v", err)
+	}
+	server, err := newHTTPServer(Config{ListenAddr: "127.0.0.1:0"}, owner)
 	if err != nil {
 		t.Fatalf("newHTTPServer() error = %v", err)
 	}

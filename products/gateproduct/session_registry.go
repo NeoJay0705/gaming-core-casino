@@ -23,6 +23,10 @@ var (
 	ErrSessionAlreadyRegistered = errors.New("gate session: connection is already registered")
 	// ErrRoomIDInvalid indicates a room operation without a room identity.
 	ErrRoomIDInvalid = errors.New("gate session: room id is invalid")
+	// ErrLoginRequired indicates that a connection has not completed login.
+	ErrLoginRequired = errors.New("gate session: login is required")
+	// ErrRoomRequired indicates that a connection has not entered a room.
+	ErrRoomRequired = errors.New("gate session: room is required")
 )
 
 // LoginName identifies one caller-authenticated player identity.
@@ -30,6 +34,12 @@ type LoginName = serversend.LoginName
 
 // RoomID identifies one caller-authorized local room membership.
 type RoomID = serversend.RoomID
+
+// SessionState is a read-only snapshot of the canonical connection state.
+type SessionState struct {
+	LoginName LoginName
+	RoomID    RoomID
+}
 
 type registeredLoginSession struct {
 	connectionID WebSocketConnectionID
@@ -80,6 +90,22 @@ type SessionRegistry struct {
 
 func NewSessionRegistry() *SessionRegistry {
 	return newLocalSessionRegistry()
+}
+
+// State returns a copy of the canonical login and room state for one
+// connection. It never exposes the session pointer or performs authentication.
+func (r *SessionRegistry) State(connectionID WebSocketConnectionID) (SessionState, bool) {
+	if r == nil || connectionID == "" {
+		return SessionState{}, false
+	}
+	r.mu.RLock()
+	loginName, exists := r.byConnection[connectionID]
+	entry, current := r.byLoginName[loginName]
+	r.mu.RUnlock()
+	if !exists || !current || entry.connectionID != connectionID {
+		return SessionState{}, false
+	}
+	return SessionState{LoginName: loginName, RoomID: entry.roomID}, true
 }
 
 func newLocalSessionRegistry() *SessionRegistry {
@@ -255,13 +281,17 @@ func (r *SessionRegistry) LeaveRoom(loginName LoginName) error {
 // SendToLoginName sends one complete client wire packet to the current
 // authoritative local session for loginName.
 func (r *SessionRegistry) SendToLoginName(loginName LoginName, data []byte) error {
+	return r.sendToLoginNameAt(loginName, data, time.Now(), serverSendTargetPlayer)
+}
+
+func (r *SessionRegistry) sendToLoginNameAt(loginName LoginName, data []byte, receivedAt time.Time, target serverSendTarget) error {
 	r.mu.RLock()
 	entry, exists := r.byLoginName[loginName]
 	r.mu.RUnlock()
 	if !exists {
 		return fmt.Errorf("%w: %q", ErrLoginSessionNotFound, loginName)
 	}
-	return entry.session.SendBinary(data)
+	return sendOutbound(entry.session, outboundMessage{data: data, source: outboundSourceServerSend, receivedAt: receivedAt, target: target})
 }
 
 // SendToConnection sends one complete client wire packet to the exact local
@@ -269,6 +299,10 @@ func (r *SessionRegistry) SendToLoginName(loginName LoginName, data []byte) erro
 // it must still be the authenticated owner of that connection; a reconnect
 // cannot receive a stale request response through its predecessor's route.
 func (r *SessionRegistry) SendToConnection(connectionID WebSocketConnectionID, expectedLoginName LoginName, data []byte) error {
+	return r.sendToConnectionAt(connectionID, expectedLoginName, data, time.Now(), serverSendTargetConnection)
+}
+
+func (r *SessionRegistry) sendToConnectionAt(connectionID WebSocketConnectionID, expectedLoginName LoginName, data []byte, receivedAt time.Time, target serverSendTarget) error {
 	r.mu.RLock()
 	loginName, exists := r.byConnection[connectionID]
 	entry := r.byLoginName[loginName]
@@ -279,12 +313,16 @@ func (r *SessionRegistry) SendToConnection(connectionID WebSocketConnectionID, e
 	if expectedLoginName != "" && loginName != expectedLoginName {
 		return fmt.Errorf("%w: connection %q is not login %q", serversend.ErrTargetNotConnected, connectionID, expectedLoginName)
 	}
-	return entry.session.SendBinary(data)
+	return sendOutbound(entry.session, outboundMessage{data: data, source: outboundSourceServerSend, receivedAt: receivedAt, target: target})
 }
 
 // BroadcastRoom sends one complete client wire packet to every current local
 // member of roomID. A failed member does not prevent delivery to others.
 func (r *SessionRegistry) BroadcastRoom(roomID RoomID, data []byte) (int, error) {
+	return r.broadcastRoomAt(roomID, data, time.Now(), serverSendTargetRoom)
+}
+
+func (r *SessionRegistry) broadcastRoomAt(roomID RoomID, data []byte, receivedAt time.Time, deliveryTarget serverSendTarget) (int, error) {
 	if roomID == "" {
 		return 0, ErrRoomIDInvalid
 	}
@@ -300,9 +338,9 @@ func (r *SessionRegistry) BroadcastRoom(roomID RoomID, data []byte) (int, error)
 
 	delivered := 0
 	var errs []error
-	for _, target := range targets {
-		if err := target.session.SendBinary(data); err != nil {
-			errs = append(errs, fmt.Errorf("broadcast room %q to login %q: %w", roomID, target.loginName, err))
+	for _, member := range targets {
+		if err := sendOutbound(member.session, outboundMessage{data: data, source: outboundSourceServerSend, receivedAt: receivedAt, target: deliveryTarget}); err != nil {
+			errs = append(errs, fmt.Errorf("broadcast room %q to login %q: %w", roomID, member.loginName, err))
 			continue
 		}
 		delivered++

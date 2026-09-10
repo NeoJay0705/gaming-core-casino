@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package metrics.example.v1;
+
+option go_package = "github.com/NeoJay0705/gaming-core-casino/examples/metrics/internal/protocol;protocol";
+
+// EchoRequest 是可啟動範例使用的 bounded workflow command。
+message EchoRequest {
+  bytes payload = 1;
+}
+
+// EchoResponse 透過既有 Game-to-Gate server-send path 回傳。
+message EchoResponse {
+  bytes payload = 1;
+}

@@ -70,4 +70,14 @@ func TestContractNormalizesChannelAcrossDispatcherOperations(t *testing.T) {
 	if err := dispatcher.Register("gate-request", 7, func(context.Context, []byte) error { return nil }); err == nil || !strings.Contains(err.Error(), "command 7") {
 		t.Fatalf("duplicate registration error = %v, want numeric command id", err)
 	}
+	if !dispatcher.IsRegistered(" gate-request ", 7) {
+		t.Fatal("IsRegistered() = false for registered normalized command")
+	}
+	if dispatcher.IsRegistered("gate-request", 8) || dispatcher.IsRegistered("other", 7) {
+		t.Fatal("IsRegistered() = true for an unregistered command")
+	}
+	var nilDispatcher *Dispatcher
+	if nilDispatcher.IsRegistered("gate-request", 7) {
+		t.Fatal("nil Dispatcher reported a registered command")
+	}
 }

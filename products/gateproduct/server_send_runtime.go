@@ -47,11 +47,11 @@ func gateServerSendConfig(snapshot config.SourceSnapshot) (serversend.Config, bo
 	return normalized, true, nil
 }
 
-func newGateServerSendRuntime(identity serversend.RuntimeGateIdentity, cfg serversend.Config, sessions *SessionRegistry, redisClient *redis.Client, keys serversend.Keyspace) (*gateServerSendRuntime, error) {
+func newGateServerSendRuntime(identity serversend.RuntimeGateIdentity, cfg serversend.Config, sessions *SessionRegistry, redisClient *redis.Client, keys serversend.Keyspace, metrics *gateMetrics) (*gateServerSendRuntime, error) {
 	if identity.GateID == "" {
 		return nil, fmt.Errorf("gate server send: runtime Gate identity is required")
 	}
-	local, err := newGateServerSendReceiver(sessions)
+	local, err := newGateServerSendReceiver(sessions, metrics)
 	if err != nil {
 		return nil, err
 	}

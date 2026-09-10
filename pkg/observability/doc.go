@@ -5,6 +5,8 @@
 // Module 會把 prometheus.Registerer 放入 framework DI。引用端可以在自己的
 // module 中以 constructor 注入該 Registerer，使用 Register 建立並註冊自訂
 // metrics；不應使用 global DefaultRegisterer 或會 panic 的 MustRegister。
+// Registry 另外包含標準 Go/process collectors；Database/Redis pool collectors
+// 只在對應 lazy resource 實際被使用時註冊。
 //
 // 外部 product 可直接以一般 framework provider 定義 metrics holder：
 //

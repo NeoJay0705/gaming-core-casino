@@ -129,6 +129,8 @@ func TestGateWebSocketContractForwardsUnhandledCommandToGame(t *testing.T) {
 	t.Cleanup(func() { _ = gameServer.Stop(context.Background()) })
 
 	localHandled := make(chan WebSocketRequestContext, 1)
+	sessionRegistered := make(chan struct{}, 1)
+	var sessions *SessionRegistry
 	app, server := newStartedWebSocketTestApp(t, writeWebSocketConfigWithGameTarget(t, gameServer.Addr()), dispatcher.Registration{
 		Channel:   WebSocketChannel,
 		CommandID: 100,
@@ -140,13 +142,43 @@ func TestGateWebSocketContractForwardsUnhandledCommandToGame(t *testing.T) {
 			localHandled <- requestContext
 			return nil
 		},
+	}, dispatcher.Registration{
+		Channel:   WebSocketChannel,
+		CommandID: 101,
+		Handler: func(ctx context.Context, payload []byte) error {
+			requestContext, ok := WebSocketRequestContextFrom(ctx)
+			if !ok || sessions == nil {
+				return errors.New("missing WebSocket request context or registry")
+			}
+			closable, ok := requestContext.Session.(ClosableWebSocketSession)
+			if !ok {
+				return errors.New("session is not closable")
+			}
+			if err := sessions.Register(closable, LoginName(payload)); err != nil {
+				return err
+			}
+			if err := sessions.EnterRoom(LoginName(payload), RoomID("test-room")); err != nil {
+				return err
+			}
+			sessionRegistered <- struct{}{}
+			return nil
+		},
 	})
 	t.Cleanup(func() { _ = app.frameworkApp.Stop(context.Background()) })
+	sessions = server.registry
 	conn, _, err := websocket.DefaultDialer.Dial("ws://"+server.Addr()+"/ws", nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer conn.Close()
+	if err := conn.WriteMessage(websocket.BinaryMessage, testWebSocketPacket(101, []byte("alice"))); err != nil {
+		t.Fatalf("write login command: %v", err)
+	}
+	select {
+	case <-sessionRegistered:
+	case <-time.After(time.Second):
+		t.Fatal("session was not registered")
+	}
 	if err := conn.WriteMessage(websocket.BinaryMessage, testWebSocketPacket(99, []byte("forwarded"))); err != nil {
 		t.Fatalf("write unregistered command: %v", err)
 	}
@@ -273,6 +305,9 @@ func TestGateWebSocketContractDirectGameReplyReturnsToOriginalConnection(t *test
 					return errors.New("WebSocket session cannot be registered")
 				}
 				if err := sessions.Register(session, LoginName(payload)); err != nil {
+					return err
+				}
+				if err := sessions.EnterRoom(LoginName(payload), RoomID("test-room")); err != nil {
 					return err
 				}
 				registered <- struct{}{}

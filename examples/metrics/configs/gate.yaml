@@ -1,0 +1,25 @@
+observability:
+  listen_addr: "127.0.0.1:18081"
+
+websocket:
+  client_addr: "127.0.0.1:18080"
+  write_chan_size: 256
+  write_timeout_ms: 5000
+
+gate_to_game:
+  target: "127.0.0.1:19090"
+  timeout: "5s"
+
+redis:
+  addr: "127.0.0.1:6379"
+  key_prefix: "metrics-example"
+
+server_send:
+  presence:
+    lease_ttl: "1m"
+  gate:
+    listen_addr: "127.0.0.1:19091"
+    endpoint_ttl: "30s"
+    endpoint_refresh: "10s"
+  broadcast:
+    primary: "redis"

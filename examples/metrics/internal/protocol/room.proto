@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package metrics.example.v1;
+
+option go_package = "github.com/NeoJay0705/gaming-core-casino/examples/metrics/internal/protocol;protocol";
+
+// EnterRoomRequest 要求範例 Gate 將已登入連線移入 room_id。
+message EnterRoomRequest {
+  string room_id = 1;
+}
+
+// EnterRoomResponse 回報範例進房流程的處理結果。
+message EnterRoomResponse {
+  uint32 code = 1;
+}

@@ -61,6 +61,9 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 		if err := observability.Module(r); err != nil {
 			return err
 		}
+		if err := r.Provide(newGameMetrics); err != nil {
+			return err
+		}
 		grpcConfig, err := gameGateGRPCConfig(snapshot)
 		if err != nil {
 			return err

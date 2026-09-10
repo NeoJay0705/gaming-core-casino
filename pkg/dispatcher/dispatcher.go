@@ -109,3 +109,16 @@ func (d *Dispatcher) RegisteredCommandIDs(channel Channel) []CommandID {
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	return ids
 }
+
+// IsRegistered reports whether a command is registered in channel. The
+// lookup uses the same channel normalization as Register and Dispatch, so
+// callers can use it as the trusted source for bounded command labels.
+func (d *Dispatcher) IsRegistered(channel Channel, commandID CommandID) bool {
+	if d == nil {
+		return false
+	}
+	d.mu.RLock()
+	_, ok := d.handlers[normalizeChannel(channel)][commandID]
+	d.mu.RUnlock()
+	return ok
+}

@@ -1,0 +1,201 @@
+package gateproduct
+
+import (
+	"errors"
+	"strconv"
+	"time"
+
+	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
+	"github.com/prometheus/client_golang/prometheus"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+type outboundSource string
+
+const (
+	outboundSourceHandler    outboundSource = "handler"
+	outboundSourceServerSend outboundSource = "server_send"
+)
+
+type serverSendTarget string
+
+const (
+	serverSendTargetConnection serverSendTarget = "connection"
+	serverSendTargetPlayer     serverSendTarget = "player"
+	serverSendTargetRoom       serverSendTarget = "room"
+)
+
+func gateCommandRouteAndLabel(commandDispatcher *dispatcher.Dispatcher, commandID uint32) (route, command string) {
+	if commandDispatcher != nil && commandDispatcher.IsRegistered(WebSocketChannel, dispatcher.CommandID(commandID)) {
+		return "local", strconv.FormatUint(uint64(commandID), 10)
+	}
+	return "game", "forward"
+}
+
+// boundedGRPCCode 只接受 gRPC 定義的標準 code；未知數值聚合為 Unknown，
+// 避免下游回傳的任意 status code 擴張 Prometheus label cardinality。
+func boundedGRPCCode(err error) string {
+	code := status.Code(err)
+	if code < codes.OK || code > codes.Unauthenticated {
+		return codes.Unknown.String()
+	}
+	return code.String()
+}
+
+// gateMetrics 僅包含 ACTIONABLE_METRICS_DESIGN.md 定義的 bounded、可執行
+// Gate 觀測值。所有更新都是同步 Prometheus 操作，不改變 transport 行為。
+type gateMetrics struct {
+	websocketConnections      prometheus.Gauge
+	websocketConnectionsTotal prometheus.Counter
+	websocketConnectionCloses *prometheus.CounterVec
+	websocketCommands         *prometheus.CounterVec
+	websocketCommandDuration  *prometheus.HistogramVec
+	websocketCommandsInFlight prometheus.Gauge
+
+	gameGRPCRequests        *prometheus.CounterVec
+	gameGRPCDuration        *prometheus.HistogramVec
+	gameGRPCInFlight        prometheus.Gauge
+	websocketWrites         *prometheus.CounterVec
+	websocketWriteDuration  *prometheus.HistogramVec
+	websocketWritesInFlight prometheus.Gauge
+	writeQueueMessages      prometheus.Gauge
+	writeQueueCapacity      prometheus.Gauge
+	writeQueueFull          *prometheus.CounterVec
+
+	serverSendRequests         *prometheus.CounterVec
+	serverSendDeliveryDuration *prometheus.HistogramVec
+}
+
+func newGateMetrics(registerer prometheus.Registerer) (*gateMetrics, error) {
+	if registerer == nil {
+		return nil, errors.New("gate metrics: registerer is nil")
+	}
+	m := &gateMetrics{
+		websocketConnections: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "gaming_core_gate_websocket_connections",
+			Help: "Current number of active Gate WebSocket connections.",
+		}),
+		websocketConnectionsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "gaming_core_gate_websocket_connections_total",
+			Help: "Total number of Gate WebSocket connections accepted.",
+		}),
+		websocketConnectionCloses: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gaming_core_gate_websocket_connection_closes_total",
+			Help: "Total number of Gate WebSocket connection closures by terminal reason.",
+		}, []string{"reason"}),
+		websocketCommands: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gaming_core_gate_websocket_commands_total",
+			Help: "Total number of Gate WebSocket application commands by route, command, and result.",
+		}, []string{"route", "command", "result"}),
+		websocketCommandDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gaming_core_gate_websocket_command_duration_seconds",
+			Help:    "Gate WebSocket command processing duration in seconds.",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"route", "command", "result"}),
+		websocketCommandsInFlight: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "gaming_core_gate_websocket_commands_in_flight",
+			Help: "Current number of Gate WebSocket commands being dispatched or forwarded.",
+		}),
+		gameGRPCRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gaming_core_gate_game_grpc_requests_total",
+			Help: "Total number of Gate-to-Game gRPC requests by bounded status code.",
+		}, []string{"code"}),
+		gameGRPCDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gaming_core_gate_game_grpc_duration_seconds",
+			Help:    "Gate-to-Game gRPC request duration in seconds.",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"code"}),
+		gameGRPCInFlight: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "gaming_core_gate_game_grpc_in_flight",
+			Help: "Current number of Gate-to-Game gRPC requests in flight.",
+		}),
+		websocketWrites: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gaming_core_gate_websocket_writes_total",
+			Help: "Total number of Gate WebSocket application binary writes by source and result.",
+		}, []string{"source", "result"}),
+		websocketWriteDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gaming_core_gate_websocket_write_duration_seconds",
+			Help:    "Gate WebSocket application binary write duration in seconds.",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"source", "result"}),
+		websocketWritesInFlight: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "gaming_core_gate_websocket_writes_in_flight",
+			Help: "Current number of Gate WebSocket application binary writes in flight.",
+		}),
+		writeQueueMessages: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "gaming_core_gate_websocket_write_queue_messages",
+			Help: "Current number of queued Gate WebSocket application messages across active connections.",
+		}),
+		writeQueueCapacity: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "gaming_core_gate_websocket_write_queue_capacity",
+			Help: "Total capacity of Gate WebSocket application write queues across active connections.",
+		}),
+		writeQueueFull: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gaming_core_gate_websocket_write_queue_full_total",
+			Help: "Total number of Gate WebSocket application enqueue failures caused by a full queue.",
+		}, []string{"source"}),
+		serverSendRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gaming_core_gate_server_send_requests_total",
+			Help: "Total number of Gate server-send requests by target and enqueue result.",
+		}, []string{"target", "result"}),
+		serverSendDeliveryDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gaming_core_gate_server_send_delivery_duration_seconds",
+			Help:    "Gate server-send receive-to-write terminal duration in seconds.",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"target", "result"}),
+	}
+	collectors := []prometheus.Collector{
+		m.websocketConnections,
+		m.websocketConnectionsTotal,
+		m.websocketConnectionCloses,
+		m.websocketCommands,
+		m.websocketCommandDuration,
+		m.websocketCommandsInFlight,
+		m.gameGRPCRequests,
+		m.gameGRPCDuration,
+		m.gameGRPCInFlight,
+		m.websocketWrites,
+		m.websocketWriteDuration,
+		m.websocketWritesInFlight,
+		m.writeQueueMessages,
+		m.writeQueueCapacity,
+		m.writeQueueFull,
+		m.serverSendRequests,
+		m.serverSendDeliveryDuration,
+	}
+	for _, collector := range collectors {
+		if err := registerer.Register(collector); err != nil {
+			return nil, err
+		}
+	}
+	return m, nil
+}
+
+func (m *gateMetrics) observeCommand(route, command, result string, elapsed time.Duration) {
+	if m == nil {
+		return
+	}
+	m.websocketCommands.WithLabelValues(route, command, result).Inc()
+	m.websocketCommandDuration.WithLabelValues(route, command, result).Observe(elapsed.Seconds())
+}
+
+func (m *gateMetrics) observeGameGRPC(code string, elapsed time.Duration) {
+	if m == nil {
+		return
+	}
+	m.gameGRPCRequests.WithLabelValues(code).Inc()
+	m.gameGRPCDuration.WithLabelValues(code).Observe(elapsed.Seconds())
+}
+
+func (m *gateMetrics) observeServerSendRequest(target, result string) {
+	if m != nil {
+		m.serverSendRequests.WithLabelValues(target, result).Inc()
+	}
+}
+
+func (m *gateMetrics) observeServerSendDelivery(target, result string, elapsed time.Duration) {
+	if m != nil {
+		m.serverSendDeliveryDuration.WithLabelValues(target, result).Observe(elapsed.Seconds())
+	}
+}
