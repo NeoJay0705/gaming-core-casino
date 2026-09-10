@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
@@ -14,8 +13,8 @@ import (
 const defaultFanoutConcurrency = 16
 
 // GateResolver resolves one trusted Gate instance to its delivery endpoint.
-// It is used by the routed player primary path; direct request replies carry
-// their endpoint in the request-scoped route.
+// It is used by the routed player primary path; request-player replies do not
+// use this resolver because they return through the originating unary call.
 type GateResolver interface {
 	Resolve(context.Context, GateID) (GateEndpoint, error)
 }
@@ -26,46 +25,40 @@ type GateEndpointLister interface {
 	List(context.Context) ([]GateEndpoint, error)
 }
 
-// DirectRequestPlayerSender sends to the exact connection that originated the
-// inbound request. The Gate supplies the endpoint in the request-scoped route;
-// this path does not perform a per-message directory lookup.
+// DirectRequestPlayerSender accepts a reply for the exact connection that
+// originated the inbound request. The gatelink server returns the reply over
+// the original unary response; this sender does not perform network I/O.
 type DirectRequestPlayerSender struct {
-	transport *GRPCTransport
+	maxPayloadBytes int
 }
 
-func NewDirectRequestPlayerSender(transport *GRPCTransport) (*DirectRequestPlayerSender, error) {
-	if transport == nil {
-		return nil, errors.New("server send: direct request transport is required")
+func NewDirectRequestPlayerSender(maxPayloadBytes int) (*DirectRequestPlayerSender, error) {
+	maxPayloadBytes, err := normalizedPayloadLimit(maxPayloadBytes)
+	if err != nil {
+		return nil, err
 	}
-	return &DirectRequestPlayerSender{transport: transport}, nil
+	return &DirectRequestPlayerSender{maxPayloadBytes: maxPayloadBytes}, nil
 }
 
 func (s *DirectRequestPlayerSender) SendToRequestPlayer(ctx context.Context, message RequestPlayerMessage) (Receipt, error) {
-	if s == nil || s.transport == nil {
+	if s == nil {
 		return Receipt{}, errors.New("server send: direct request sender is not configured")
 	}
-	if err := message.validatePayload(s.transport.cfg.MaxPayloadBytes); err != nil {
+	if err := message.validatePayload(s.maxPayloadBytes); err != nil {
 		return Receipt{}, err
 	}
-	requestContext, ok := gatelink.GateRequestContextFrom(ctx)
-	if !ok {
-		return Receipt{}, ErrRequestRouteUnavailable
-	}
-	source := requestContext.Source
-	source.GateID = strings.TrimSpace(source.GateID)
-	source.ConnectionID = strings.TrimSpace(source.ConnectionID)
-	source.ReplyEndpoint = strings.TrimSpace(source.ReplyEndpoint)
-	if source.GateID == "" {
-		return Receipt{}, fmt.Errorf("%w: gate id is required", ErrRequestRouteInvalid)
-	}
-	if source.ConnectionID == "" {
-		return Receipt{}, fmt.Errorf("%w: connection id is required", ErrRequestRouteInvalid)
-	}
-	if source.ReplyEndpoint == "" {
-		return Receipt{}, fmt.Errorf("%w: reply endpoint is required", ErrRequestRouteInvalid)
-	}
-	endpoint := GateEndpoint{GateID: GateID(source.GateID), Address: source.ReplyEndpoint}
-	if _, err := s.transport.SendToConnection(ctx, endpoint, message, ConnectionID(source.ConnectionID)); err != nil {
+	err := gatelink.SetForwardReply(ctx, gatelink.Reply{
+		CommandID:         message.CommandID,
+		Payload:           message.Payload,
+		ExpectedLoginName: string(message.ExpectedLoginName),
+	})
+	if err != nil {
+		if errors.Is(err, gatelink.ErrForwardReplyUnavailable) {
+			return Receipt{}, ErrRequestRouteUnavailable
+		}
+		if errors.Is(err, gatelink.ErrForwardReplyAlreadySet) {
+			return Receipt{}, ErrRequestReplyAlreadySet
+		}
 		return Receipt{}, err
 	}
 	return newReceipt(), nil

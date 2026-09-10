@@ -2,6 +2,7 @@ package gatelink
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -14,7 +15,6 @@ import (
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 func TestContractForwardsOpaquePayloadAndRequestContext(t *testing.T) {
@@ -43,7 +43,7 @@ func TestContractForwardsOpaquePayloadAndRequestContext(t *testing.T) {
 		Payload:   payload,
 	}
 	ctx := WithGateRequestContext(context.Background(), GateRequestContext{TraceID: "trace-123", Source: RequestSource{GateID: "gate-a", ConnectionID: "connection-42", ReplyEndpoint: "127.0.0.1:19091"}})
-	if err := client.Forward(ctx, request); err != nil {
+	if _, err := client.Forward(ctx, request); err != nil {
 		t.Fatalf("forward: %v", err)
 	}
 	payload[0] = 0x99
@@ -63,6 +63,178 @@ func TestContractForwardsOpaquePayloadAndRequestContext(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("handler did not receive request")
+	}
+}
+
+func TestContractForwardReplyRoundTripCopiesPayload(t *testing.T) {
+	replyPayload := []byte("reply")
+	server, err := NewServer(ServerConfig{ListenAddr: "127.0.0.1:0"}, RequestHandlerFunc(func(ctx context.Context, _ Request) error {
+		if err := SetForwardReply(ctx, Reply{
+			CommandID:         2,
+			Payload:           replyPayload,
+			ExpectedLoginName: "alice",
+		}); err != nil {
+			return err
+		}
+		replyPayload[0] = 'X'
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+
+	client, err := NewClient(ClientConfig{Target: server.Addr(), Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Stop(context.Background()) })
+	ctx := WithGateRequestContext(context.Background(), GateRequestContext{Source: RequestSource{ConnectionID: "connection-1"}})
+	reply, err := client.Forward(ctx, Request{CommandID: 1})
+	if err != nil {
+		t.Fatalf("forward: %v", err)
+	}
+	if reply == nil || reply.CommandID != 2 || string(reply.Payload) != "reply" || reply.ExpectedLoginName != "alice" {
+		t.Fatalf("reply = %#v, want copied command, payload, and expected login", reply)
+	}
+	reply.Payload[0] = 'Y'
+	if string(replyPayload) != "Xeply" {
+		t.Fatalf("caller reply payload = %q, want server-side copy mutation only", replyPayload)
+	}
+}
+
+func TestContractForwardReplyAllowsNoReply(t *testing.T) {
+	server, err := NewServer(ServerConfig{ListenAddr: "127.0.0.1:0"}, RequestHandlerFunc(func(context.Context, Request) error {
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+	client, err := NewClient(ClientConfig{Target: server.Addr(), Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Stop(context.Background()) })
+	ctx := WithGateRequestContext(context.Background(), GateRequestContext{Source: RequestSource{ConnectionID: "connection-1"}})
+	reply, err := client.Forward(ctx, Request{CommandID: 1})
+	if err != nil || reply != nil {
+		t.Fatalf("no-reply forward = reply:%#v error:%v, want nil/nil", reply, err)
+	}
+}
+
+func TestContractForwardReplyAllowsOnlyOneAndClosesAfterHandler(t *testing.T) {
+	var secondErr error
+	var handlerContext context.Context
+	server, err := NewServer(ServerConfig{ListenAddr: "127.0.0.1:0"}, RequestHandlerFunc(func(ctx context.Context, _ Request) error {
+		handlerContext = ctx
+		if err := SetForwardReply(ctx, Reply{CommandID: 2, Payload: []byte("first")}); err != nil {
+			return err
+		}
+		secondErr = SetForwardReply(ctx, Reply{CommandID: 3, Payload: []byte("second")})
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	response, err := server.Forward(context.Background(), &GateRequest{CommandId: 1})
+	if err != nil {
+		t.Fatalf("forward: %v", err)
+	}
+	if !errors.Is(secondErr, ErrForwardReplyAlreadySet) {
+		t.Fatalf("second reply error = %v, want ErrForwardReplyAlreadySet", secondErr)
+	}
+	if response.GetReply().GetCommandId() != 2 || string(response.GetReply().GetPayload()) != "first" {
+		t.Fatalf("response reply = %#v, want first reply", response.GetReply())
+	}
+	if err := SetForwardReply(handlerContext, Reply{CommandID: 4}); !errors.Is(err, ErrForwardReplyUnavailable) {
+		t.Fatalf("reply after handler error = %v, want ErrForwardReplyUnavailable", err)
+	}
+}
+
+func TestContractForwardReplyConcurrentCallsAcceptOnlyOne(t *testing.T) {
+	slot := newForwardReplySlot()
+	ctx := withForwardReplySlot(context.Background(), slot)
+	results := make(chan error, 2)
+	for commandID := uint32(2); commandID <= 3; commandID++ {
+		go func(commandID uint32) {
+			results <- SetForwardReply(ctx, Reply{CommandID: commandID})
+		}(commandID)
+	}
+	var successes int
+	for i := 0; i < 2; i++ {
+		if err := <-results; err == nil {
+			successes++
+		} else if !errors.Is(err, ErrForwardReplyAlreadySet) {
+			t.Fatalf("concurrent reply error = %v, want duplicate error", err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("concurrent reply successes = %d, want 1", successes)
+	}
+	if reply := slot.finish(true); reply == nil {
+		t.Fatal("concurrent reply slot finished without a reply")
+	}
+}
+
+func TestContractForwardReplyIsDiscardedOnHandlerError(t *testing.T) {
+	server, err := NewServer(ServerConfig{ListenAddr: "127.0.0.1:0"}, RequestHandlerFunc(func(ctx context.Context, _ Request) error {
+		if err := SetForwardReply(ctx, Reply{CommandID: 2, Payload: []byte("discard")}); err != nil {
+			return err
+		}
+		return errors.New("handler failed")
+	}))
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	response, err := server.Forward(context.Background(), &GateRequest{CommandId: 1})
+	if status.Code(err) != codes.Internal || response != nil {
+		t.Fatalf("failed forward = response:%#v error:%v, want nil/Internal", response, err)
+	}
+}
+
+func TestContractRejectsMalformedForwardReplies(t *testing.T) {
+	cases := []struct {
+		name     string
+		response *ForwardResponse
+	}{
+		{name: "nil response"},
+		{name: "zero reply command", response: &ForwardResponse{Reply: &ForwardReply{}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &Client{
+				cfg:    ClientConfig{Timeout: time.Second},
+				client: forwardClientStub{response: tc.response},
+			}
+			reply, err := client.Forward(context.Background(), Request{CommandID: 1})
+			if reply != nil || status.Code(err) != codes.Internal {
+				t.Fatalf("malformed forward = reply:%#v error:%v, want nil/Internal", reply, err)
+			}
+		})
+	}
+}
+
+func TestContractClientCopiesForwardReplyPayload(t *testing.T) {
+	payload := []byte("reply")
+	client := &Client{
+		client: forwardClientStub{response: &ForwardResponse{
+			Reply: &ForwardReply{CommandId: 2, Payload: payload},
+		}},
+	}
+	reply, err := client.Forward(context.Background(), Request{CommandID: 1})
+	if err != nil {
+		t.Fatalf("forward: %v", err)
+	}
+	reply.Payload[0] = 'X'
+	if string(payload) != "reply" {
+		t.Fatalf("stub response payload = %q, want unchanged after client mapping", payload)
 	}
 }
 
@@ -91,7 +263,7 @@ func TestContractUsesRoundRobinAcrossResolvedBackends(t *testing.T) {
 	t.Cleanup(func() { _ = client.Stop(context.Background()) })
 	for i := 1; i <= 20; i++ {
 		ctx := WithGateRequestContext(context.Background(), GateRequestContext{Source: RequestSource{ConnectionID: "connection-test"}})
-		if err := client.Forward(ctx, testRequest(uint32(i))); err != nil {
+		if _, err := client.Forward(ctx, testRequest(uint32(i))); err != nil {
 			t.Fatalf("forward(%d): %v", i, err)
 		}
 	}
@@ -161,7 +333,7 @@ func TestContractRejectsCommandIDZeroBeforeCallingHandler(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = client.Stop(context.Background()) })
 	ctx := WithGateRequestContext(context.Background(), GateRequestContext{Source: RequestSource{ConnectionID: "connection-1"}})
-	if err := client.Forward(ctx, Request{}); status.Code(err) != codes.InvalidArgument {
+	if _, err := client.Forward(ctx, Request{}); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("Client.Forward command 0 status = %s, want %s", status.Code(err), codes.InvalidArgument)
 	}
 	if _, err := client.client.Forward(ctx, &GateRequest{}); status.Code(err) != codes.InvalidArgument {
@@ -174,8 +346,11 @@ func TestContractRejectsCommandIDZeroBeforeCallingHandler(t *testing.T) {
 
 func TestContractRecoversHandlerPanicAndKeepsServerAvailable(t *testing.T) {
 	var calls atomic.Int32
-	server, err := NewServer(ServerConfig{ListenAddr: "127.0.0.1:0"}, RequestHandlerFunc(func(context.Context, Request) error {
+	server, err := NewServer(ServerConfig{ListenAddr: "127.0.0.1:0"}, RequestHandlerFunc(func(ctx context.Context, _ Request) error {
 		if calls.Add(1) == 1 {
+			if err := SetForwardReply(ctx, Reply{CommandID: 2, Payload: []byte("discard")}); err != nil {
+				return err
+			}
 			panic("test handler panic")
 		}
 		return nil
@@ -193,14 +368,26 @@ func TestContractRecoversHandlerPanicAndKeepsServerAvailable(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = client.Stop(context.Background()) })
 	ctx := WithGateRequestContext(context.Background(), GateRequestContext{Source: RequestSource{ConnectionID: "connection-1"}})
-	if err := client.Forward(ctx, Request{CommandID: 1}); status.Code(err) != codes.Internal {
-		t.Fatalf("panic response status = %s, want %s", status.Code(err), codes.Internal)
+	if reply, err := client.Forward(ctx, Request{CommandID: 1}); reply != nil || status.Code(err) != codes.Internal {
+		t.Fatalf("panic response = reply:%#v status:%s, want nil/Internal", reply, status.Code(err))
 	}
-	if err := client.Forward(ctx, Request{CommandID: 1}); err != nil {
+	if _, err := client.Forward(ctx, Request{CommandID: 1}); err != nil {
 		t.Fatalf("forward after handler panic: %v", err)
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("handler calls = %d, want 2", calls.Load())
+	}
+}
+
+func TestContractRejectsCanceledForwardReplyContext(t *testing.T) {
+	slot := newForwardReplySlot()
+	ctx, cancel := context.WithCancel(withForwardReplySlot(context.Background(), slot))
+	cancel()
+	if err := SetForwardReply(ctx, Reply{CommandID: 1}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled reply error = %v, want context.Canceled", err)
+	}
+	if reply := slot.finish(true); reply != nil {
+		t.Fatalf("canceled reply slot = %#v, want empty", reply)
 	}
 }
 
@@ -219,7 +406,7 @@ func TestContractRejectsRequestWithoutSourceConnectionID(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Stop(context.Background()) })
-	if err := client.Forward(context.Background(), Request{CommandID: 1}); err == nil || !strings.Contains(err.Error(), "connection_id is required") {
+	if _, err := client.Forward(context.Background(), Request{CommandID: 1}); err == nil || !strings.Contains(err.Error(), "connection_id is required") {
 		t.Fatalf("forward without source error = %v, want missing connection_id", err)
 	}
 }
@@ -247,9 +434,17 @@ type countingServer struct {
 	calls atomic.Int32
 }
 
-func (s *countingServer) Forward(context.Context, *GateRequest) (*emptypb.Empty, error) {
+type forwardClientStub struct {
+	response *ForwardResponse
+}
+
+func (s forwardClientStub) Forward(context.Context, *GateRequest, ...grpc.CallOption) (*ForwardResponse, error) {
+	return s.response, nil
+}
+
+func (s *countingServer) Forward(context.Context, *GateRequest) (*ForwardResponse, error) {
 	s.calls.Add(1)
-	return &emptypb.Empty{}, nil
+	return &ForwardResponse{}, nil
 }
 
 func startCountingServer(t *testing.T) (*countingServer, string) {

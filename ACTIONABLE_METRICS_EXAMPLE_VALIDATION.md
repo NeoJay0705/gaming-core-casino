@@ -33,8 +33,8 @@ EnterRoom 是 setup traffic，不納入 Echo latency 與 Echo request 數量。L
    `request-timeout` 收尾。一筆 request 只能有一個 terminal result；只有上層 context cancellation 才記為
    `cancelled`。
 
-此數值包含 client write、網路、Gate ingress、Gate-to-Game gRPC、Game handler、server-send、Gate
-WebSocket write 與 client read，是玩家角度的 end-to-end latency。
+此數值包含 client write、網路、Gate ingress、Gate-to-Game gRPC、Game handler、unary reply、Gate
+enqueue、WebSocket write 與 client read，是玩家角度的 end-to-end latency。
 
 ### 2.2 Server-side stages
 
@@ -46,8 +46,8 @@ WebSocket write 與 client read，是玩家角度的 end-to-end latency。
 | Gate command latency | `gaming_core_gate_websocket_command_duration_seconds{route="game",command="forward",result="success"}` |
 | Gate → Game gRPC | `gaming_core_gate_game_grpc_requests_total{code="OK"}`、`gaming_core_gate_game_grpc_duration_seconds{code="OK"}` |
 | Game Echo handler | `gaming_core_game_gate_commands_total{command="4043309073",result="success"}`、`gaming_core_game_gate_command_duration_seconds` |
-| Game request-player | `gaming_core_game_server_send_requests_total{operation="request_player",result="success"}`、`gaming_core_game_server_send_duration_seconds`；direct reply 使用 request-scoped `ReplyEndpoint`，不查 Redis |
-| Gate 收到 server-send | `gaming_core_gate_server_send_requests_total{target="connection",result="queued"}` |
+| Game request-player | `gaming_core_game_server_send_requests_total{operation="request_player",result="success"}`；counter 記錄 sender call 與 acceptance result，direct reply 寫入目前 unary request 的 reply slot，不查 Redis |
+| Gate 收到 server-send | Gate 收到 `ForwardResponse` 的 optional reply 後，`gaming_core_gate_server_send_requests_total{target="connection",result="queued"}` |
 | Gate 寫回 client | `gaming_core_gate_websocket_writes_total{source="server_send",result="success"}` |
 | Gate receive 至 write terminal | `gaming_core_gate_server_send_delivery_duration_seconds{target="connection",result="success"}` |
 
@@ -202,7 +202,6 @@ load process 結束時會同步關閉 `/metrics`，因此不要求 Prometheus �
 - `gaming_core_gate_websocket_commands_in_flight`
 - `gaming_core_gate_game_grpc_in_flight`
 - `gaming_core_game_gate_commands_in_flight`
-- `gaming_core_game_server_send_in_flight{operation="request_player"}`
 - `gaming_core_gate_websocket_writes_in_flight`
 - `gaming_core_gate_websocket_write_queue_messages`
 - `gaming_core_gate_websocket_connections`
@@ -224,7 +223,8 @@ request timeout 才表示 client-side failure。
 `write_queue_full` 或 `panic`，本次 correctness run 不通過。
 
 Counter delta 的相等關係只用於停止送流並完成收尾後的 final snapshots。測試進行中因 scrape 時序及
-server-send／WebSocket write 是非同步的，短暫不相等是正常現象。
+Gate enqueue／WebSocket write 是非同步的，短暫不相等是正常現象；request-player reply 本身會在原始
+Gate-to-Game unary response 中同步返回。
 
 ## 6. 綜合分析方式
 
@@ -256,11 +256,11 @@ histogram_quantile(
 )
 ```
 
-對 Gate gRPC、Game handler、Game server-send、Gate server-send delivery 與 Gate WebSocket write 使用
+對 Gate gRPC、Game handler、Gate server-send delivery 與 Gate WebSocket write 使用
 相同形式查詢。判讀原則：
 
 - client p95 與 Gate command／gRPC 同時升高：優先檢查 Gate-to-Game 或 Game handler；
-- Game handler 平穩，但 Game server-send 升高：檢查 request-scoped reply endpoint、Gate receiver 或 gRPC transport；
+- Game handler 平穩，但 request-player counter error 增加：檢查 reply slot acceptance、handler error 或 payload contract；
 - server-send delivery 或 WebSocket write 升高：檢查 write queue、slow client 與 socket write；
 - 所有 server stages 平穩，只有 client round trip 升高：檢查 client、網路或 load generator saturation。
 

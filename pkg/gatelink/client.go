@@ -94,17 +94,18 @@ func (c *Client) Stop(context.Context) error {
 	return c.conn.Close()
 }
 
-// Forward sends an opaque Gate request. Its unary interceptor propagates the
-// caller's GateRequestContext through gRPC metadata.
-func (c *Client) Forward(ctx context.Context, request Request) error {
+// Forward sends an opaque Gate request and returns its optional reply. Its
+// unary interceptor propagates the caller's GateRequestContext through gRPC
+// metadata.
+func (c *Client) Forward(ctx context.Context, request Request) (*Reply, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if c == nil {
-		return errors.New("gatelink: nil client")
+		return nil, errors.New("gatelink: nil client")
 	}
 	if request.CommandID == 0 {
-		return status.Error(codes.InvalidArgument, "command_id is required")
+		return nil, status.Error(codes.InvalidArgument, "command_id is required")
 	}
 	c.mu.Lock()
 	client := c.client
@@ -112,21 +113,38 @@ func (c *Client) Forward(ctx context.Context, request Request) error {
 	cfg := c.cfg
 	c.mu.Unlock()
 	if stopped {
-		return errors.New("gatelink: client is stopped")
+		return nil, errors.New("gatelink: client is stopped")
 	}
 	if client == nil {
-		return errClientUnavailable
+		return nil, errClientUnavailable
 	}
 	if cfg.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, cfg.Timeout)
 		defer cancel()
 	}
-	_, err := client.Forward(ctx, &GateRequest{
+	response, err := client.Forward(ctx, &GateRequest{
 		CommandId: request.CommandID,
 		Payload:   append([]byte(nil), request.Payload...),
 	})
-	return err
+	if err != nil {
+		return nil, err
+	}
+	if response == nil {
+		return nil, status.Error(codes.Internal, "gatelink: Forward returned nil response")
+	}
+	forwardReply := response.GetReply()
+	if forwardReply == nil {
+		return nil, nil
+	}
+	if forwardReply.GetCommandId() == 0 {
+		return nil, status.Error(codes.Internal, "gatelink: Forward reply command_id is required")
+	}
+	return &Reply{
+		CommandID:         forwardReply.GetCommandId(),
+		Payload:           append([]byte(nil), forwardReply.GetPayload()...),
+		ExpectedLoginName: forwardReply.GetExpectedLoginName(),
+	}, nil
 }
 
 var _ interface {

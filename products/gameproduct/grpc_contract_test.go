@@ -60,7 +60,7 @@ func TestGameProductContractRegistersGateRequestHandler(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = client.Stop(context.Background()) })
 	ctx := gatelink.WithGateRequestContext(context.Background(), gatelink.GateRequestContext{Source: gatelink.RequestSource{ConnectionID: "player-7"}})
-	if err := client.Forward(ctx, gatelink.Request{CommandID: 7, Payload: []byte("opaque")}); err != nil {
+	if _, err := client.Forward(ctx, gatelink.Request{CommandID: 7, Payload: []byte("opaque")}); err != nil {
 		t.Fatalf("forward to game product: %v", err)
 	}
 	select {
@@ -97,7 +97,7 @@ func TestGameProductAllowsMissingHandlerUntilDispatcherIsInstalled(t *testing.T)
 	}
 	t.Cleanup(func() { _ = client.Stop(context.Background()) })
 	ctx := gatelink.WithGateRequestContext(context.Background(), gatelink.GateRequestContext{Source: gatelink.RequestSource{ConnectionID: "player-empty"}})
-	if err := client.Forward(ctx, gatelink.Request{CommandID: 99}); status.Code(err) != codes.Unimplemented {
+	if _, err := client.Forward(ctx, gatelink.Request{CommandID: 99}); status.Code(err) != codes.Unimplemented {
 		t.Fatalf("empty dispatcher status = %s, want %s", status.Code(err), codes.Unimplemented)
 	}
 	_ = app.frameworkApp.Stop(context.Background())

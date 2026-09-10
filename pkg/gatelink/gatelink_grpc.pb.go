@@ -11,7 +11,6 @@ import (
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
 	status "google.golang.org/grpc/status"
-	emptypb "google.golang.org/protobuf/types/known/emptypb"
 )
 
 // This is a compile-time assertion to ensure that this generated file
@@ -29,7 +28,7 @@ const (
 //
 // GateRequestService is the direct Gate-to-Game ingress contract.
 type GateRequestServiceClient interface {
-	Forward(ctx context.Context, in *GateRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	Forward(ctx context.Context, in *GateRequest, opts ...grpc.CallOption) (*ForwardResponse, error)
 }
 
 type gateRequestServiceClient struct {
@@ -40,9 +39,9 @@ func NewGateRequestServiceClient(cc grpc.ClientConnInterface) GateRequestService
 	return &gateRequestServiceClient{cc}
 }
 
-func (c *gateRequestServiceClient) Forward(ctx context.Context, in *GateRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *gateRequestServiceClient) Forward(ctx context.Context, in *GateRequest, opts ...grpc.CallOption) (*ForwardResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(emptypb.Empty)
+	out := new(ForwardResponse)
 	err := c.cc.Invoke(ctx, GateRequestService_Forward_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
@@ -56,7 +55,7 @@ func (c *gateRequestServiceClient) Forward(ctx context.Context, in *GateRequest,
 //
 // GateRequestService is the direct Gate-to-Game ingress contract.
 type GateRequestServiceServer interface {
-	Forward(context.Context, *GateRequest) (*emptypb.Empty, error)
+	Forward(context.Context, *GateRequest) (*ForwardResponse, error)
 	mustEmbedUnimplementedGateRequestServiceServer()
 }
 
@@ -67,7 +66,7 @@ type GateRequestServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedGateRequestServiceServer struct{}
 
-func (UnimplementedGateRequestServiceServer) Forward(context.Context, *GateRequest) (*emptypb.Empty, error) {
+func (UnimplementedGateRequestServiceServer) Forward(context.Context, *GateRequest) (*ForwardResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Forward not implemented")
 }
 func (UnimplementedGateRequestServiceServer) mustEmbedUnimplementedGateRequestServiceServer() {}

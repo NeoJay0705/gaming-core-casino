@@ -9,7 +9,6 @@ package gatelink
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
-	emptypb "google.golang.org/protobuf/types/known/emptypb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
@@ -76,17 +75,130 @@ func (x *GateRequest) GetPayload() []byte {
 	return nil
 }
 
+type ForwardReply struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	CommandId uint32                 `protobuf:"varint,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
+	Payload   []byte                 `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"`
+	// 非空時，Gate 必須確認原 connection 仍是此登入身分。
+	ExpectedLoginName string `protobuf:"bytes,3,opt,name=expected_login_name,json=expectedLoginName,proto3" json:"expected_login_name,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *ForwardReply) Reset() {
+	*x = ForwardReply{}
+	mi := &file_pkg_gatelink_gatelink_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ForwardReply) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ForwardReply) ProtoMessage() {}
+
+func (x *ForwardReply) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_gatelink_gatelink_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ForwardReply.ProtoReflect.Descriptor instead.
+func (*ForwardReply) Descriptor() ([]byte, []int) {
+	return file_pkg_gatelink_gatelink_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *ForwardReply) GetCommandId() uint32 {
+	if x != nil {
+		return x.CommandId
+	}
+	return 0
+}
+
+func (x *ForwardReply) GetPayload() []byte {
+	if x != nil {
+		return x.Payload
+	}
+	return nil
+}
+
+func (x *ForwardReply) GetExpectedLoginName() string {
+	if x != nil {
+		return x.ExpectedLoginName
+	}
+	return ""
+}
+
+type ForwardResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 未設定表示 handler 沒有立即回覆；每筆 request 最多一筆。
+	Reply         *ForwardReply `protobuf:"bytes,1,opt,name=reply,proto3" json:"reply,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ForwardResponse) Reset() {
+	*x = ForwardResponse{}
+	mi := &file_pkg_gatelink_gatelink_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ForwardResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ForwardResponse) ProtoMessage() {}
+
+func (x *ForwardResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_gatelink_gatelink_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ForwardResponse.ProtoReflect.Descriptor instead.
+func (*ForwardResponse) Descriptor() ([]byte, []int) {
+	return file_pkg_gatelink_gatelink_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *ForwardResponse) GetReply() *ForwardReply {
+	if x != nil {
+		return x.Reply
+	}
+	return nil
+}
+
 var File_pkg_gatelink_gatelink_proto protoreflect.FileDescriptor
 
 const file_pkg_gatelink_gatelink_proto_rawDesc = "" +
 	"\n" +
-	"\x1bpkg/gatelink/gatelink.proto\x12\vgatelink.v1\x1a\x1bgoogle/protobuf/empty.proto\"F\n" +
+	"\x1bpkg/gatelink/gatelink.proto\x12\vgatelink.v1\"F\n" +
 	"\vGateRequest\x12\x1d\n" +
 	"\n" +
 	"command_id\x18\x01 \x01(\rR\tcommandId\x12\x18\n" +
-	"\apayload\x18\x02 \x01(\fR\apayload2Q\n" +
-	"\x12GateRequestService\x12;\n" +
-	"\aForward\x12\x18.gatelink.v1.GateRequest\x1a\x16.google.protobuf.EmptyB7Z5github.com/NeoJay0705/gaming-core-casino/pkg/gatelinkb\x06proto3"
+	"\apayload\x18\x02 \x01(\fR\apayload\"w\n" +
+	"\fForwardReply\x12\x1d\n" +
+	"\n" +
+	"command_id\x18\x01 \x01(\rR\tcommandId\x12\x18\n" +
+	"\apayload\x18\x02 \x01(\fR\apayload\x12.\n" +
+	"\x13expected_login_name\x18\x03 \x01(\tR\x11expectedLoginName\"B\n" +
+	"\x0fForwardResponse\x12/\n" +
+	"\x05reply\x18\x01 \x01(\v2\x19.gatelink.v1.ForwardReplyR\x05reply2W\n" +
+	"\x12GateRequestService\x12A\n" +
+	"\aForward\x12\x18.gatelink.v1.GateRequest\x1a\x1c.gatelink.v1.ForwardResponseB7Z5github.com/NeoJay0705/gaming-core-casino/pkg/gatelinkb\x06proto3"
 
 var (
 	file_pkg_gatelink_gatelink_proto_rawDescOnce sync.Once
@@ -100,19 +212,21 @@ func file_pkg_gatelink_gatelink_proto_rawDescGZIP() []byte {
 	return file_pkg_gatelink_gatelink_proto_rawDescData
 }
 
-var file_pkg_gatelink_gatelink_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
+var file_pkg_gatelink_gatelink_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
 var file_pkg_gatelink_gatelink_proto_goTypes = []any{
-	(*GateRequest)(nil),   // 0: gatelink.v1.GateRequest
-	(*emptypb.Empty)(nil), // 1: google.protobuf.Empty
+	(*GateRequest)(nil),     // 0: gatelink.v1.GateRequest
+	(*ForwardReply)(nil),    // 1: gatelink.v1.ForwardReply
+	(*ForwardResponse)(nil), // 2: gatelink.v1.ForwardResponse
 }
 var file_pkg_gatelink_gatelink_proto_depIdxs = []int32{
-	0, // 0: gatelink.v1.GateRequestService.Forward:input_type -> gatelink.v1.GateRequest
-	1, // 1: gatelink.v1.GateRequestService.Forward:output_type -> google.protobuf.Empty
-	1, // [1:2] is the sub-list for method output_type
-	0, // [0:1] is the sub-list for method input_type
-	0, // [0:0] is the sub-list for extension type_name
-	0, // [0:0] is the sub-list for extension extendee
-	0, // [0:0] is the sub-list for field type_name
+	1, // 0: gatelink.v1.ForwardResponse.reply:type_name -> gatelink.v1.ForwardReply
+	0, // 1: gatelink.v1.GateRequestService.Forward:input_type -> gatelink.v1.GateRequest
+	2, // 2: gatelink.v1.GateRequestService.Forward:output_type -> gatelink.v1.ForwardResponse
+	2, // [2:3] is the sub-list for method output_type
+	1, // [1:2] is the sub-list for method input_type
+	1, // [1:1] is the sub-list for extension type_name
+	1, // [1:1] is the sub-list for extension extendee
+	0, // [0:1] is the sub-list for field type_name
 }
 
 func init() { file_pkg_gatelink_gatelink_proto_init() }
@@ -126,7 +240,7 @@ func file_pkg_gatelink_gatelink_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pkg_gatelink_gatelink_proto_rawDesc), len(file_pkg_gatelink_gatelink_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   1,
+			NumMessages:   3,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

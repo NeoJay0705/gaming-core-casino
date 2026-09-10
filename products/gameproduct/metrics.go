@@ -17,8 +17,6 @@ type gameMetrics struct {
 	gateCommandsInFlight prometheus.Gauge
 
 	serverSendRequests *prometheus.CounterVec
-	serverSendDuration *prometheus.HistogramVec
-	serverSendInFlight *prometheus.GaugeVec
 }
 
 func gameCommandLabel(commandDispatcher *dispatcher.Dispatcher, commandID uint32) string {
@@ -50,23 +48,12 @@ func newGameMetrics(registerer prometheus.Registerer) (*gameMetrics, error) {
 			Name: "gaming_core_game_server_send_requests_total",
 			Help: "Total number of Game server-send requests by operation and result.",
 		}, []string{"operation", "result"}),
-		serverSendDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Name:    "gaming_core_game_server_send_duration_seconds",
-			Help:    "Game server-send operation duration in seconds.",
-			Buckets: prometheus.DefBuckets,
-		}, []string{"operation", "result"}),
-		serverSendInFlight: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "gaming_core_game_server_send_in_flight",
-			Help: "Current number of Game server-send operations in flight.",
-		}, []string{"operation"}),
 	}
 	for _, collector := range []prometheus.Collector{
 		m.gateCommands,
 		m.gateCommandDuration,
 		m.gateCommandsInFlight,
 		m.serverSendRequests,
-		m.serverSendDuration,
-		m.serverSendInFlight,
 	} {
 		if err := registerer.Register(collector); err != nil {
 			return nil, err
@@ -93,19 +80,13 @@ func (s *measuredRequestPlayerSender) SendToRequestPlayer(ctx context.Context, m
 		return serversend.Receipt{}, errors.New("game server send: request player sender is not configured")
 	}
 	const operation = "request_player"
-	if s.metrics != nil {
-		s.metrics.serverSendInFlight.WithLabelValues(operation).Inc()
-	}
-	start := time.Now()
 	receipt, err := s.delegate.SendToRequestPlayer(ctx, message)
 	result := "success"
 	if err != nil {
 		result = "error"
 	}
 	if s.metrics != nil {
-		s.metrics.serverSendInFlight.WithLabelValues(operation).Dec()
 		s.metrics.serverSendRequests.WithLabelValues(operation, result).Inc()
-		s.metrics.serverSendDuration.WithLabelValues(operation, result).Observe(time.Since(start).Seconds())
 	}
 	return receipt, err
 }

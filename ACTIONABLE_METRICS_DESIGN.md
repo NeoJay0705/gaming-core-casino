@@ -8,8 +8,8 @@ Duration 與 Saturation 的最小 metrics，並提供 `gameproduct`、`gateprodu
 
 壓測主流程使用既有正式 Login proto，加上範例專用且穩定可重現的 player-facing proto：進房、Echo
 command。Echo 代表目前尚未定義的 Game business command，會走完整的 WebSocket read、Gate-to-Game
-gRPC、Game handler、server-send、Gate receive 與 WebSocket write 路徑；它是可啟動範例的完整 transport
-workflow，不是 framework product 對外承諾的業務 API。
+unary gRPC request/response、Game handler、Gate enqueue 與 WebSocket write 路徑；它是可啟動範例的完整
+transport workflow，不是 framework product 對外承諾的業務 API。
 
 Command label 不維護第二份 allowlist。`dispatcher` 的可信任註冊資料是合法 command 的唯一來源：
 在能判定合法性的 process 內，已註冊 ID 才能成為 label value，未註冊輸入聚合成 `unknown`；Gate
@@ -33,7 +33,7 @@ metrics 與 proto 修改，只有本文件明確列出的部分在本次解除�
   2. Login command 在 Gate 處理。
   3. Enter-room command 在 Gate 處理。
   4. Echo command 由 Gate forward 到 Game gRPC。
-  5. Game handler 透過 server-send 回到原 Gate connection。
+  5. Game handler 透過 `RequestPlayerSender` 將一筆 reply 放入原 Gate-to-Game unary response。
   6. Gate writer 實際完成 WebSocket binary write。
 - 未登入執行 enter-room，或未進房執行 forward，Gate 都記錄固定原因並關閉該 connection。
 - 能從 metrics 判斷各階段的 latency、RPS、error 與現有資源 saturation。
@@ -49,8 +49,8 @@ metrics 與 proto 修改，只有本文件明確列出的部分在本次解除�
 | read 後 | Gate 完成一個 WebSocket binary packet 解析後，開始 command timer |
 | gRPC 前 | Gate 呼叫 `gatelink.Client.Forward` 前，開始 Gate-to-Game timer |
 | gRPC handler 前 | Game 進入 product request handler 後，開始 Game command timer |
-| server-send 前 | Game handler 呼叫 direct request-player sender 前，開始 server-send timer |
-| Gate 收到後 | Gate 的 `LocalReceiver` 收到並完成基本 request validation 後，保存本機 `receivedAt` |
+| server-send 前 | Game handler 呼叫 `RequestPlayerSender` 前，開始 request-player acceptance timer |
+| Gate 收到後 | Gate 收到 `ForwardResponse` 並完成基本 reply validation 後，保存本機 `receivedAt` |
 | write 成功 | writer goroutine 的 `WriteMessage` 返回 nil 時結束 write 與 server-send delivery timer |
 
 每個 duration 都由同一 process 的 `time.Now` 差值產生，不輸出每筆 timestamp，也不跨主機相減。
@@ -123,10 +123,14 @@ Gate WebSocketServer
 Game gRPC handler --> Game dispatcher --> Echo handler
                                            |
                                            v
-                              RequestPlayerSender / server-send
+                              RequestPlayerSender
+                              (single reply slot)
                                            |
                                            v
-Gate LocalReceiver -- receivedAt --> outbound envelope --> writer --> player
+                         ForwardResponse --> Gate enqueue
+                                           |
+                                           v
+                              outbound envelope --> writer --> player
 
 prometheus.Registerer
   |-- Go/process collectors
@@ -179,15 +183,16 @@ Collector 不執行 query、PING 或其他 I/O；scrape 時只讀本機 stats sn
 workflow 註冊與使用；它們不成為 framework product 的公開業務 API。Runnable 範本只負責組裝正式
 product App 與範例 handler，不把假資料邏輯加入四個 product 的預設 module。
 
-### 4.7 `pkg/gatelink` 與 direct request route
+### 4.7 `pkg/gatelink` 與 request reply
 
-`gatelink.RequestSource` 保留 `GateID`、`ConnectionID`，並增加由 Gate server-send listener 產生的
-`ReplyEndpoint`。既有 gRPC metadata interceptor 以固定 `x-gate-request-reply-endpoint` key 傳遞它；一般
-Gate request 可不帶此欄位，只有 `RequestPlayerSender` 要求三者完整。Gate 不接受 player payload 提供 endpoint。
+`gatelink.Forward` 回傳 `ForwardResponse`，其中最多包含一個 `ForwardReply`。Game gRPC server 在 handler
+context 建立 request-scoped reply slot；`serversend.RequestPlayerSender` 將 reply 寫入 slot，handler
+成功結束後由同一個 unary response 返回 Gate。
 
-`serversend.DirectRequestPlayerSender` 只依賴既有 `GRPCTransport`，從 request context 組出已驗證的
-`GateEndpoint` 後直接呼叫 `SendToConnection`，不再以 GateID 呼叫 Redis `GateResolver`。`RoutedPlayerSender`
-與 broadcast sender 的 presence/directory route 不變。
+Gate 使用發出 `Forward` 時仍持有的 WebSocket session enqueue reply，不重新查找 Gate endpoint、presence 或
+Redis。`RequestSource.ReplyEndpoint` 與既有 metadata propagation 暫時保留，供 mixed-version rollout 的舊
+Game reverse server-send path 使用；新的 request-player reply 不依賴它。`RoutedPlayerSender` 與 broadcast sender
+的 presence/directory route 不變。
 
 ---
 
@@ -235,8 +240,8 @@ Gate request 可不帶此欄位，只有 `RequestPlayerSender` 要求三者完�
 | `gaming_core_gate_websocket_write_queue_messages` | Gauge | 所有 active connections 尚未開始 write 的 application messages |
 | `gaming_core_gate_websocket_write_queue_capacity` | Gauge | 所有 active connection queues 的總 capacity |
 | `gaming_core_gate_websocket_write_queue_full_total` | Counter `{source}` | non-blocking enqueue 因 queue full 失敗 |
-| `gaming_core_gate_server_send_requests_total` | Counter `{target,result}` | Gate LocalReceiver 收到的 direct/player/room request；結果為 `queued`、`ignored` 或 `error` |
-| `gaming_core_gate_server_send_delivery_duration_seconds` | Histogram `{target,result}` | Gate receive 到每個目標 write terminal state |
+| `gaming_core_gate_server_send_requests_total` | Counter `{target,result}` | Gate 收到的 logical direct/player/room delivery；request-player unary reply 也在 Gate enqueue 時記錄；結果為 `queued`、`ignored` 或 `error` |
+| `gaming_core_gate_server_send_delivery_duration_seconds` | Histogram `{target,result}` | Gate 收到 logical delivery 到每個目標 write terminal state |
 
 固定 label 值：
 
@@ -260,8 +265,6 @@ Gate request 可不帶此欄位，只有 `RequestPlayerSender` 要求三者完�
 | `gaming_core_game_gate_command_duration_seconds` | Histogram `{command,result}` | 進入 Game product handler 到 dispatcher 返回 |
 | `gaming_core_game_gate_commands_in_flight` | Gauge | Game 正在處理的 Gate commands |
 | `gaming_core_game_server_send_requests_total` | Counter `{operation,result}` | direct request-player sender 呼叫 rate/error |
-| `gaming_core_game_server_send_duration_seconds` | Histogram `{operation,result}` | Game 呼叫 sender 到 Gate 回覆 enqueue 結果 |
-| `gaming_core_game_server_send_in_flight` | Gauge `{operation}` | concurrent server-send calls |
 
 `command` 只可能是 Game dispatcher 已註冊 ID 的十進位字串或 `unknown`；`operation` 本次只有
 `request_player`。未知 command 回 `Unimplemented`，不把 raw ID 暴露為 label。
@@ -356,8 +359,9 @@ type outboundMessage struct {
 ```
 
 - Handler 直接呼叫 `SendBinary` 時，source 為 `handler`，enqueue 當下設定時間。
-- Gate server-send receiver 在 method entry 保存同一個 `receivedAt`，透過 package-private registry
-  helper 傳給每一個目標 connection；room broadcast 的所有 envelopes 共用這個 receive time。
+- Gate 收到 Game `ForwardResponse` 的 request-player reply 時，保存本機 `receivedAt`，透過
+  package-private registry helper 傳給原始 connection。仍保留的 Gate server-send receiver 在 method entry
+  保存同一個 `receivedAt`，room broadcast 的所有 envelopes 共用這個 receive time。
 - 真實 `webSocketConnection` 走 timestamp-aware private enqueue；既有 test fake 仍可 fallback 到公開
   `SendBinary`，因此不擴大 public interface。
 - Writer dequeue 時更新 queue Gauge；`WriteMessage` 返回後記錄 write result 與 delivery duration。
@@ -371,8 +375,9 @@ Concrete connection 以 package-private `closeWithReason` 保存 first terminal 
 既有 server-side kick/replacement 使用 `server_closed`，App shutdown 則由 owner 明確使用 `shutdown`。
 不修改 `ClosableWebSocketSession` public contract。
 
-Server-send RPC 的既有 `DELIVERED` 語意維持「成功 enqueue」。本次只增加非同步 write outcome
-metrics，不讓 gRPC 等待 client socket write，避免改變 timeout 與 backpressure 行為。
+仍保留的 Player/Broadcast server-send RPC，其既有 `DELIVERED` 語意維持「成功 enqueue」。本次只增加
+非同步 write outcome metrics，不讓任何 server-send gRPC 等待 client socket write，避免改變 timeout 與
+backpressure 行為；request-player reply 則已在原始 `ForwardResponse` enqueue 時記錄相同 logical delivery。
 
 ---
 
@@ -435,7 +440,8 @@ Login proto 與既有 transport path 是 public contract；EnterRoom/Echo transp
 - 在 `GateRequestChannel` 註冊 example-local Echo command。
 - Unmarshal example-local `EchoRequest`，建立 `EchoResponse`。
 - 使用 `RequestPlayerSender.SendToRequestPlayer` 回到原始 Gate connection。
-- direct request-player reply 直接使用 Gate request context 的 `ReplyEndpoint`；不為每筆 Echo reply 查 Redis。
+- direct request-player reply 寫入目前 `Forward` request 的 single reply slot；Gate 收到 `ForwardResponse` 後
+  enqueue 原始 session，不為每筆 Echo reply 查 Redis 或重新發起 reverse RPC。
 - 不使用 Database；`PlayerSender`／broadcast 仍依既有設定使用 Redis presence/directory route。
 
 ### 7.4 四個 runnable programs
@@ -589,15 +595,18 @@ read failure 與 application 主動 close 應分開；原始 error 只進 log，
 - `products/gameproduct/grpc.go`
   - 以 dispatcher registration 決定 bounded command label 並記錄 handler metrics。
 - `products/gameproduct/server_send.go`
-  - 只包裝 `RequestPlayerSender`，以 request-scoped reply endpoint 建立 direct sender，不改其他 sender 行為。
+  - 只包裝 `RequestPlayerSender`，以 request-scoped reply slot 建立 direct sender，不改其他 sender 行為。
 - Game 既有 contract tests
   - 補 registered/unknown/error/server-send metrics contracts。
-- `pkg/gatelink/metadata.go` 與 gatelink contract tests
-  - 在 `RequestSource`／既有 metadata interceptor 傳遞可選 `ReplyEndpoint`，保留一般 request 的相容性。
+- `pkg/gatelink/gatelink.proto`、generated code、`reply.go`、`server.go`、`client.go` 與 gatelink contract tests
+  - 定義 `ForwardResponse` 的 single optional reply、request-scoped slot 與 client mapping；保留既有 metadata
+    與一般 request 的相容性。
 - `pkg/serversend/sender.go` 與 sender contract tests
-  - direct request-player sender 直接驗證並使用 request route，不依賴 per-message Redis `GateResolver`。
-- `products/gateproduct/server_send_runtime.go`、`websocket.go` 與受影響 Gate tests
-  - 保存 managed advertise endpoint，注入每筆 forwarded request；停止後清空 route。
+  - direct request-player sender 將 reply 寫入 active unary slot，不依賴 transport 或 per-message Redis
+    `GateResolver`。
+- `products/gateproduct/websocket.go` 與受影響 Gate tests
+  - 接收 optional `ForwardResponse` reply、驗證 identity、enqueue 原始 session；既有 reverse server-send
+    runtime 僅供 Player/Broadcast 與 mixed-version rollout。
 
 ### 10.2 Example wire contract
 
@@ -632,7 +641,8 @@ namespace 使用 `metrics.example.v1`，Go package 使用
 
 - `pkg/framework` lifecycle、DI public interfaces 與 phases。
 - Observability HTTP paths、listener config、health/readiness 語意。
-- `gatelink.proto`、`serversend.proto` 與既有 RPC wire format。
+- `serversend.proto` 與既有 server-send RPC wire format；`gatelink.proto` 的 `Forward` response 是本次明確
+  修改的 unary reply contract。
 - `WebSocketSession.SendBinary` public method signature。
 - 既有 WebSocket packet header 與 `EncodeWebSocketPacket` 的 wire 語意。
 - Server-send `DELIVERED`/`Receipt.AcceptedAt` 的 enqueue/acceptance 語意。
@@ -660,8 +670,8 @@ namespace 使用 `metrics.example.v1`，Go package 使用
 12. Observability：每個 App 都含 Go/process collectors，兩個 App registry 仍互相隔離。
 13. Load observer：每筆 Echo 只有一個 `success`、`error` 或 `cancelled` terminal result，Histogram
     count 對應 Counter、in-flight 歸零，且 private `/metrics` listener 可停止。
-14. Direct request route：metadata 保留 GateID／connection／reply endpoint；sender 不查 Redis，malformed
-    endpoint 在 delivery 前失敗。
+14. Direct request reply：RequestPlayerSender 寫入 active unary reply slot；沒有 slot、duplicate 或 malformed
+    reply 都在 Gate enqueue 前失敗，sender 不查 Redis。
 15. Load phases：所有 handshake 完成後才送 Login，所有 session ready 後才 warm-up，admission window 到期
     不取消既有 in-flight request，setup concurrency 不超過設定。
 
@@ -714,8 +724,9 @@ Gate 對 forwarded command 只能標 `forward` 是刻意限制。若讓 Gate 複
 ### 12.2 保留 asynchronous WebSocket write
 
 讓 server-send RPC 等待 socket write，會把慢 client 直接轉成 Game-to-Gate timeout 並改變現有
-backpressure。Private envelope/callback 可得到真實 write outcome，同時保留 enqueue contract；這是
-滿足 latency 需求所需的最小結構變更。
+backpressure。Private envelope/callback 可得到真實 write outcome，同時保留 enqueue contract；request-player
+reply 在原始 unary response 中完成，Player/Broadcast reverse RPC 仍不等待 socket write。這是滿足 latency
+需求所需的最小結構變更。
 
 ### 12.3 Pool metrics 隨 lazy resource 註冊
 
@@ -732,9 +743,9 @@ framework product 的公開 package。其 payload bounded、無資料庫 side ef
 
 ### 12.5 不全面 instrument 所有 infra/serversend operation
 
-目前壓測流程只使用 direct request-player reply；直接攜帶 Gate request 的 reply endpoint 即可定位需求描述
-中的 server-send stage，且不必為每筆 reply 查 Redis。Player/broadcast sender、Redis commands 與 SQL
-statements 尚無 workload/SLO，現在加入只會增加未被驗證的 metric surface。
+目前壓測流程只使用 direct request-player reply；single unary reply slot 與 Gate 原始 session enqueue
+即可定位需求描述中的 server-send stage，且不必為每筆 reply 查 Redis 或建立 reverse RPC。Player/broadcast
+sender、Redis commands 與 SQL statements 尚無 workload/SLO，現在加入只會增加未被驗證的 metric surface。
 
 ---
 
@@ -798,7 +809,8 @@ statements 尚無 workload/SLO，現在加入只會增加未被驗證的 metric 
 - 不新增 per-command name metadata；已註冊 numeric ID 足以穩定定位。
 - 不讓 Gate 同步取得或複製 Game command registry。
 - 不讓 server-send RPC 等待 WebSocket write。
-- 不增加 timestamp wire fields 或修改既有 gRPC proto。
+- 不增加 timestamp wire fields，也不修改 `serversend.proto`；`gatelink.proto` 的 `ForwardResponse` 修改屬於
+  本次必要的 request-correlated reply contract。
 - 不量測 Ping/Pong、bytes、每個 Redis command、SQL statement、RocketMQ 或未使用的 sender paths。
 - 不加入假的 API/GMS traffic、debug endpoints、delay/error query 參數、pprof 或 tracing。
 - 不新增 metrics config、bucket config、alerts、dashboards、Docker Compose 或通用 load framework。
@@ -808,8 +820,8 @@ statements 尚無 workload/SLO，現在加入只會增加未被驗證的 metric 
 
 Review 後的修改沒有刪減已確認需求。所有新增 production metrics 都能對應 Rate、Error、Duration 或
 Saturation，且每個 label 都有封閉來源。額外程式結構只用於現存缺口：判斷 dispatcher registration、讀取
-canonical session state、把 server-send receive time 帶到 asynchronous writer、攜帶 direct reply endpoint
-以及讓 load setup 與 measured window 可分離。
+canonical session state、把 unary reply receive time 帶到 asynchronous writer、以 single reply slot 保持
+request-correlated delivery，以及讓 load setup 與 measured window 可分離。
 
 若再移除其中任一項，會失去 command cardinality 安全、狀態 contract、指定 latency 邊界、pool
 saturation 或可執行驗證之一；上述明確排除項若加入，則會超出目前 workload 與需求。因此本設計是
@@ -826,7 +838,7 @@ saturation 或可執行驗證之一；上述明確排除項若加入，則會超
 5. 新增 example-local EnterRoom/Echo proto、generated files 與 schema contracts。
 6. 新增 Gate/Game workflow modules 與 full-flow integration contract。
 7. 新增四個 runnable service mains、最小 load client、configs 與 README，確認全部 examples 可編譯。
-8. 完成 request-scoped direct reply route 與 load setup/warm-up/admission phases 的 contract tests。
+8. 完成 request-scoped unary reply slot 與 load setup/warm-up/admission phases 的 contract tests。
 9. 執行完整 test/race/vet，最後核對 diff 只包含第 10 節列出的必要範圍。
 
 若實作中發現既有 API 無法維持本文件定義的 enqueue、lazy lifecycle 或 App-local registry 契約，應先

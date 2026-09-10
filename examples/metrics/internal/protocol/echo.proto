@@ -9,7 +9,7 @@ message EchoRequest {
   bytes payload = 1;
 }
 
-// EchoResponse 透過既有 Game-to-Gate server-send path 回傳。
+// EchoResponse 由 Game 放入 Gate-to-Game unary response，再回到原始 connection。
 message EchoResponse {
   bytes payload = 1;
 }

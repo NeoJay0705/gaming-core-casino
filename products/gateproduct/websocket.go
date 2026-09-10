@@ -386,10 +386,11 @@ func (s *WebSocketServer) dispatchPacket(ctx context.Context, session *webSocket
 	if s.metrics != nil {
 		s.metrics.gameGRPCInFlight.Inc()
 	}
-	if err := s.gameClient.Forward(ctx, gatelink.Request{
+	reply, err := s.gameClient.Forward(ctx, gatelink.Request{
 		CommandID: packet.CommandID,
 		Payload:   packet.Payload,
-	}); err != nil {
+	})
+	if err != nil {
 		if s.metrics != nil {
 			s.metrics.gameGRPCInFlight.Dec()
 			s.metrics.observeGameGRPC(boundedGRPCCode(err), time.Since(grpcStart))
@@ -401,6 +402,36 @@ func (s *WebSocketServer) dispatchPacket(ctx context.Context, session *webSocket
 	if s.metrics != nil {
 		s.metrics.gameGRPCInFlight.Dec()
 		s.metrics.observeGameGRPC(boundedGRPCCode(nil), time.Since(grpcStart))
+	}
+	if reply != nil {
+		receivedAt := time.Now()
+		if reply.ExpectedLoginName != "" {
+			state, exists := s.registry.State(session.ID())
+			if !exists || string(state.LoginName) != reply.ExpectedLoginName {
+				if s.metrics != nil {
+					s.metrics.observeServerSendRequest(string(serverSendTargetConnection), "ignored")
+				}
+				log.Printf("[gate websocket] forwarded reply identity mismatch: session=%s command=%d", session.ID(), reply.CommandID)
+				_ = session.closeWithReason(closeReasonForwardError)
+				return false
+			}
+		}
+		if err := sendOutbound(session, outboundMessage{
+			data:       encodeWebSocketPacket(WebSocketPacket{CommandID: reply.CommandID, Payload: reply.Payload}),
+			source:     outboundSourceServerSend,
+			receivedAt: receivedAt,
+			target:     serverSendTargetConnection,
+		}); err != nil {
+			if s.metrics != nil {
+				s.metrics.observeServerSendRequest(string(serverSendTargetConnection), "error")
+			}
+			log.Printf("[gate websocket] enqueue forwarded reply failed: session=%s command=%d err=%v", session.ID(), reply.CommandID, err)
+			_ = session.closeWithReason(closeReasonForwardError)
+			return false
+		}
+		if s.metrics != nil {
+			s.metrics.observeServerSendRequest(string(serverSendTargetConnection), "queued")
+		}
 	}
 	result = "success"
 	return true

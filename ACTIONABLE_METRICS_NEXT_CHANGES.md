@@ -1,11 +1,11 @@
-# Actionable Metrics 後續必要修改
+# Actionable Metrics 後續必要修改（request-player unary reply）
 
 ## 1. 目的與範圍
 
 本文件只整理目前 Echo 壓測暴露出的兩項必要修正：
 
-1. `RequestPlayerSender` 回覆原請求 connection 時，直接使用 Gate request 攜帶的 reply endpoint，避免每筆
-   Echo 都以 Redis `GET` 重新解析同一個 Gate endpoint。
+1. `RequestPlayerSender` 回覆原請求 connection 時，將單一 reply 寫入 Gate → Game `Forward` unary response，
+   避免每筆 Echo 建立 reverse RPC 或以 Redis `GET` 重新解析 Gate endpoint。
 2. load client 必須先建立全部 WebSocket connections，再初始化 Login／EnterRoom、執行 warm-up，最後才開始
    固定 duration 的正式測量，避免 connection establishment 與正式 Echo 數據混在同一窗口。
 
@@ -16,13 +16,11 @@ Gate／Game／load Prometheus metrics 足以分析 latency、RPS、error 與 sat
 
 ### 2.1 Direct reply 現況
 
-目前 `gatelink.RequestSource` 只有 `GateID` 與 `ConnectionID`，沒有 endpoint address；
-`DirectRequestPlayerSender.SendToRequestPlayer` 會用 `GateID` 呼叫 `GateResolver.Resolve`，因此 Game 在每筆
-Echo reply 都會執行 Redis route lookup。現況並非已經攜帶 endpoint，必須先補上 request metadata contract，
-才能安全地移除 lookup。
-
-這項修改只適用於「回覆目前這筆 Gate request」的 `RequestPlayerSender`。`PlayerSender` 仍需依玩家目前所在
-Gate 查 presence 與 directory；broadcast 行為也不變，不能一併移除它們的 Redis dependency。
+原本 direct request-player reply 會由 Game 另發一筆 Game → Gate unary RPC，並依 request route 尋址；這對
+「回覆目前這筆 Gate request」不是必要的 network hop。現在 `gatelink.Forward` 回傳可選的
+`ForwardResponse`，Game handler 以 request-scoped single reply slot 提供最多一筆 reply，Gate 收到後直接
+enqueue 發起該 request 的 session。`PlayerSender` 仍依玩家目前所在 Gate 查 presence/directory，broadcast
+行為與 Redis dependency 不變。
 
 ### 2.2 Load client 現況
 
@@ -34,106 +32,50 @@ listen backlog 是尚未完成 accept 的排隊上限，不是可維持 WebSocke
 可能延遲、重傳或 timeout；因此 load client 應限制 setup concurrency，而不是調高 framework runtime 的
 連線上限或把 backlog 當成服務容量。
 
-## 3. 修改一：request-scoped direct reply route
+## 3. 修改一：request-scoped unary reply
 
-### 3.1 `pkg/gatelink/metadata.go`
+### 3.1 `pkg/gatelink`
 
-在既有 `RequestSource` 增加用途明確的欄位：
+`gatelink.proto` 將 `Forward` response 改為 `ForwardResponse`，其中最多有一個 optional `ForwardReply`；
+generated files 必須由既有 `protoc` toolchain 同步產生。`gatelink.Server` 在 handler context 建立
+single reply slot，handler 成功結束後才把 reply 放入 unary response；`gatelink.Client.Forward` 明確回傳
+`(*gatelink.Reply, error)`，no-reply 為 `nil, nil`。
 
-```go
-type RequestSource struct {
-	GateID        string
-	ConnectionID  string
-	ReplyEndpoint string
-}
-```
+slot 以 mutex 保護，第一次設定成功，duplicate、handler 結束後設定、invalid command 或 payload error 都
+不能交付第二筆 reply。handler error／panic 時丟棄 slot。這條新路徑不需要新增 metadata、endpoint 或自訂
+codec。
 
-新增固定 metadata key `x-gate-request-reply-endpoint`，並在既有 outgoing／incoming interceptors 中傳遞。
-沿用 `singleMetadataValue` 的規則：禁止 duplicate value，讀取後 `TrimSpace`。不要新增另一套 context type、
-protobuf message 或自訂 codec。
+### 3.2 `pkg/serversend` 與 Game composition
 
-`gatelink.Client.Forward` 本身只要求 `ConnectionID` 的既有行為不變，因為非 server-send 使用情境仍可能沒有
-reply endpoint。`GateID` 與 `ReplyEndpoint` 的完整性由真正使用它們的 `RequestPlayerSender` 驗證。
+`RequestPlayerSender` interface 不變；`DirectRequestPlayerSender` 只保存 payload bound。`SendToRequestPlayer`
+先驗證 message，再呼叫 `gatelink.SetForwardReply`，將 missing slot、duplicate 與 payload errors 映射為既有
+或新增的 typed server-send errors，成功回傳既有 receipt。它不依賴 `GRPCTransport`、GateResolver、Redis
+或任何 network I/O。
 
-必要測試：
+`newGameRequestPlayerSender` 只以 `serversend.Config.MaxPayloadBytes` 建立此 sender；`PlayerSender`、
+`BroadcastSender` 與它們使用的 Redis directory/reverse transport 維持不變。
 
-- metadata round trip 可保留 `GateID`、`ConnectionID` 與 `ReplyEndpoint`；
-- duplicate reply endpoint 會得到 `InvalidArgument`；
-- 未攜帶 reply endpoint 的一般 Gate request 仍能進入 Game handler，避免不必要地擴大 gatelink contract。
+### 3.3 Gate enqueue 與 metrics
 
-### 3.2 `products/gateproduct/server_send_runtime.go`
+Gate 在 `Forward` 成功收到 optional reply 後，使用仍持有的原始 WebSocket session；非空
+`ExpectedLoginName` 先以 `SessionRegistry.State` 驗證，再沿用 `outboundSourceServerSend`、既有 queue、writer
+與 server-send metrics enqueue。Gate 不依 reply 內容重新 routing，也不為 request-player reply 發起 reverse RPC。
 
-`gateServerSendRuntime.Start` 已在 listener 啟動後得到經 `ResolveAdvertiseEndpoint` 正規化的
-`advertiseAddress`。將 `{GateID, ReplyEndpoint}` 保存成 runtime route，且只在 registrar 成功啟動後發布；
-`Stop` 時清空。route 的讀寫沿用既有 mutex，不增加新 lifecycle component。
+request-player 的 Game server-send counter 記錄 slot acceptance result；Gate server-send request/delivery metrics
+則從收到 `ForwardResponse` 開始。既有 Player/Broadcast reverse receiver 的 metrics 語意不變。
 
-將 package-private `Route() string` 改成回傳 `gatelink.RequestSource`（或等價的 package-private value method）。
-回傳值只含 Gate 產生的 `GateID` 與 `ReplyEndpoint`，`ConnectionID` 仍由 WebSocket session 補入。不要從
-WebSocket payload、header 或 login request 接受 endpoint。
-
-### 3.3 `products/gateproduct/websocket.go`
-
-建立 forwarded request context 時：
-
-1. 從已啟動的 `gateServerSendRuntime` 取得 `{GateID, ReplyEndpoint}`；
-2. 寫入目前 session 的 `ConnectionID`；
-3. 沿用既有 `WithWebSocketRequestContext` 與 gRPC metadata propagation。
-
-不改 command dispatch、Login／EnterRoom state policy、metrics labels 或 WebSocket framing。
-
-### 3.4 `pkg/serversend/sender.go`
-
-把 `DirectRequestPlayerSender` 縮減為只依賴 `*GRPCTransport`：
-
-```go
-type DirectRequestPlayerSender struct {
-	transport *GRPCTransport
-}
-
-func NewDirectRequestPlayerSender(transport *GRPCTransport) (*DirectRequestPlayerSender, error)
-```
-
-`SendToRequestPlayer` 的必要流程固定為：
-
-1. 驗證 message 與 payload size；
-2. 取得 `gatelink.GateRequestContext`；
-3. 要求 `GateID`、`ConnectionID`、`ReplyEndpoint` 都非空；
-4. 組成 `GateEndpoint{GateID: ..., Address: ...}`；
-5. 呼叫既有 `GRPCTransport.SendToConnection`。該方法會沿用 `GateEndpoint.validated()` 檢查 `host:port`，
-   不要複製 endpoint validation；
-6. 回傳既有 receipt/error。
-
-移除 `directory.Resolve` 及 resolved GateID comparison；endpoint 與 GateID 已屬於同一份 request-scoped
-route。`GateResolver` interface 仍由 `RoutedPlayerSender` 使用，不可刪除。
-
-此路徑會信任 Gate-to-Game internal transport 所攜帶的 reply endpoint。這與目前未提供 transport
-authentication 的部署假設一致，但 endpoint 至少必須是 Gate runtime 產生且通過格式驗證的值。mTLS、signed
-metadata 或 endpoint allowlist 屬於另一項安全需求，本次不加入。
-
-### 3.5 `products/gameproduct/server_send.go`
-
-`newGameRequestPlayerSender` 移除 `*RedisGateDirectory` 參數，只以 transport 建立 direct sender，再套用既有
-`measuredRequestPlayerSender`。metrics 名稱與量測邊界不變。
-
-Game 仍註冊 Redis directory provider，因 `PlayerSender` 需要它；DI 的 lazy resolution 會確保只使用
-`RequestPlayerSender` 的 Echo workflow 不會為 direct reply 解析 Redis endpoint。
-
-### 3.6 必要 contract tests
+### 3.4 必要 contract tests
 
 只調整受 contract 變更影響的測試：
 
-- `pkg/gatelink/gatelink_contract_test.go`：補 reply endpoint propagation、duplicate rejection。
-- `pkg/serversend/sender_contract_test.go`：直接以 request context 的 endpoint 送達；缺少／格式錯誤的 endpoint
-  必須在 delivery 前失敗。移除「unknown Gate 必須由 directory 拒絕」案例，因它已不符合新 contract。
-- `products/gateproduct/server_send_lifecycle_contract_test.go`：驗證 runtime route 同時包含 GateID 與實際
-  advertise endpoint，Stop 後 route 為空。
-- 既有 dual-Gate/full-flow contracts：改由各 request 的 reply endpoint 證明 response 回到來源 Gate，不能
-  fallback 或 broadcast 到另一個 Gate。
-- `products/gameproduct/metrics_contract_test.go`：既有 request-player success/error metrics assertions 保留；
-  只有 constructor/dependency setup 因新 signature 而調整。
+- `pkg/gatelink/gatelink_contract_test.go`：no-reply、payload copy、single/duplicate/concurrent slot、handler
+  error／after-handler rejection 與 malformed response。
+- `pkg/serversend/sender_contract_test.go`：active slot 寫入、missing slot、duplicate、invalid message 與
+  payload bound；證明不需要 transport 或 Redis。
+- Gate/Game full-flow contract：不啟動 Gate reverse listener，Echo 仍回到原始 connection；no-reply、identity、
+  queue 與 handler error 行為沿用既有 policy。
 
-不要新增 Redis command-level metric。移除 resolver constructor dependency 已能在型別層級保證 direct sender
-不執行 Redis lookup；為此再做一套 Redis command spy 沒有額外 contract 價值。
+不要新增 Redis command-level metric；移除 reverse dependency 已能在型別層級保證 direct sender 不執行 lookup。
 
 ## 4. 修改二：load client 分階段執行
 
@@ -253,7 +195,7 @@ Prometheus metric 表達，不需要為 log 再維護一份重複 counter。不�
 
 實作時同步更新既有文件，但不另寫重複教學：
 
-- `ACTIONABLE_METRICS_DESIGN.md`：修正 request route 不再查 Redis，並把 load workflow 改為四階段；
+- `ACTIONABLE_METRICS_DESIGN.md`：修正 request-player 改走 unary reply slot，並把 load workflow 改為四階段；
 - `ACTIONABLE_METRICS_EXAMPLE_VALIDATION.md`：加入 warm-up delta 扣除方式、measurement window，以及固定測試矩陣；
 - `examples/metrics/README.md`：補四個 flags、admission/drain 終止條件與 phase summary 語意。
 
@@ -292,8 +234,8 @@ Prometheus 維持既有 scrape 設定，不需要每次壓測後才抓 metrics�
 ## 7. Self review
 
 上述兩組變更都直接對應已觀察到的問題：每筆 direct reply 的非必要 Redis lookup，以及大量 connections 下
-setup 與 measured load 混合。request metadata、sender dependency 與受影響 contract tests 是移除 lookup 的
-最小閉環；setup barrier、bounded concurrency、單次 warm-up 與獨立 measured context 是取得可比較壓測結果的
+setup 與 measured load 混合。unary response contract、single reply slot、sender dependency 與受影響 contract
+tests 是移除 lookup 的最小閉環；setup barrier、bounded concurrency、單次 warm-up 與獨立 measured context 是取得可比較壓測結果的
 最小閉環。
 
 沒有要求新增 metrics，因現有 client round trip、Gate/Game stage、queue/in-flight、Redis/DB pool 與 Go/process

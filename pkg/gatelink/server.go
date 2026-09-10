@@ -13,7 +13,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 // ServerConfig configures the Game-side Gate request listener.
@@ -77,8 +76,8 @@ func isNilRequestHandler(handler RequestHandler) bool {
 }
 
 // Forward delivers the opaque binary payload and the single request metadata
-// carrier to the registered Game handler.
-func (s *Server) Forward(ctx context.Context, request *GateRequest) (*emptypb.Empty, error) {
+// carrier to the registered Game handler, then returns its optional reply.
+func (s *Server) Forward(ctx context.Context, request *GateRequest) (*ForwardResponse, error) {
 	if request == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is required")
 	}
@@ -91,23 +90,36 @@ func (s *Server) Forward(ctx context.Context, request *GateRequest) (*emptypb.Em
 	if s == nil || isNilRequestHandler(s.handler) {
 		return nil, status.Error(codes.Unimplemented, "gate request handler is not configured")
 	}
+	replySlot := newForwardReplySlot()
+	defer replySlot.close()
+	ctx = withForwardReplySlot(ctx, replySlot)
 	handlerRequest := Request{
 		CommandID: request.GetCommandId(),
 		Payload:   append([]byte(nil), request.GetPayload()...),
 	}
-	if err := s.handler.HandleGateRequest(ctx, handlerRequest); err != nil {
-		if status.Code(err) != codes.Unknown {
-			return nil, err
+	handlerErr := s.handler.HandleGateRequest(ctx, handlerRequest)
+	reply := replySlot.finish(handlerErr == nil)
+	if handlerErr != nil {
+		if status.Code(handlerErr) != codes.Unknown {
+			return nil, handlerErr
 		}
-		if errors.Is(err, context.Canceled) {
-			return nil, status.Error(codes.Canceled, err.Error())
+		if errors.Is(handlerErr, context.Canceled) {
+			return nil, status.Error(codes.Canceled, handlerErr.Error())
 		}
-		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, status.Error(codes.DeadlineExceeded, err.Error())
+		if errors.Is(handlerErr, context.DeadlineExceeded) {
+			return nil, status.Error(codes.DeadlineExceeded, handlerErr.Error())
 		}
 		return nil, status.Error(codes.Internal, "gate request handler failed")
 	}
-	return &emptypb.Empty{}, nil
+	response := &ForwardResponse{}
+	if reply != nil {
+		response.Reply = &ForwardReply{
+			CommandId:         reply.CommandID,
+			Payload:           reply.Payload,
+			ExpectedLoginName: reply.ExpectedLoginName,
+		}
+	}
+	return response, nil
 }
 
 // Start binds the listener synchronously, so readiness is never reached when

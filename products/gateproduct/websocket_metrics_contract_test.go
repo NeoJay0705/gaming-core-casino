@@ -20,9 +20,15 @@ func TestWebSocketQueueMetricsContract(t *testing.T) {
 	if err := connection.SendBinary([]byte("first")); err != nil {
 		t.Fatalf("first SendBinary() error = %v", err)
 	}
-	if err := connection.SendBinary([]byte("second")); !errors.Is(err, errWebSocketWriteQueueFull) {
-		t.Fatalf("second SendBinary() error = %v, want queue-full", err)
+	if err := connection.sendOutbound(outboundMessage{
+		data:       []byte("second"),
+		source:     outboundSourceServerSend,
+		receivedAt: time.Now(),
+		target:     serverSendTargetConnection,
+	}); !errors.Is(err, errWebSocketWriteQueueFull) {
+		t.Fatalf("second sendOutbound() error = %v, want queue-full", err)
 	}
+	_ = connection.closeWithReason(closeReasonForwardError)
 	if got := connection.currentCloseReason(); got != closeReasonWriteQueueFull {
 		t.Fatalf("close reason = %q, want %q", got, closeReasonWriteQueueFull)
 	}
@@ -36,7 +42,7 @@ func TestWebSocketQueueMetricsContract(t *testing.T) {
 	if got := gaugeValue(t, metrics.websocketConnections); got != 0 {
 		t.Fatalf("websocket connections = %v, want 0 after finish", got)
 	}
-	if got := gatheredCounterValue(t, registry, "gaming_core_gate_websocket_write_queue_full_total", map[string]string{"source": "handler"}); got != 1 {
+	if got := gatheredCounterValue(t, registry, "gaming_core_gate_websocket_write_queue_full_total", map[string]string{"source": "server_send"}); got != 1 {
 		t.Fatalf("queue full counter = %v, want 1", got)
 	}
 	if got := gatheredCounterValue(t, registry, "gaming_core_gate_websocket_connection_closes_total", map[string]string{"reason": closeReasonWriteQueueFull}); got != 1 {

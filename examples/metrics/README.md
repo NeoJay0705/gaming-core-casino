@@ -1,8 +1,8 @@
 # Actionable metrics example
 
 這組範本讓 Gate 與 Game 走一個可實際壓測的 example workflow：Login → EnterRoom → Echo。
-Echo 由 Gate forward 至 Game，Game 透過 direct request-player server-send 回到原始 Gate，
-再由 Gate 的 WebSocket writer 完成 binary write。API/GMS 只啟動 lifecycle 與共用的
+Echo 由 Gate forward 至 Game，Game 將 reply 寫入原始 `Forward` unary response，Gate 收到後
+enqueue 原始 session，再由 Gate 的 WebSocket writer 完成 binary write。API/GMS 只啟動 lifecycle 與共用的
 `/health`、`/ready`、`/metrics` listener，不虛構業務流量。
 
 先啟動 Redis（預設 `127.0.0.1:6379`），再在 repository root 執行：

@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 )
 
@@ -49,19 +48,6 @@ func TestGameServerSendContractDeliversAcrossTwoGates(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = transport.Stop(context.Background()) })
-
-	direct, err := serversend.NewDirectRequestPlayerSender(transport)
-	if err != nil {
-		t.Fatal(err)
-	}
-	requestContext := gatelink.WithGateRequestContext(context.Background(), gatelink.GateRequestContext{
-		Source: gatelink.RequestSource{GateID: "gate-a", ConnectionID: "gate-a-alice", ReplyEndpoint: gateAEndpoint.Address},
-	})
-	if _, err := direct.SendToRequestPlayer(requestContext, serversend.RequestPlayerMessage{Message: serversend.Message{CommandID: 101, Payload: []byte("direct")}}); err != nil {
-		t.Fatalf("direct request reply: %v", err)
-	}
-	assertServerSendPacket(t, alice, 101, "direct")
-	assertNoServerSendPacket(t, bob, 101)
 
 	routed, err := serversend.NewRoutedPlayerSender(dualGatePresenceResolver{presence: serversend.Presence{LoginName: "bob", GateID: "gate-b", ConnectionID: "gate-b-bob", Epoch: 1}}, directory, transport, nil)
 	if err != nil {

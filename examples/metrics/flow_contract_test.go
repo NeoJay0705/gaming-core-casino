@@ -195,7 +195,6 @@ server_send:
 		"result":    "success",
 	}, 1)
 	assertGaugeZero(t, gameRegisterer, "gaming_core_game_gate_commands_in_flight")
-	assertGaugeZero(t, gameRegisterer, "gaming_core_game_server_send_in_flight")
 }
 
 func captureGameServer(address chan<- string) framework.Module {

@@ -21,7 +21,6 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/products/gameproduct"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gorilla/websocket"
-	"github.com/redis/go-redis/v9"
 )
 
 const gateToGameTestYAML = "gate_to_game:\n  target: dns:///gameproduct:9090\n"
@@ -215,33 +214,11 @@ func TestGateWebSocketContractForwardsUnhandledCommandToGame(t *testing.T) {
 	}
 }
 
-func TestGateWebSocketContractDirectGameReplyReturnsToOriginalConnection(t *testing.T) {
+func TestGateWebSocketContractUnaryGameReplyReturnsToOriginalConnection(t *testing.T) {
 	miniRedis := miniredis.RunT(t)
-	deliveryListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	deliveryAddress := deliveryListener.Addr().String()
-	if err := deliveryListener.Close(); err != nil {
-		t.Fatal(err)
-	}
-	redisClient := redis.NewClient(&redis.Options{Addr: miniRedis.Addr()})
-	t.Cleanup(func() { _ = redisClient.Close() })
-	keys, err := serversend.NewKeyspace("core-casino")
-	if err != nil {
-		t.Fatal(err)
-	}
-	registrar, err := serversend.NewEndpointRegistrar(redisClient, keys, serversend.GateEndpoint{GateID: "gate-direct-reply", Address: deliveryAddress}, serversend.EndpointRegistrarConfig{TTL: time.Minute})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := registrar.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = registrar.Stop(context.Background()) })
 
 	gameConfig := filepath.Join(t.TempDir(), "game.yaml")
-	gameYAML := observabilityTestYAML + "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\ngate_to_game:\n  listen_addr: 127.0.0.1:0\nserver_send:\n  presence:\n    lease_ttl: 30s\n  gate:\n    listen_addr: 127.0.0.1:0\n    endpoint_ttl: 30s\n  broadcast:\n    primary: redis\n"
+	gameYAML := observabilityTestYAML + "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\ngate_to_game:\n  listen_addr: 127.0.0.1:0\nserver_send:\n  max_payload_bytes: 1024\n  broadcast:\n    primary: redis\n"
 	if err := os.WriteFile(gameConfig, []byte(gameYAML), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +229,10 @@ func TestGateWebSocketContractDirectGameReplyReturnsToOriginalConnection(t *test
 		Channel:   gameproduct.GateRequestChannel,
 		CommandID: 99,
 		Handler: func(ctx context.Context, _ []byte) error {
-			_, err := requestSender.SendToRequestPlayer(ctx, serversend.RequestPlayerMessage{Message: serversend.Message{CommandID: 0xE20010, Payload: []byte("reply")}})
+			_, err := requestSender.SendToRequestPlayer(ctx, serversend.RequestPlayerMessage{
+				ExpectedLoginName: "alice",
+				Message:           serversend.Message{CommandID: 0xE20010, Payload: []byte("reply")},
+			})
 			return err
 		},
 	}), func(r framework.Registry) error {
@@ -316,25 +296,6 @@ func TestGateWebSocketContractDirectGameReplyReturnsToOriginalConnection(t *test
 		}); err != nil {
 			return err
 		}
-		if err := r.Provide(func(sessions *SessionRegistry) (*serversend.ReceiverServer, error) {
-			receiver, err := newGateServerSendReceiver(sessions)
-			if err != nil {
-				return nil, err
-			}
-			return serversend.NewReceiverServer(serversend.ReceiverConfig{ListenAddr: deliveryAddress}, receiver)
-		}); err != nil {
-			return err
-		}
-		if err := r.Provide(func() *gateServerSendRuntime {
-			return &gateServerSendRuntime{gateID: "gate-direct-reply", replyEndpoint: deliveryAddress, started: true}
-		}); err != nil {
-			return err
-		}
-		if err := r.AddHook(func(receiver *serversend.ReceiverServer) framework.Hook {
-			return framework.Hook{Name: "direct-reply-gate-receiver", Phase: framework.PhaseInfrastructure, OnStart: receiver.Start, OnStop: receiver.Stop}
-		}); err != nil {
-			return err
-		}
 		return r.AddHook(func(server *WebSocketServer) framework.Hook {
 			gateServer = server
 			return framework.Hook{Name: "capture-direct-reply-gate-websocket", Phase: framework.PhaseIngress, OnStart: func(context.Context) error { return nil }}
@@ -351,23 +312,43 @@ func TestGateWebSocketContractDirectGameReplyReturnsToOriginalConnection(t *test
 		t.Fatal("Gate WebSocket server did not start")
 	}
 
-	conn, _, err := websocket.DefaultDialer.Dial("ws://"+gateServer.Addr()+"/ws", nil)
-	if err != nil {
-		t.Fatal(err)
+	registerConnection := func(loginName string) *websocket.Conn {
+		conn, _, err := websocket.DefaultDialer.Dial("ws://"+gateServer.Addr()+"/ws", nil)
+		if err != nil {
+			t.Fatalf("dial %s: %v", loginName, err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+		if err := conn.WriteMessage(websocket.BinaryMessage, testWebSocketPacket(100, []byte(loginName))); err != nil {
+			t.Fatalf("register WebSocket session %s: %v", loginName, err)
+		}
+		select {
+		case <-registered:
+		case <-time.After(time.Second):
+			t.Fatalf("Gate did not register WebSocket session %s", loginName)
+		}
+		return conn
 	}
-	defer conn.Close()
-	if err := conn.WriteMessage(websocket.BinaryMessage, testWebSocketPacket(100, []byte("alice"))); err != nil {
-		t.Fatalf("register WebSocket session: %v", err)
-	}
-	select {
-	case <-registered:
-	case <-time.After(time.Second):
-		t.Fatal("Gate did not register WebSocket session")
-	}
-	if err := conn.WriteMessage(websocket.BinaryMessage, testWebSocketPacket(99, []byte("request"))); err != nil {
+	alice := registerConnection("alice")
+	bob := registerConnection("bob")
+	if err := alice.WriteMessage(websocket.BinaryMessage, testWebSocketPacket(99, []byte("request"))); err != nil {
 		t.Fatalf("forward request: %v", err)
 	}
-	assertWebSocketPacket(t, conn, testWebSocketPacket(0xE20010, []byte("reply")))
+	assertWebSocketPacket(t, alice, testWebSocketPacket(0xE20010, []byte("reply")))
+	_ = bob.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	if _, _, err := bob.ReadMessage(); err == nil {
+		t.Fatal("unrelated WebSocket connection received unary reply")
+	} else {
+		var networkErr net.Error
+		if !errors.As(err, &networkErr) || !networkErr.Timeout() {
+			t.Fatalf("unrelated WebSocket connection read error = %v, want timeout without a reply", err)
+		}
+	}
+
+	carol := registerConnection("carol")
+	if err := carol.WriteMessage(websocket.BinaryMessage, testWebSocketPacket(99, []byte("request"))); err != nil {
+		t.Fatalf("forward identity-mismatch request: %v", err)
+	}
+	assertWebSocketClosed(t, carol)
 }
 
 func TestGateWebSocketContractBroadcastsAndKicksRegisteredSessions(t *testing.T) {

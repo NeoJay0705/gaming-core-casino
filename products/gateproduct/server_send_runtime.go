@@ -141,9 +141,10 @@ func (r *gateServerSendRuntime) Stop(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// Route returns the current Gate identity and direct reply endpoint injected
-// into every Gate-to-Game request. Both values come from the managed
-// server-send listener and are unavailable before it starts or after it stops.
+// Route returns the current Gate identity and legacy reverse server-send
+// endpoint injected into Gate-to-Game metadata. Both values come from the
+// managed server-send listener and are unavailable before it starts or after
+// it stops. The request-player unary reply path does not use this route.
 func (r *gateServerSendRuntime) Route() gatelink.RequestSource {
 	if r == nil {
 		return gatelink.RequestSource{}

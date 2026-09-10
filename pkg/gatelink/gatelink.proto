@@ -2,8 +2,6 @@ syntax = "proto3";
 
 package gatelink.v1;
 
-import "google/protobuf/empty.proto";
-
 option go_package = "github.com/NeoJay0705/gaming-core-casino/pkg/gatelink";
 
 // GateRequest keeps the player packet opaque. The Game product owns decoding
@@ -13,7 +11,19 @@ message GateRequest {
   bytes payload = 2;
 }
 
+message ForwardReply {
+  uint32 command_id = 1;
+  bytes payload = 2;
+  // 非空時，Gate 必須確認原 connection 仍是此登入身分。
+  string expected_login_name = 3;
+}
+
+message ForwardResponse {
+  // 未設定表示 handler 沒有立即回覆；每筆 request 最多一筆。
+  ForwardReply reply = 1;
+}
+
 // GateRequestService is the direct Gate-to-Game ingress contract.
 service GateRequestService {
-  rpc Forward(GateRequest) returns (google.protobuf.Empty);
+  rpc Forward(GateRequest) returns (ForwardResponse);
 }

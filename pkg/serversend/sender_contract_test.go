@@ -11,66 +11,67 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 )
 
-func TestDirectRequestPlayerSenderContractUsesOnlyRequestRoute(t *testing.T) {
-	receiver, endpoint := newTestReceiverEndpoint(t, "gate-a", DeliveryStatus_DELIVERY_STATUS_DELIVERED)
-	transport, err := NewGRPCTransport(TransportConfig{RequestTimeout: time.Second})
+func TestDirectRequestPlayerSenderContractUsesForwardReplySlot(t *testing.T) {
+	sender, err := NewDirectRequestPlayerSender(0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = transport.Stop(context.Background()) })
-	sender, err := NewDirectRequestPlayerSender(transport)
+	payload := []byte("reply")
+	var secondErr error
+	server, err := gatelink.NewServer(gatelink.ServerConfig{ListenAddr: "127.0.0.1:0"}, gatelink.RequestHandlerFunc(func(ctx context.Context, _ gatelink.Request) error {
+		if _, err := sender.SendToRequestPlayer(ctx, RequestPlayerMessage{ExpectedLoginName: "alice", Message: Message{CommandID: 1, Payload: payload}}); err != nil {
+			return err
+		}
+		secondErr = func() error {
+			_, err := sender.SendToRequestPlayer(ctx, RequestPlayerMessage{Message: Message{CommandID: 2}})
+			return err
+		}()
+		return nil
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := gatelink.WithGateRequestContext(context.Background(), gatelink.GateRequestContext{TraceID: "trace-request-1", Source: gatelink.RequestSource{GateID: string(endpoint.GateID), ConnectionID: "connection-1", ReplyEndpoint: endpoint.Address}})
-	if _, err := sender.SendToRequestPlayer(ctx, RequestPlayerMessage{ExpectedLoginName: "alice", Message: Message{CommandID: 1, Payload: []byte("reply")}}); err != nil {
-		t.Fatalf("send direct response: %v", err)
+	response, err := server.Forward(context.Background(), &gatelink.GateRequest{CommandId: 99})
+	if err != nil {
+		t.Fatalf("forward: %v", err)
 	}
-	receiver.mu.Lock()
-	gotConnection, gotLogin := receiver.connectionID, receiver.expectedLoginName
-	receiver.mu.Unlock()
-	if gotConnection != "connection-1" || gotLogin != "alice" {
-		t.Fatalf("direct target = connection:%q login:%q, want connection-1/alice", gotConnection, gotLogin)
+	payload[0] = 'X'
+	if !errors.Is(secondErr, ErrRequestReplyAlreadySet) {
+		t.Fatalf("second reply error = %v, want ErrRequestReplyAlreadySet", secondErr)
 	}
-	receiver.mu.Lock()
-	gotTraceID := receiver.traceID
-	receiver.mu.Unlock()
-	if gotTraceID != "trace-request-1" {
-		t.Fatalf("direct trace id = %q, want trace-request-1", gotTraceID)
-	}
-	if _, err := sender.SendToRequestPlayer(context.Background(), RequestPlayerMessage{Message: Message{CommandID: 1}}); !errors.Is(err, ErrRequestRouteUnavailable) {
-		t.Fatalf("missing route error = %v, want ErrRequestRouteUnavailable", err)
-	}
-	invalidCtx := gatelink.WithGateRequestContext(context.Background(), gatelink.GateRequestContext{Source: gatelink.RequestSource{ConnectionID: "connection-1"}})
-	if _, err := sender.SendToRequestPlayer(invalidCtx, RequestPlayerMessage{Message: Message{CommandID: 1}}); !errors.Is(err, ErrRequestRouteInvalid) {
-		t.Fatalf("invalid route error = %v, want ErrRequestRouteInvalid", err)
+	if response.GetReply().GetCommandId() != 1 || string(response.GetReply().GetPayload()) != "reply" || response.GetReply().GetExpectedLoginName() != "alice" {
+		t.Fatalf("forward reply = %#v, want first message", response.GetReply())
 	}
 }
 
-func TestDirectRequestPlayerSenderContractRejectsMissingOrMalformedReplyEndpoint(t *testing.T) {
-	transport, err := NewGRPCTransport(TransportConfig{RequestTimeout: time.Second})
+func TestDirectRequestPlayerSenderContractRequiresActiveReplyAndPayloadBound(t *testing.T) {
+	sender, err := NewDirectRequestPlayerSender(3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = transport.Stop(context.Background()) })
-	sender, err := NewDirectRequestPlayerSender(transport)
+	if _, err := sender.SendToRequestPlayer(context.Background(), RequestPlayerMessage{Message: Message{CommandID: 0}}); !errors.Is(err, ErrMessageInvalid) {
+		t.Fatalf("invalid message error = %v, want ErrMessageInvalid", err)
+	}
+	if _, err := sender.SendToRequestPlayer(context.Background(), RequestPlayerMessage{Message: Message{CommandID: 1}}); !errors.Is(err, ErrRequestRouteUnavailable) {
+		t.Fatalf("missing reply slot error = %v, want ErrRequestRouteUnavailable", err)
+	}
+	if _, err := NewDirectRequestPlayerSender(-1); err == nil || !strings.Contains(err.Error(), "max payload") {
+		t.Fatalf("negative payload limit error = %v, want payload validation", err)
+	}
+	var senderErr error
+	server, err := gatelink.NewServer(gatelink.ServerConfig{ListenAddr: "127.0.0.1:0"}, gatelink.RequestHandlerFunc(func(ctx context.Context, _ gatelink.Request) error {
+		_, senderErr = sender.SendToRequestPlayer(ctx, RequestPlayerMessage{Message: Message{CommandID: 1, Payload: []byte("1234")}})
+		return nil
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, test := range []struct {
-		name   string
-		source gatelink.RequestSource
-		want   string
-	}{
-		{name: "missing endpoint", source: gatelink.RequestSource{GateID: "gate-a", ConnectionID: "connection-1"}, want: "reply endpoint is required"},
-		{name: "malformed endpoint", source: gatelink.RequestSource{GateID: "gate-a", ConnectionID: "connection-1", ReplyEndpoint: "not-an-endpoint"}, want: "gate address"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			ctx := gatelink.WithGateRequestContext(context.Background(), gatelink.GateRequestContext{Source: test.source})
-			if _, err := sender.SendToRequestPlayer(ctx, RequestPlayerMessage{Message: Message{CommandID: 1}}); err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("reply route error = %v, want %q", err, test.want)
-			}
-		})
+	response, err := server.Forward(context.Background(), &gatelink.GateRequest{CommandId: 99})
+	if err != nil || response.GetReply() != nil {
+		t.Fatalf("oversized reply forward = response:%#v error:%v, want no reply/nil", response, err)
+	}
+	if !errors.Is(senderErr, ErrPayloadTooLarge) {
+		t.Fatalf("oversized reply sender error = %v, want ErrPayloadTooLarge", senderErr)
 	}
 }
 

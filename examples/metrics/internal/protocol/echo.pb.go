@@ -66,7 +66,7 @@ func (x *EchoRequest) GetPayload() []byte {
 	return nil
 }
 
-// EchoResponse 透過既有 Game-to-Gate server-send path 回傳。
+// EchoResponse 由 Game 放入 Gate-to-Game unary response，再回到原始 connection。
 type EchoResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Payload       []byte                 `protobuf:"bytes,1,opt,name=payload,proto3" json:"payload,omitempty"`

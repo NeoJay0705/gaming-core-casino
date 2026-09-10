@@ -12,12 +12,15 @@ var (
 	ErrMessageInvalid = errors.New("server send: message is invalid")
 	// ErrDestinationInvalid indicates an incomplete or malformed destination.
 	ErrDestinationInvalid = errors.New("server send: destination is invalid")
-	// ErrRequestRouteUnavailable indicates that an inbound Gate request did not
-	// carry a route back to its source Gate connection.
+	// ErrRequestRouteUnavailable indicates that the inbound Gate request has no
+	// active unary reply slot.
 	ErrRequestRouteUnavailable = errors.New("server send: request route is unavailable")
-	// ErrRequestRouteInvalid indicates a request route that cannot be used for
-	// direct delivery.
+	// ErrRequestRouteInvalid is retained for compatibility with callers that
+	// classify the former direct-route error.
 	ErrRequestRouteInvalid = errors.New("server send: request route is invalid")
+	// ErrRequestReplyAlreadySet indicates that the current Gate request already
+	// accepted its one request-player reply.
+	ErrRequestReplyAlreadySet = errors.New("server send: request reply is already set")
 	// ErrPresenceNotFound indicates that no current Gate owner exists for a
 	// login name.
 	ErrPresenceNotFound = errors.New("server send: player presence is not found")
@@ -125,7 +128,8 @@ type RequestPlayerMessage struct {
 	Message
 }
 
-// Validate checks the client message. The route itself is validated from ctx.
+// Validate checks the client message. RequestPlayerSender obtains its
+// destination from the active unary reply slot in ctx.
 func (m RequestPlayerMessage) Validate() error { return m.Message.Validate() }
 
 func (m RequestPlayerMessage) validatePayload(maxBytes int) error {
@@ -164,13 +168,16 @@ func (m BroadcastMessage) clone() BroadcastMessage {
 }
 
 // Receipt records that the sender accepted a message for its documented
-// delivery path. It does not mean a browser has received the WebSocket frame.
+// delivery path. For RequestPlayerSender, it means the message was accepted
+// into the current Gate-to-Game unary response; it does not mean Gate queued or
+// a browser received the WebSocket frame.
 type Receipt struct{ AcceptedAt time.Time }
 
 func newReceipt() Receipt { return Receipt{AcceptedAt: time.Now()} }
 
-// RequestPlayerSender sends to the Gate connection described by the current
-// request context. It must not use player presence or broadcast fan-out.
+// RequestPlayerSender accepts at most one reply for the current Gate request.
+// The framework returns that reply through the original Gate-to-Game unary
+// response; it must not use player presence, endpoint routing, or fan-out.
 type RequestPlayerSender interface {
 	SendToRequestPlayer(context.Context, RequestPlayerMessage) (Receipt, error)
 }

@@ -42,10 +42,10 @@ type Request struct {
 }
 
 // RequestSource identifies the Gate connection that originated Request.
-// GateID and ReplyEndpoint are optional for ordinary Gate-to-Game requests;
-// the direct request-player sender requires both to deliver a reply. The
-// endpoint is produced by Gate's server-send listener, never by the player
-// payload.
+// GateID and ReplyEndpoint are optional for ordinary Gate-to-Game requests and
+// for the unary request-player reply path. ReplyEndpoint is retained for the
+// legacy reverse server-send path and is produced by Gate's server-send
+// listener, never by the player payload.
 type RequestSource struct {
 	GateID        string
 	ConnectionID  string

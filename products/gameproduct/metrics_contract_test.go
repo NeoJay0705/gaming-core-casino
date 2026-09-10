@@ -137,15 +137,6 @@ func TestMeasuredRequestPlayerSenderContractRecordsSuccessAndError(t *testing.T)
 	if got := counterValue(t, registry, "gaming_core_game_server_send_requests_total", map[string]string{"operation": "request_player", "result": "error"}); got != 1 {
 		t.Fatalf("server-send error count = %v, want 1", got)
 	}
-	if got := counterValue(t, registry, "gaming_core_game_server_send_duration_seconds", map[string]string{"operation": "request_player", "result": "success"}); got != 1 {
-		t.Fatalf("server-send success duration count = %v, want 1", got)
-	}
-	if got := counterValue(t, registry, "gaming_core_game_server_send_duration_seconds", map[string]string{"operation": "request_player", "result": "error"}); got != 1 {
-		t.Fatalf("server-send error duration count = %v, want 1", got)
-	}
-	if got := counterValue(t, registry, "gaming_core_game_server_send_in_flight", map[string]string{"operation": "request_player"}); got != 0 {
-		t.Fatalf("server-send in-flight = %v, want 0", got)
-	}
 }
 
 type recordingRequestPlayerSender struct{ err error }
