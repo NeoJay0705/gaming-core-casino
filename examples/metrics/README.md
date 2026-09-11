@@ -27,6 +27,17 @@ Prometheus snapshots 對照。
 各服務的 `/metrics` endpoint 分別是 Game `http://127.0.0.1:19080/metrics`、Gate
 `http://127.0.0.1:18081/metrics`、API `http://127.0.0.1:20081/metrics`、GMS
 `http://127.0.0.1:21081/metrics`；同一 listener 也提供 `/health` 與 `/ready`。
+四個 framework product 的 production pprof 由 `observability.pprof_listen_addr` 控制；空白值為預設關閉，
+且只接受 loopback address。它會使用獨立 listener，不會出現在上述 `/metrics` listener：
+
+```sh
+CORE_CASINO_METRICS_GAME__OBSERVABILITY__PPROF_LISTEN_ADDR=127.0.0.1:19082 \
+  go run ./examples/metrics/game
+```
+
+operator 可透過相同 network namespace 的 SSH tunnel 或 `kubectl port-forward` 存取；不要將 pprof
+address 設為 wildcard，也不要把 pprof listener 加入 Prometheus scrape。下方 `-pprof-addr` 只保留給
+example/benchmark 的獨立 helper 使用；同一個 process 不要同時以 config 與 flag 綁定同一個 port。
 Load client 另外在 `http://127.0.0.1:22081/metrics` 暴露 example-local Echo round-trip Counter、
 Histogram、in-flight Gauge，以及 Go runtime/process collectors，可用 `-metrics-addr` 調整 listener。這個 endpoint 只觀測壓測端，
 不屬於 framework product；完整的 client／Gate／Game 比對方法見 repository root 的
@@ -91,8 +102,8 @@ CPU 比例接近 `1` 表示該 process 接近可用 `GOMAXPROCS`；若 CPU 未�
 `ClientConn` 可持續改善 RPS，才支持 single-transport contention 候選。CPU、latency knee 與
 pprof／trace 必須一起判讀，不能由單一 Gauge 宣稱飽和。
 
-需要 function-level evidence 時，在 Gate、Game 或 grpcload 另外開啟 loopback-only pprof listener；不帶
-`-pprof-addr` 時不會建立該 listener：
+需要 function-level evidence 時，framework product 使用上述 config；standalone example/benchmark
+才使用 `-pprof-addr`。不帶該設定時不會建立 listener：
 
 ```sh
 GOMAXPROCS=4 go run ./examples/metrics/game -pprof-addr 127.0.0.1:19082

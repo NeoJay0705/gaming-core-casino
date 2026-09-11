@@ -1,14 +1,14 @@
-// Package profilehttp 提供範例專用的 loopback pprof HTTP server。
+// Package profilehttp 提供 repository 內部共用的 loopback-only pprof HTTP server。
 //
-// 這個 package 不屬於 framework observability contract；呼叫端必須明確
-// 傳入 listen address 才會啟動，避免把 profiling endpoint 暴露給正式
-// product listener。
+// 呼叫端必須明確傳入 listen address；空白 address 會停用 server。此 package
+// 不知道 framework、readiness 或 Prometheus，讓上層自行決定 lifecycle 邊界。
 package profilehttp
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -17,9 +17,7 @@ import (
 	"time"
 )
 
-const (
-	readHeaderTimeout = 5 * time.Second
-)
+const readHeaderTimeout = 5 * time.Second
 
 // Server 擁有一個可選的 loopback-only pprof listener。
 type Server struct {
@@ -40,12 +38,16 @@ func Start(listenAddr string) (*Server, error) {
 	if listenAddr == "" {
 		return nil, nil
 	}
-	if err := validateLoopbackAddress(listenAddr); err != nil {
+	if err := ValidateLoopbackAddress(listenAddr); err != nil {
 		return nil, err
 	}
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("profilehttp: listen on %s: %w", listenAddr, err)
+	}
+	if !isLoopbackListener(listener) {
+		_ = listener.Close()
+		return nil, fmt.Errorf("profilehttp: listen address %q did not bind to loopback", listenAddr)
 	}
 
 	mux := http.NewServeMux()
@@ -65,12 +67,17 @@ func Start(listenAddr string) (*Server, error) {
 		if errors.Is(serveErr, http.ErrServerClosed) {
 			serveErr = nil
 		}
+		if serveErr != nil {
+			log.Printf("[profilehttp] pprof server stopped unexpectedly: %v", serveErr)
+		}
 		server.done <- serveErr
 	}()
 	return server, nil
 }
 
-func validateLoopbackAddress(listenAddr string) error {
+// ValidateLoopbackAddress 驗證 pprof listen address；不會建立 listener。
+func ValidateLoopbackAddress(listenAddr string) error {
+	listenAddr = strings.TrimSpace(listenAddr)
 	host, port, err := net.SplitHostPort(listenAddr)
 	if err != nil {
 		return fmt.Errorf("profilehttp: invalid listen address %q: %w", listenAddr, err)
@@ -86,6 +93,11 @@ func validateLoopbackAddress(listenAddr string) error {
 		return fmt.Errorf("profilehttp: listen address %q must be loopback", listenAddr)
 	}
 	return nil
+}
+
+func isLoopbackListener(listener net.Listener) bool {
+	address, ok := listener.Addr().(*net.TCPAddr)
+	return ok && address.IP != nil && address.IP.IsLoopback()
 }
 
 // Addr returns the bound address, or an empty string after shutdown/when the

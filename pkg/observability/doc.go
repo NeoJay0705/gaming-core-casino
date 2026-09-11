@@ -1,12 +1,15 @@
 // Package observability 提供 product 共用的 Health、Readiness 與 Prometheus
 // Metrics HTTP endpoint。HTTP server 固定提供 GET /health（回應 ok）、GET /ready
-// （readiness hook 完成前回應 503）與 GET /metrics。
+// （readiness hook 完成前回應 503）與 GET /metrics。Config 的
+// pprof_listen_addr 若為空則停用 profiling；有值時另開只允許 loopback 的
+// pprof listener，不會把 debug routes 加入 metrics listener。
 //
 // Module 會把 prometheus.Registerer 放入 framework DI。引用端可以在自己的
 // module 中以 constructor 注入該 Registerer，使用 Register 建立並註冊自訂
 // metrics；不應使用 global DefaultRegisterer 或會 panic 的 MustRegister。
 // Registry 另外包含標準 Go/process collectors；Database/Redis pool collectors
-// 只在對應 lazy resource 實際被使用時註冊。
+// 只在對應 lazy resource 實際被使用時註冊。Go runtime collector 另外啟用
+// go_sched_latencies_seconds，供判斷 goroutine runnable 後的 scheduler delay。
 //
 // 外部 product 可直接以一般 framework provider 定義 metrics holder：
 //

@@ -2,6 +2,7 @@ package observability
 
 import (
 	"fmt"
+	"regexp"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -17,7 +18,13 @@ func newRegistryOwner() (*registryOwner, error) {
 	registry := prometheus.NewRegistry()
 	// 使用 App-local registry，但仍提供壓測必要的 Go/process 基礎資訊。
 	for _, collector := range []prometheus.Collector{
-		collectors.NewGoCollector(),
+		collectors.NewGoCollector(
+			collectors.WithGoCollectorRuntimeMetrics(
+				collectors.GoRuntimeMetricsRule{
+					Matcher: regexp.MustCompile(`^/sched/latencies:seconds$`),
+				},
+			),
+		),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	} {
 		if err := registry.Register(collector); err != nil {

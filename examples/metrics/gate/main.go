@@ -10,8 +10,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/NeoJay0705/gaming-core-casino/examples/metrics/internal/profilehttp"
 	"github.com/NeoJay0705/gaming-core-casino/examples/metrics/internal/workflow"
+	"github.com/NeoJay0705/gaming-core-casino/internal/profilehttp"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
 	"github.com/NeoJay0705/gaming-core-casino/products/gateproduct"
 )

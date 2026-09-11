@@ -31,6 +31,7 @@ func TestConfigContractValidatesListenAddress(t *testing.T) {
 		{name: "missing address", body: "observability: {}\n", want: "listen_addr is required"},
 		{name: "invalid address", body: "observability:\n  listen_addr: 127.0.0.1\n", want: "invalid listen_addr"},
 		{name: "missing port", body: "observability:\n  listen_addr: '127.0.0.1:'\n", want: "invalid listen_addr"},
+		{name: "invalid pprof address", body: "observability:\n  listen_addr: 127.0.0.1:0\n  pprof_listen_addr: 0.0.0.0:6060\n", want: "invalid pprof_listen_addr"},
 		{name: "unknown field", body: "observability:\n  listen_addr: 127.0.0.1:0\n  port: 8081\n", want: "unknown config paths"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -41,12 +42,23 @@ func TestConfigContractValidatesListenAddress(t *testing.T) {
 		})
 	}
 
-	cfg, err := newConfig(loadSnapshot(t, "observability:\n  listen_addr: ' 127.0.0.1:0 '\n"))
+	cfg, err := newConfig(loadSnapshot(t, "observability:\n  listen_addr: ' 127.0.0.1:0 '\n  pprof_listen_addr: ' 127.0.0.1:6060 '\n"))
 	if err != nil {
 		t.Fatalf("newConfig(valid) error = %v", err)
 	}
 	if cfg.ListenAddr != "127.0.0.1:0" {
 		t.Fatalf("ListenAddr = %q, want 127.0.0.1:0", cfg.ListenAddr)
+	}
+	if cfg.PprofListenAddr != "127.0.0.1:6060" {
+		t.Fatalf("PprofListenAddr = %q, want 127.0.0.1:6060", cfg.PprofListenAddr)
+	}
+
+	disabled, err := newConfig(loadSnapshot(t, "observability:\n  listen_addr: 127.0.0.1:0\n"))
+	if err != nil {
+		t.Fatalf("newConfig(disabled pprof) error = %v", err)
+	}
+	if disabled.PprofListenAddr != "" {
+		t.Fatalf("disabled PprofListenAddr = %q, want empty", disabled.PprofListenAddr)
 	}
 }
 
@@ -98,6 +110,12 @@ func TestHTTPServerContractServesHealthReadinessAndMetrics(t *testing.T) {
 		if !strings.Contains(body, "go_goroutines") {
 			t.Fatalf("custom registry does not expose Go collector: %q", body)
 		}
+		if !strings.Contains(body, "go_sched_latencies_seconds") {
+			t.Fatalf("custom registry does not expose scheduler latency collector: %q", body)
+		}
+		if !strings.Contains(body, "# TYPE go_sched_latencies_seconds histogram") {
+			t.Fatalf("scheduler latency collector is not a histogram: %q", body)
+		}
 		if (runtime.GOOS == "linux" || runtime.GOOS == "windows") && !strings.Contains(body, "process_cpu_seconds_total") {
 			t.Fatalf("custom registry does not expose process collector: %q", body)
 		}
@@ -109,6 +127,82 @@ func TestHTTPServerContractServesHealthReadinessAndMetrics(t *testing.T) {
 			t.Fatalf("unknown route status = %d, want %d", recorder.Code, http.StatusNotFound)
 		}
 	})
+}
+
+func TestPprofServerContractIsOptionalAndUsesSeparateListener(t *testing.T) {
+	disabled, err := newPprofServer(Config{})
+	if err != nil {
+		t.Fatalf("newPprofServer(disabled) error = %v", err)
+	}
+	if err := disabled.Start(context.Background()); err != nil {
+		t.Fatalf("disabled Start() error = %v", err)
+	}
+	if disabled.addr() != "" {
+		t.Fatalf("disabled address = %q, want empty", disabled.addr())
+	}
+	if err := disabled.Stop(context.Background()); err != nil {
+		t.Fatalf("disabled Stop() error = %v", err)
+	}
+
+	server, err := newPprofServer(Config{PprofListenAddr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatalf("newPprofServer(enabled) error = %v", err)
+	}
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatalf("enabled Start() error = %v", err)
+	}
+	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+	addr := server.addr()
+	if addr == "" {
+		t.Fatal("enabled pprof address is empty")
+	}
+	client := &http.Client{Timeout: time.Second}
+	response, err := client.Get("http://" + addr + "/debug/pprof/")
+	if err != nil {
+		t.Fatalf("GET pprof index: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("GET pprof index status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	for _, path := range []string{"/metrics", "/health", "/ready"} {
+		response, err := client.Get("http://" + addr + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusNotFound {
+			t.Fatalf("GET %s status = %d, want %d", path, response.StatusCode, http.StatusNotFound)
+		}
+	}
+	if err := server.Stop(context.Background()); err != nil {
+		t.Fatalf("enabled Stop() error = %v", err)
+	}
+	if server.addr() != "" {
+		t.Fatalf("address after Stop() = %q, want empty", server.addr())
+	}
+	if err := server.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "stopped") {
+		t.Fatalf("Start() after Stop() error = %v, want stopped error", err)
+	}
+}
+
+func TestPprofServerStartHonorsCancelledContext(t *testing.T) {
+	server, err := newPprofServer(Config{PprofListenAddr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatalf("newPprofServer() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := server.Start(ctx); err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start(cancelled context) error = %v, want context.Canceled", err)
+	}
+	if server.addr() != "" {
+		t.Fatalf("address after cancelled Start = %q, want empty", server.addr())
+	}
+	if err := server.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop() after cancelled Start error = %v", err)
+	}
 }
 
 func TestRegistryContractIsAppLocalAndReportsDuplicateRegistration(t *testing.T) {
@@ -201,7 +295,7 @@ func TestHTTPServerStopIsIdempotent(t *testing.T) {
 }
 
 func TestModuleContractDrivesReadinessAcrossLifecycle(t *testing.T) {
-	snapshot := loadSnapshot(t, "observability:\n  listen_addr: 127.0.0.1:0\n")
+	snapshot := loadSnapshot(t, "observability:\n  listen_addr: 127.0.0.1:0\n  pprof_listen_addr: 127.0.0.1:0\n")
 	serviceStarted := make(chan struct{})
 	releaseService := make(chan struct{})
 	serviceStopped := make(chan int, 1)
@@ -289,7 +383,7 @@ func TestModuleContractDrivesReadinessAcrossLifecycle(t *testing.T) {
 	}
 }
 
-func TestModuleRegistersOneManagedServerAndReadinessHook(t *testing.T) {
+func TestModuleRegistersManagedServersAndReadinessHook(t *testing.T) {
 	var registry recordingRegistry
 	if err := Module(&registry); err != nil {
 		t.Fatalf("Module() error = %v", err)
@@ -297,20 +391,23 @@ func TestModuleRegistersOneManagedServerAndReadinessHook(t *testing.T) {
 	if len(registry.provides) != 3 {
 		t.Fatalf("Provide calls = %d, want 3", len(registry.provides))
 	}
-	if len(registry.managed) != 1 {
-		t.Fatalf("managed resources = %d, want 1", len(registry.managed))
+	if len(registry.managed) != 2 {
+		t.Fatalf("managed resources = %d, want 2", len(registry.managed))
 	}
 	if got := registry.managed[0]; got.name != "observability-http" || got.phase != framework.PhaseInfrastructure || !got.hasConstructor {
 		t.Fatalf("managed registration = %+v, want observability-http at infrastructure", got)
 	}
+	if got := registry.managed[1]; got.name != "observability-pprof" || got.phase != framework.PhaseInfrastructure || !got.hasConstructor {
+		t.Fatalf("managed registration = %+v, want observability-pprof at infrastructure", got)
+	}
 	if len(registry.hookConstructors) != 1 {
 		t.Fatalf("hook registrations = %d, want 1 readiness hook", len(registry.hookConstructors))
 	}
-	hookConstructor, ok := registry.hookConstructors[0].(func(*httpServer) framework.Hook)
+	hookConstructor, ok := registry.hookConstructors[0].(func(*httpServer, *pprofServer) framework.Hook)
 	if !ok {
 		t.Fatalf("readiness hook constructor type = %T", registry.hookConstructors[0])
 	}
-	hook := hookConstructor(nil)
+	hook := hookConstructor(nil, nil)
 	if hook.Name != "readiness" || hook.Phase != framework.PhaseReadiness || hook.OnStart == nil || hook.OnStop == nil {
 		t.Fatalf("readiness hook = %+v, want named start/stop hook at readiness phase", hook)
 	}
@@ -362,6 +459,49 @@ func TestModuleRollsBackListenerWhenInfrastructureStartupFails(t *testing.T) {
 		t.Fatalf("listener was not released after rollback: %v", err)
 	}
 	_ = listener.Close()
+}
+
+func TestModuleRollsBackHTTPListenerWhenPprofStartupFails(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("occupy pprof address: %v", err)
+	}
+	defer occupied.Close()
+
+	snapshot := loadSnapshot(t, fmt.Sprintf("observability:\n  listen_addr: 127.0.0.1:0\n  pprof_listen_addr: %s\n", occupied.Addr()))
+	var server *httpServer
+	app, err := framework.New(func(r framework.Registry) error {
+		if err := r.Provide(func() config.SourceSnapshot { return snapshot }); err != nil {
+			return err
+		}
+		if err := Module(r); err != nil {
+			return err
+		}
+		return r.AddHook(func(value *httpServer) framework.Hook {
+			server = value
+			return framework.Hook{
+				Name:    "pprof-rollback-observer",
+				Phase:   framework.PhaseService,
+				OnStart: func(context.Context) error { return nil },
+			}
+		})
+	})
+	if err != nil {
+		t.Fatalf("framework.New() error = %v", err)
+	}
+	if server == nil {
+		t.Fatal("observability server was not resolved")
+	}
+	if err := app.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "observability pprof server start") {
+		t.Fatalf("App.Start() error = %v, want pprof startup error", err)
+	}
+	server.mu.Lock()
+	started, stopped := server.started, server.stopped
+	server.mu.Unlock()
+	addr := server.addr()
+	if started || !stopped || addr != "" {
+		t.Fatalf("HTTP server after pprof rollback: started=%t stopped=%t addr=%q", started, stopped, addr)
+	}
 }
 
 func TestHTTPServerStopForcesCloseWhenContextIsCancelled(t *testing.T) {

@@ -25,10 +25,13 @@ func Module(r framework.Registry) error {
 	if err := r.ProvideManaged("observability-http", framework.PhaseInfrastructure, newHTTPServer); err != nil {
 		return err
 	}
+	if err := r.ProvideManaged("observability-pprof", framework.PhaseInfrastructure, newPprofServer); err != nil {
+		return err
+	}
 	return r.AddHook(newReadinessHook)
 }
 
-func newReadinessHook(server *httpServer) framework.Hook {
+func newReadinessHook(server *httpServer, _ *pprofServer) framework.Hook {
 	return framework.Hook{
 		Name:  "readiness",
 		Phase: framework.PhaseReadiness,

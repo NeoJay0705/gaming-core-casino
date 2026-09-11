@@ -5,6 +5,7 @@ import (
 	"net"
 	"strings"
 
+	"github.com/NeoJay0705/gaming-core-casino/internal/profilehttp"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
 )
@@ -13,7 +14,8 @@ const configPath = "observability"
 
 // Config 是共用 Observability HTTP Server 的設定。
 type Config struct {
-	ListenAddr string `config:"listen_addr" yaml:"listen_addr"`
+	ListenAddr      string `config:"listen_addr" yaml:"listen_addr"`
+	PprofListenAddr string `config:"pprof_listen_addr" yaml:"pprof_listen_addr"`
 }
 
 func newConfig(snapshot config.SourceSnapshot) (Config, error) {
@@ -38,6 +40,7 @@ func validateConfig(cfg *Config) error {
 		return fmt.Errorf("observability config is nil")
 	}
 	cfg.ListenAddr = strings.TrimSpace(cfg.ListenAddr)
+	cfg.PprofListenAddr = strings.TrimSpace(cfg.PprofListenAddr)
 	if cfg.ListenAddr == "" {
 		return fmt.Errorf("observability config: listen_addr is required")
 	}
@@ -47,6 +50,11 @@ func validateConfig(cfg *Config) error {
 	}
 	if port == "" {
 		return fmt.Errorf("observability config: invalid listen_addr %q: port is required", cfg.ListenAddr)
+	}
+	if cfg.PprofListenAddr != "" {
+		if err := profilehttp.ValidateLoopbackAddress(cfg.PprofListenAddr); err != nil {
+			return fmt.Errorf("observability config: invalid pprof_listen_addr: %w", err)
+		}
 	}
 	return nil
 }

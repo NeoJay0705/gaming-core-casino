@@ -15,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/NeoJay0705/gaming-core-casino/examples/metrics/internal/profilehttp"
 	"github.com/NeoJay0705/gaming-core-casino/examples/metrics/internal/protocol"
+	"github.com/NeoJay0705/gaming-core-casino/internal/profilehttp"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 	"google.golang.org/protobuf/proto"

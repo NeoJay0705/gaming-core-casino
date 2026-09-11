@@ -1,5 +1,6 @@
 observability:
   listen_addr: "127.0.0.1:19080"
+  pprof_listen_addr: ""
 
 gate_to_game:
   listen_addr: "127.0.0.1:19090"
