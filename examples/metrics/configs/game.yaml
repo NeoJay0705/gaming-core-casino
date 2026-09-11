@@ -1,17 +1,32 @@
 observability:
+  # 必填：/health、/ready、/metrics 共用的 HTTP listener。
   listen_addr: "127.0.0.1:19080"
+  # 非必要：loopback-only production pprof listener；空白代表關閉（default）。
   pprof_listen_addr: ""
 
-gate_to_game:
-  listen_addr: "127.0.0.1:19090"
-
-redis:
-  addr: "127.0.0.1:6379"
-  key_prefix: "metrics-example"
+grpc:
+  server:
+    # 必填：Game product 唯一 gRPC listener。
+    listen_addr: "127.0.0.1:19090"
+    # 非必要：0 使用 grpc-go default（default）。
+    # max_concurrent_streams: 0
+  clients:
+    gate:
+      # 非必要：broadcast／player gRPC RPC timeout；預設 3s。
+      timeout: "5s"
+      fanout:
+        # 必填：broadcast fallback 與 player fallback 的 headless DNS target。
+        target: "dns:///gate-grpc-headless:19091"
+        # 非必要：最多 fan-out endpoint；0 使用 default 256。
+        max_endpoints: 256
 
 server_send:
-  request_timeout: "5s"
-  fanout:
-    grpc_target: "127.0.0.1:19091"
   broadcast:
+    # 非必要：redis 或 grpc；default redis，Redis 失敗時一次 fallback gRPC。
     primary: "redis"
+
+redis:
+  # 必填：Redis server address。
+  addr: "127.0.0.1:6379"
+  # 必填：application Redis root namespace。
+  key_prefix: "metrics-example"

@@ -9,72 +9,65 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/protobuf/proto"
 )
 
-// RoomPublisher is the narrow Redis Pub/Sub publish dependency.
-type RoomPublisher interface {
+// BroadcastPublisher 是窄型 Redis Pub/Sub publish dependency。
+type BroadcastPublisher interface {
 	Publish(context.Context, string, any) *redis.IntCmd
 }
 
-// RedisBroadcastSender publishes a room message once. Gate subscribers apply
-// it only to their local room members. Redis Pub/Sub is intentionally
-// best-effort: it has no replay for a Gate that was disconnected.
+// RedisBroadcastSender 對 generic command publish 一次。Redis Pub/Sub 刻意
+// 維持 best-effort，斷線 Gate 不會 replay 遺失訊息。
 type RedisBroadcastSender struct {
-	publisher       RoomPublisher
-	keys            Keyspace
-	maxPayloadBytes int
+	publisher BroadcastPublisher
+	keys      Keyspace
 }
 
-type RedisBroadcastConfig struct{ MaxPayloadBytes int }
-
-func NewRedisBroadcastSender(publisher RoomPublisher, keys Keyspace, configs ...RedisBroadcastConfig) (*RedisBroadcastSender, error) {
+func NewRedisBroadcastSender(publisher BroadcastPublisher, keys Keyspace) (*RedisBroadcastSender, error) {
 	if publisher == nil {
-		return nil, fmt.Errorf("%w: Redis room publisher is required", ErrRouteStoreUnavailable)
+		return nil, fmt.Errorf("%w: Redis broadcast publisher is required", ErrRouteStoreUnavailable)
 	}
 	if keys.Prefix() == "" {
 		return nil, fmt.Errorf("%w: redis key prefix is required", ErrDestinationInvalid)
 	}
-	maxPayloadBytes, err := payloadLimitFromConfig(configs)
-	if err != nil {
-		return nil, err
-	}
-	return &RedisBroadcastSender{publisher: publisher, keys: keys, maxPayloadBytes: maxPayloadBytes}, nil
+	return &RedisBroadcastSender{publisher: publisher, keys: keys}, nil
 }
 
-func (s *RedisBroadcastSender) Broadcast(ctx context.Context, message BroadcastMessage) (Receipt, error) {
+func (s *RedisBroadcastSender) Broadcast(ctx context.Context, message Message) (Receipt, error) {
 	if s == nil || s.publisher == nil {
-		return Receipt{}, fmt.Errorf("%w: Redis room publisher is not configured", ErrRouteStoreUnavailable)
+		return Receipt{}, fmt.Errorf("%w: Redis broadcast publisher is not configured", ErrRouteStoreUnavailable)
 	}
-	if err := message.validatePayload(s.maxPayloadBytes); err != nil {
+	if err := message.validatePayload(DefaultMaxPayloadBytes); err != nil {
 		return Receipt{}, err
 	}
-	return s.broadcastValidated(ctx, message)
-}
-
-func (s *RedisBroadcastSender) broadcastValidated(ctx context.Context, message BroadcastMessage) (Receipt, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	message = message.clone()
-	traceID := traceIDFromContext(ctx)
-	encoded, err := proto.Marshal(&RedisBroadcastEnvelope{Message: &BroadcastRoomRequest{RoomId: string(message.RoomID), CommandId: message.CommandID, Payload: message.Payload}, TraceId: traceID})
+	encoded, err := proto.Marshal(&gatelink.GateRequest{CommandId: message.CommandID, Payload: message.Payload})
 	if err != nil {
-		return Receipt{}, fmt.Errorf("server send: encode Redis room broadcast: %w", err)
+		return Receipt{}, fmt.Errorf("server send: encode Redis broadcast command: %w", err)
 	}
-	if err := s.publisher.Publish(ctx, s.keys.roomChannel(message.RoomID), encoded).Err(); err != nil {
-		return Receipt{}, routeStoreError(fmt.Sprintf("publish room %q", message.RoomID), err)
+	count, err := s.publisher.Publish(ctx, s.keys.broadcastChannel(), encoded).Result()
+	if err != nil {
+		return Receipt{}, routeStoreError("publish broadcast command", err)
+	}
+	if count == 0 {
+		return Receipt{}, fmt.Errorf("%w: publish broadcast command has no subscribers", ErrRouteStoreUnavailable)
 	}
 	return newReceipt(), nil
 }
 
-// RoomSubscriptionStore is the narrow Redis Pub/Sub subscription dependency.
-type RoomSubscriptionStore interface {
+// BroadcastSubscriptionStore 是窄型 Redis Pub/Sub subscription dependency。
+type BroadcastSubscriptionStore interface {
 	PSubscribe(context.Context, ...string) *redis.PubSub
 }
 
-type roomSubscription interface {
+type broadcastSubscription interface {
 	ReceiveMessage(context.Context) (*redis.Message, error)
 	Close() error
 }
@@ -84,48 +77,38 @@ const (
 	defaultSubscriptionRetryMax      = 30 * time.Second
 )
 
-// RedisBroadcastSubscriber receives every room channel under one Keyspace and
-// applies each message to local Gate state. A broken subscription is reopened
-// with bounded exponential backoff and jitter; Pub/Sub still provides no replay
-// for messages missed while the subscriber was disconnected.
+// RedisBroadcastSubscriber 透過固定 channel 接收 generic command，並將每筆
+// 訊息交給 Gate product handler。subscription 中斷時以 bounded exponential
+// backoff 與 jitter 重新建立；Pub/Sub 對中斷期間遺失的訊息仍不 replay。
 type RedisBroadcastSubscriber struct {
-	store    RoomSubscriptionStore
-	keys     Keyspace
-	receiver LocalReceiver
+	store             BroadcastSubscriptionStore
+	keys              Keyspace
+	commandDispatcher *dispatcher.Dispatcher
 
 	mu      sync.Mutex
 	cancel  context.CancelFunc
 	done    chan struct{}
-	sub     roomSubscription
+	sub     broadcastSubscription
 	started bool
 
-	// subscribe and retryInterval make lifecycle behaviour contract-testable
-	// without exposing Redis Pub/Sub implementation details.
-	subscribe       func(context.Context) (roomSubscription, error)
-	retryInterval   time.Duration
-	retryMax        time.Duration
-	maxPayloadBytes int
+	// subscribe 與 retryInterval 讓 lifecycle 行為可做 contract test，避免
+	// 暴露 Redis Pub/Sub 實作細節。
+	subscribe     func(context.Context) (broadcastSubscription, error)
+	retryInterval time.Duration
+	retryMax      time.Duration
 }
 
-type RedisSubscriberConfig struct {
-	MaxPayloadBytes int
-}
-
-func NewRedisBroadcastSubscriber(store RoomSubscriptionStore, keys Keyspace, receiver LocalReceiver, configs ...RedisSubscriberConfig) (*RedisBroadcastSubscriber, error) {
+func NewRedisBroadcastSubscriber(store BroadcastSubscriptionStore, keys Keyspace, commandDispatcher *dispatcher.Dispatcher) (*RedisBroadcastSubscriber, error) {
 	if store == nil {
-		return nil, fmt.Errorf("%w: Redis room subscription store is required", ErrRouteStoreUnavailable)
+		return nil, fmt.Errorf("%w: Redis broadcast subscription store is required", ErrRouteStoreUnavailable)
 	}
 	if keys.Prefix() == "" {
 		return nil, fmt.Errorf("%w: redis key prefix is required", ErrDestinationInvalid)
 	}
-	if isNilLocalReceiver(receiver) {
-		return nil, errors.New("server send: local receiver is required")
+	if commandDispatcher == nil {
+		return nil, errors.New("server send: dispatcher is required")
 	}
-	maxPayloadBytes, retryMax, err := subscriberConfigValues(configs)
-	if err != nil {
-		return nil, err
-	}
-	return &RedisBroadcastSubscriber{store: store, keys: keys, receiver: receiver, maxPayloadBytes: maxPayloadBytes, retryMax: retryMax}, nil
+	return &RedisBroadcastSubscriber{store: store, keys: keys, commandDispatcher: commandDispatcher, retryMax: defaultSubscriptionRetryMax}, nil
 }
 
 func (s *RedisBroadcastSubscriber) Start(ctx context.Context) error {
@@ -179,32 +162,32 @@ func (s *RedisBroadcastSubscriber) Stop(ctx context.Context) error {
 	}
 }
 
-func (s *RedisBroadcastSubscriber) openSubscription(ctx context.Context) (roomSubscription, error) {
+func (s *RedisBroadcastSubscriber) openSubscription(ctx context.Context) (broadcastSubscription, error) {
 	if s.subscribe != nil {
 		sub, err := s.subscribe(ctx)
 		if err != nil {
-			return nil, routeStoreError("subscribe room broadcasts", err)
+			return nil, routeStoreError("subscribe broadcast commands", err)
 		}
 		if sub == nil {
-			return nil, routeStoreError("subscribe room broadcasts", errors.New("subscription is nil"))
+			return nil, routeStoreError("subscribe broadcast commands", errors.New("subscription is nil"))
 		}
 		return sub, nil
 	}
 	if s.store == nil {
-		return nil, routeStoreError("subscribe room broadcasts", errors.New("Redis subscription store is not configured"))
+		return nil, routeStoreError("subscribe broadcast commands", errors.New("Redis subscription store is not configured"))
 	}
-	pubsub := s.store.PSubscribe(ctx, s.keys.roomChannelPattern())
+	pubsub := s.store.PSubscribe(ctx, s.keys.broadcastChannel())
 	if pubsub == nil {
-		return nil, routeStoreError("subscribe room broadcasts", errors.New("Redis subscription is nil"))
+		return nil, routeStoreError("subscribe broadcast commands", errors.New("Redis subscription is nil"))
 	}
 	if _, err := pubsub.Receive(ctx); err != nil {
 		_ = pubsub.Close()
-		return nil, routeStoreError("subscribe room broadcasts", err)
+		return nil, routeStoreError("subscribe broadcast commands", err)
 	}
 	return pubsub, nil
 }
 
-func (s *RedisBroadcastSubscriber) consume(ctx context.Context, done chan struct{}, sub roomSubscription) {
+func (s *RedisBroadcastSubscriber) consume(ctx context.Context, done chan struct{}, sub broadcastSubscription) {
 	defer close(done)
 	current := sub
 	attempt := 0
@@ -214,7 +197,7 @@ func (s *RedisBroadcastSubscriber) consume(ctx context.Context, done chan struct
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("[server send] Redis room broadcast subscriber reconnecting: %v", err)
+			log.Printf("[server send] Redis broadcast subscriber reconnecting: %v", err)
 			_ = current.Close()
 			attempt++
 			if !waitForSubscriptionRetry(ctx, s.subscriptionRetryDelay(attempt)) {
@@ -222,7 +205,7 @@ func (s *RedisBroadcastSubscriber) consume(ctx context.Context, done chan struct
 			}
 			next, openErr := s.openSubscription(ctx)
 			if openErr != nil {
-				log.Printf("[server send] Redis room broadcast resubscribe failed: %v", openErr)
+				log.Printf("[server send] Redis broadcast resubscribe failed: %v", openErr)
 				continue
 			}
 			if !s.replaceSubscription(done, next) {
@@ -234,12 +217,12 @@ func (s *RedisBroadcastSubscriber) consume(ctx context.Context, done chan struct
 			continue
 		}
 		if err := s.handle(ctx, []byte(message.Payload)); err != nil {
-			log.Printf("[server send] Redis room broadcast ignored: %v", err)
+			log.Printf("[server send] Redis broadcast command ignored: %v", err)
 		}
 	}
 }
 
-func (s *RedisBroadcastSubscriber) replaceSubscription(done chan struct{}, next roomSubscription) bool {
+func (s *RedisBroadcastSubscriber) replaceSubscription(done chan struct{}, next broadcastSubscription) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.started || s.done != done {
@@ -306,33 +289,23 @@ func waitForSubscriptionRetry(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
-func (s *RedisBroadcastSubscriber) handle(ctx context.Context, encoded []byte) error {
+func (s *RedisBroadcastSubscriber) handle(ctx context.Context, encoded []byte) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("Redis broadcast handler panic: %v", recovered)
+		}
+	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	var envelope RedisBroadcastEnvelope
-	if err := proto.Unmarshal(encoded, &envelope); err != nil {
-		return fmt.Errorf("decode broadcast envelope: %w", err)
+	var request gatelink.GateRequest
+	if err := proto.Unmarshal(encoded, &request); err != nil {
+		return fmt.Errorf("decode broadcast command: %w", err)
 	}
-	request := envelope.GetMessage()
-	if request == nil {
-		return errors.New("broadcast envelope message is required")
-	}
-	message := BroadcastMessage{RoomID: RoomID(request.GetRoomId()), Message: Message{CommandID: request.GetCommandId(), Payload: append([]byte(nil), request.GetPayload()...)}}
-	maxPayloadBytes := s.maxPayloadBytes
-	if maxPayloadBytes == 0 {
-		maxPayloadBytes = DefaultMaxPayloadBytes
-	}
-	if err := message.validatePayload(maxPayloadBytes); err != nil {
-		return err
-	}
-	if envelope.GetTraceId() != "" {
-		ctx = WithRequestContext(ctx, RequestContext{TraceID: envelope.GetTraceId()})
-	}
-	delivered, err := s.receiver.BroadcastRoom(ctx, message)
-	if delivered < 0 {
-		return errors.New("receiver returned invalid delivery count")
-	}
+	_, err = dispatchRemoteCommand(ctx, s.commandDispatcher, Message{
+		CommandID: request.GetCommandId(),
+		Payload:   append([]byte(nil), request.GetPayload()...),
+	})
 	return err
 }
 
@@ -341,29 +314,3 @@ var _ interface {
 	Start(context.Context) error
 	Stop(context.Context) error
 } = (*RedisBroadcastSubscriber)(nil)
-
-func payloadLimitFromConfig(configs []RedisBroadcastConfig) (int, error) {
-	if len(configs) > 1 {
-		return 0, fmt.Errorf("%w: only one Redis broadcast config is supported", ErrDestinationInvalid)
-	}
-	value := 0
-	if len(configs) == 1 {
-		value = configs[0].MaxPayloadBytes
-	}
-	return normalizedPayloadLimit(value)
-}
-
-func subscriberConfigValues(configs []RedisSubscriberConfig) (int, time.Duration, error) {
-	if len(configs) > 1 {
-		return 0, 0, fmt.Errorf("%w: only one Redis subscriber config is supported", ErrDestinationInvalid)
-	}
-	value := RedisSubscriberConfig{}
-	if len(configs) == 1 {
-		value = configs[0]
-	}
-	maxPayload, err := normalizedPayloadLimit(value.MaxPayloadBytes)
-	if err != nil {
-		return 0, 0, err
-	}
-	return maxPayload, defaultSubscriptionRetryMax, nil
-}

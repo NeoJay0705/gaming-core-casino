@@ -3,128 +3,112 @@ package gateproduct
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
-	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/grpcserver"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 )
 
-func TestGateServerSendContractManagedRuntimeStartsThroughWebSocketDependency(t *testing.T) {
+func TestGateGRPCEndpointRegistrationUsesProductServerLifecycle(t *testing.T) {
 	miniRedis := miniredis.RunT(t)
 	path := filepath.Join(t.TempDir(), "gate.yaml")
-	contents := observabilityTestYAML + "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\ngate_to_game:\n  target: dns:///gameproduct:9090\nserver_send:\n  presence:\n    lease_ttl: 30s\n  gate:\n    listen_addr: 127.0.0.1:0\n    endpoint_ttl: 30s\n"
+	contents := fmt.Sprintf("observability:\n  listen_addr: 127.0.0.1:0\nredis:\n  addr: %s\n  key_prefix: core-casino\ngrpc:\n  server:\n    listen_addr: 127.0.0.1:0\n  clients:\n    game:\n      target: dns:///gameproduct:9090\n  endpoint_registration:\n    ttl: 30s\nsession_ownership:\n  lease_ttl: 30s\n", miniRedis.Addr())
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var webSocket *WebSocketServer
-	app, err := NewApp(context.Background(), AppOptions{Config: config.ConfigInputs{MergedPaths: []string{path}}, EnvPrefix: "CORE_CASINO_GATE_SERVER_SEND_LIFECYCLE_TEST__"}, func(r framework.Registry) error {
-		return r.AddHook(func(server *WebSocketServer) framework.Hook {
-			webSocket = server
-			return framework.Hook{Name: "capture-server-send-websocket", Phase: framework.PhaseService, OnStart: func(context.Context) error { return nil }}
+
+	var server *grpcserver.Server
+	var registration *gateGRPCEndpointRegistration
+	app, err := NewApp(context.Background(), AppOptions{Config: config.ConfigInputs{MergedPaths: []string{path}}, EnvPrefix: "CORE_CASINO_GATE_ENDPOINT_LIFECYCLE_TEST__"}, func(r framework.Registry) error {
+		return r.AddHook(func(value *grpcserver.Server, endpoint *gateGRPCEndpointRegistration) framework.Hook {
+			server, registration = value, endpoint
+			return framework.Hook{Name: "capture-gate-endpoint-lifecycle", Phase: framework.PhaseService, OnStart: func(context.Context) error { return nil }}
 		})
 	})
 	if err != nil {
-		t.Fatalf("new app: %v", err)
+		t.Fatalf("new Gate app: %v", err)
 	}
 	if err := app.frameworkApp.Start(context.Background()); err != nil {
-		t.Fatalf("start app: %v", err)
+		t.Fatalf("start Gate app: %v", err)
 	}
-	if webSocket == nil || webSocket.serverSend == nil {
-		t.Fatal("server-send runtime was not resolved through the WebSocket dependency")
+	if server == nil || registration == nil || server.Addr() == "" {
+		t.Fatal("Gate gRPC server or endpoint registration was not started")
 	}
-	client := redis.NewClient(&redis.Options{Addr: miniRedis.Addr()})
-	t.Cleanup(func() { _ = client.Close() })
+
+	redisClient := redis.NewClient(&redis.Options{Addr: miniRedis.Addr()})
+	t.Cleanup(func() { _ = redisClient.Close() })
 	keys, err := serversend.NewKeyspace("core-casino")
 	if err != nil {
 		t.Fatal(err)
 	}
-	directory, err := serversend.NewRedisGateDirectory(client, keys)
+	directory, err := serversend.NewRedisGateDirectory(redisClient, keys)
 	if err != nil {
 		t.Fatal(err)
 	}
-	route := webSocket.serverSend.Route()
-	gateID := serversend.GateID(route.GateID)
-	if gateID == "" {
-		t.Fatal("server-send runtime did not expose a Gate identity")
-	}
-	if route.ReplyEndpoint == "" {
-		t.Fatal("server-send runtime did not expose a reply endpoint")
-	}
-	endpoint, err := directory.Resolve(context.Background(), gateID)
+	endpoint, err := directory.Resolve(context.Background(), registration.gateID)
 	if err != nil {
-		t.Fatalf("endpoint after app start: %v", err)
+		t.Fatalf("resolve registered endpoint: %v", err)
 	}
-	if route.ReplyEndpoint != endpoint.Address {
-		t.Fatalf("reply endpoint = %q, registered endpoint = %q", route.ReplyEndpoint, endpoint.Address)
-	}
-	identitySession := &registrySession{id: "identity-contract"}
-	if err := webSocket.registry.Register(identitySession, "alice"); err != nil {
-		t.Fatalf("register identity contract session: %v", err)
-	}
-	t.Cleanup(func() { webSocket.registry.Remove(identitySession) })
-	presenceResolver, err := serversend.NewRedisPresenceResolver(client, keys)
+	listenerAddress, err := net.ResolveTCPAddr("tcp", server.Addr())
 	if err != nil {
 		t.Fatal(err)
 	}
-	presence, err := presenceResolver.Resolve(context.Background(), "alice")
+	wantAddress, err := serversend.ResolveAdvertiseEndpoint(listenerAddress)
 	if err != nil {
-		t.Fatalf("resolve identity contract presence: %v", err)
+		t.Fatal(err)
 	}
-	if presence.GateID != gateID {
-		t.Fatalf("presence Gate id = %q, endpoint/request Gate id = %q", presence.GateID, gateID)
+	if endpoint.Address != wantAddress {
+		t.Fatalf("registered endpoint = %q, want product server address %q", endpoint.Address, wantAddress)
 	}
+
 	if err := app.frameworkApp.Stop(context.Background()); err != nil {
-		t.Fatalf("stop app: %v", err)
+		t.Fatalf("stop Gate app: %v", err)
 	}
-	if route := webSocket.serverSend.Route(); route != (gatelink.RequestSource{}) {
-		t.Fatalf("server-send route after app stop = %#v, want empty route", route)
+	if _, err := directory.Resolve(context.Background(), registration.gateID); !errors.Is(err, serversend.ErrGateEndpointNotFound) {
+		t.Fatalf("endpoint after stop = %v, want ErrGateEndpointNotFound", err)
 	}
-	if _, err := directory.Resolve(context.Background(), gateID); !errors.Is(err, serversend.ErrGateEndpointNotFound) {
-		t.Fatalf("endpoint after app stop = %v, want ErrGateEndpointNotFound", err)
+	if server.Addr() != "" {
+		t.Fatalf("product server address after stop = %q, want empty", server.Addr())
 	}
-	// A second Stop must remain idempotent after the managed runtime was
-	// resolved by WebSocketServer rather than by a no-op root hook.
 	if err := app.frameworkApp.Stop(context.Background()); err != nil {
 		t.Fatalf("second stop: %v", err)
 	}
 }
 
-func TestGateServerSendContractDoesNotSubscribeToRedisForGRPCPrimary(t *testing.T) {
-	miniRedis := miniredis.RunT(t)
-	path := filepath.Join(t.TempDir(), "gate.yaml")
-	contents := observabilityTestYAML + "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\ngate_to_game:\n  target: dns:///gameproduct:9090\nserver_send:\n  broadcast:\n    primary: grpc\n  presence:\n    lease_ttl: 30s\n  gate:\n    listen_addr: 127.0.0.1:0\n    endpoint_ttl: 30s\n"
-	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	var runtime *gateServerSendRuntime
-	app, err := NewApp(context.Background(), AppOptions{Config: config.ConfigInputs{MergedPaths: []string{path}}, EnvPrefix: "CORE_CASINO_GATE_SERVER_SEND_GRPC_PRIMARY_TEST__"}, func(r framework.Registry) error {
-		return r.AddHook(func(value *gateServerSendRuntime) framework.Hook {
-			runtime = value
-			return framework.Hook{Name: "capture-grpc-primary-runtime", Phase: framework.PhaseService, OnStart: func(context.Context) error { return nil }}
-		})
-	})
+func TestGateServerSendBroadcastGRPCConfigDoesNotConstructRedisRuntime(t *testing.T) {
+	snapshot := serverSendBroadcastSnapshot{primary: "grpc"}
+	cfg, enabled, err := gateServerSendBroadcast(snapshot)
 	if err != nil {
-		t.Fatalf("new app: %v", err)
+		t.Fatalf("validate gRPC broadcast config: %v", err)
 	}
-	if err := app.frameworkApp.Start(context.Background()); err != nil {
-		t.Fatalf("start app: %v", err)
+	if !enabled || cfg.Primary != "grpc" {
+		t.Fatalf("broadcast config = %#v enabled=%t", cfg, enabled)
 	}
-	if runtime == nil {
-		t.Fatal("gRPC-primary runtime was not resolved")
+	if _, err := newGateServerSendBroadcastRuntime(gateServerSendBroadcastConfig{Primary: "grpc"}, nil, nil, serversend.Keyspace{}); err == nil {
+		t.Fatal("gRPC broadcast unexpectedly accepted Redis subscriber runtime")
 	}
-	runtime.mu.RLock()
-	subscriber := runtime.subscriber
-	runtime.mu.RUnlock()
-	if subscriber != nil {
-		t.Fatal("gRPC-primary Gate created a Redis room subscriber")
+}
+
+type serverSendBroadcastSnapshot struct{ primary string }
+
+func (s serverSendBroadcastSnapshot) Bind(path string, target any, _ ...config.BindOption) error {
+	if path == "server_send" {
+		target.(*gateServerSendConfig).Broadcast.Primary = s.primary
 	}
-	if err := app.frameworkApp.Stop(context.Background()); err != nil {
-		t.Fatalf("stop app: %v", err)
-	}
+	return nil
+}
+func (serverSendBroadcastSnapshot) Has(path string) bool {
+	return path == "server_send" || path == "server_send.broadcast"
+}
+func (serverSendBroadcastSnapshot) HasSource(string) bool { return false }
+func (serverSendBroadcastSnapshot) BindSource(string, string, any, ...config.BindOption) error {
+	return nil
 }

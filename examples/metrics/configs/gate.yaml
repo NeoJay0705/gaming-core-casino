@@ -1,26 +1,54 @@
 observability:
+  # 必填：/health、/ready、/metrics 共用的 HTTP listener。
   listen_addr: "127.0.0.1:18081"
+  # 非必要：loopback-only production pprof listener；空白代表關閉（default）。
   pprof_listen_addr: ""
 
 websocket:
+  # 必填：玩家 WebSocket listener。
   client_addr: "127.0.0.1:18080"
+  # 非必要：每條連線 write queue；default 256。
   write_chan_size: 256
+  # 非必要：單一 frame write timeout（毫秒）；default 5000。
   write_timeout_ms: 5000
 
-gate_to_game:
-  target: "127.0.0.1:19090"
-  timeout: "5s"
+grpc:
+  server:
+    # 必填：Gate product 唯一 gRPC listener。
+    listen_addr: "127.0.0.1:19091"
+    # 非必要：0 使用 grpc-go default（default）。
+    # max_concurrent_streams: 0
+  clients:
+    game:
+      # 必填：Gate → Game Forward target。
+      target: "127.0.0.1:19090"
+      # 非必要：單次 Gate → Game RPC timeout；default 10s。
+      timeout: "5s"
+    gate:
+      # 非必要：broadcast gRPC fallback timeout；default 3s。
+      timeout: "3s"
+      fanout:
+        # 必填：Gate fan-out 的 headless DNS target。
+        target: "dns:///gate-grpc-headless:19091"
+        # 非必要：最多 fan-out endpoint；0 使用 default 256。
+        max_endpoints: 256
+  endpoint_registration:
+    # 必填：Gate endpoint Redis lease TTL。
+    ttl: "30s"
+    # 非必要：省略時 ttl / 3；default 10s in this example。
+    refresh: "10s"
 
-redis:
-  addr: "127.0.0.1:6379"
-  key_prefix: "metrics-example"
+session_ownership:
+  # 必填：distributed session ownership lease TTL。
+  lease_ttl: "1m"
 
 server_send:
-  presence:
-    lease_ttl: "1m"
-  gate:
-    listen_addr: "127.0.0.1:19091"
-    endpoint_ttl: "30s"
-    endpoint_refresh: "10s"
   broadcast:
+    # 非必要：redis 或 grpc；default redis，Redis 失敗時一次 fallback gRPC。
     primary: "redis"
+
+redis:
+  # 必填：Redis server address。
+  addr: "127.0.0.1:6379"
+  # 必填：application Redis root namespace。
+  key_prefix: "metrics-example"

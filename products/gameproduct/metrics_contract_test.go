@@ -65,13 +65,12 @@ func TestGameGateMetricsContractDistinguishesRegisteredAndUnknown(t *testing.T) 
 	if err := commandDispatcher.Register(GateRequestChannel, 7, func(context.Context, []byte) error { return nil }); err != nil {
 		t.Fatalf("Register() error = %v", err)
 	}
-	server, err := newGameGateGRPCServer(gameGateGRPCInputs{
-		Config:     gatelink.ServerConfig{ListenAddr: "127.0.0.1:0"},
+	server, err := newGameGateGRPCService(gameGRPCServerInputs{
 		Dispatcher: commandDispatcher,
 		Metrics:    metrics,
 	})
 	if err != nil {
-		t.Fatalf("newGameGateGRPCServer() error = %v", err)
+		t.Fatalf("newGameGateGRPCService() error = %v", err)
 	}
 	if _, err := server.Forward(context.Background(), &gatelink.GateRequest{CommandId: 7}); err != nil {
 		t.Fatalf("registered Forward() error = %v", err)

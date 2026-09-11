@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
 	redisinfra "github.com/NeoJay0705/gaming-core-casino/pkg/infra/redis"
 	"github.com/redis/go-redis/v9"
 )
@@ -170,7 +170,13 @@ func TestRedisIntegrationContractEndpointRefreshAndExpiry(t *testing.T) {
 func TestRedisIntegrationContractSubscriberSurvivesStartupContextExpiry(t *testing.T) {
 	client, keys := newRedisIntegrationClient(t)
 	receiver := &recordingReceiver{}
-	subscriber, err := NewRedisBroadcastSubscriber(client, keys, receiver, RedisSubscriberConfig{MaxPayloadBytes: 1024})
+	commandDispatcher := dispatcher.New()
+	if err := commandDispatcher.Register(RemoteCommandChannel, 12, func(ctx context.Context, payload []byte) error {
+		return receiver.HandleRemote(ctx, 12, payload)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	subscriber, err := NewRedisBroadcastSubscriber(client, keys, commandDispatcher)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,28 +191,24 @@ func TestRedisIntegrationContractSubscriberSurvivesStartupContextExpiry(t *testi
 	subscriber.mu.Lock()
 	initialSubscription := subscriber.sub
 	subscriber.mu.Unlock()
-	sender, err := NewRedisBroadcastSender(client, keys, RedisBroadcastConfig{MaxPayloadBytes: 1024})
+	sender, err := NewRedisBroadcastSender(client, keys)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := sender.Broadcast(gatelink.WithGateRequestContext(context.Background(), gatelink.GateRequestContext{TraceID: "trace-real-redis"}), BroadcastMessage{RoomID: "room-real", Message: Message{CommandID: 12, Payload: []byte{0, 1, 255}}}); err != nil {
+	if _, err := sender.Broadcast(context.Background(), Message{CommandID: 12, Payload: []byte{0, 1, 255}}); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 	waitForRedisIntegration(t, time.Second, func() bool {
 		receiver.mu.Lock()
-		got := receiver.broadcast.RoomID == "room-real"
+		got := receiver.remoteCommandID == 12 && string(receiver.remotePayload) == string([]byte{0, 1, 255})
 		receiver.mu.Unlock()
 		return got
 	})
 	receiver.mu.Lock()
-	delivered := receiver.broadcast.RoomID == "room-real"
-	traceID := receiver.traceID
+	delivered := receiver.remoteCommandID == 12
 	receiver.mu.Unlock()
 	if !delivered {
 		t.Fatal("subscriber did not receive Redis Pub/Sub message")
-	}
-	if traceID != "trace-real-redis" {
-		t.Fatalf("subscriber trace = %q, want trace-real-redis", traceID)
 	}
 	if killed, err := client.Do(context.Background(), "CLIENT", "KILL", "TYPE", "pubsub").Int64(); err != nil || killed < 1 {
 		t.Fatalf("kill Redis Pub/Sub connection = count:%d error:%v, want at least one", killed, err)
@@ -216,20 +218,14 @@ func TestRedisIntegrationContractSubscriberSurvivesStartupContextExpiry(t *testi
 		defer subscriber.mu.Unlock()
 		return subscriber.sub != nil && subscriber.sub != initialSubscription
 	})
-	if _, err := sender.Broadcast(gatelink.WithGateRequestContext(context.Background(), gatelink.GateRequestContext{TraceID: "trace-real-reconnect"}), BroadcastMessage{RoomID: "room-real-reconnect", Message: Message{CommandID: 13, Payload: []byte("reconnected")}}); err != nil {
+	if _, err := sender.Broadcast(context.Background(), Message{CommandID: 12, Payload: []byte("reconnected")}); err != nil {
 		t.Fatalf("publish after reconnect: %v", err)
 	}
 	waitForRedisIntegration(t, time.Second, func() bool {
 		receiver.mu.Lock()
 		defer receiver.mu.Unlock()
-		return receiver.broadcast.RoomID == "room-real-reconnect"
+		return receiver.remoteCommandID == 12 && string(receiver.remotePayload) == "reconnected"
 	})
-	receiver.mu.Lock()
-	traceID = receiver.traceID
-	receiver.mu.Unlock()
-	if traceID != "trace-real-reconnect" {
-		t.Fatalf("reconnected subscriber trace = %q, want trace-real-reconnect", traceID)
-	}
 	if err := subscriber.Stop(context.Background()); err != nil {
 		t.Fatalf("stop subscriber: %v", err)
 	}

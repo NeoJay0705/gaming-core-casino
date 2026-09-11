@@ -1,26 +1,24 @@
-# 必填：接收 Gate player binary request 的 gRPC server。
-# transport 只轉交 command、原始 bytes 與 context 中的 trace/source，不負責解碼或 dispatch。
-# 尚未由 dispatcher.Register 註冊對應 command 時，request 會回 Unimplemented。
-gate_to_game:
-  listen_addr: ":9090"
+# Game product 的單一 product-level gRPC server。
+grpc:
+  server:
+    # 必填：Game product 唯一 gRPC listener。
+    listen_addr: ":9090"
+    # 非必要：0 使用 grpc-go default；預設 0。
+    # max_concurrent_streams: 0
 
-# Server Send 的 Redis root prefix 與 broadcast primary 請由 infra.yaml 提供。
-# Game business module 可注入 RequestPlayerSender、PlayerSender、BroadcastSender。
+  # Game 透過 Redis presence／endpoint directory 找到指定 Gate；此 client
+  # 只設定每次 delivery 的 timeout，不設定固定 target。
+  clients:
+    gate:
+      # 非必要：exact／fan-out Gate RPC timeout；預設 3s。
+      # timeout: "3s"
+      fanout:
+        # 必填（使用 PlayerSender 或 broadcast 時）：all-Gate fan-out 的 headless DNS target。
+        target: "dns:///gate-grpc-headless:9091"
+        # 非必要：最多 fan-out endpoint；預設 256。
+        # max_endpoints: 256
+
 server_send:
-  # 非必要：單次 Game → Gate gRPC deadline；預設 3s。
-  # request_timeout: "3s"
-
-  # player 或 broadcast fallback 使用 grpc 時必填；必須列出每個 Gate
-  # instance 的 headless DNS／Docker tasks DNS，不能是 round-robin VIP。
-  fanout:
-    grpc_target: "dns:///gate-server-send-headless:9091"
-    # 非必要：最多 fan-out Gate 數，預設 256。
-    # max_endpoints: 256
-
-  player:
-    # 非必要：primary route 失敗後的 fallback；可填 grpc 或 none。
-    fallback: grpc
-
   broadcast:
-    # infra.yaml 的 primary 決定 Redis 或 gRPC；這裡只設定 Game-side fallback。
-    fallback: grpc
+    # 非必要：redis 或 grpc；預設 redis，Redis 失敗時固定 fallback gRPC。
+    primary: redis

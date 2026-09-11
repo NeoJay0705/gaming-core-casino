@@ -23,11 +23,11 @@ func TestProductAppsProvideManagedInfrastructureToProductModules(t *testing.T) {
 		t.Fatal(err)
 	}
 	gamePath := filepath.Join(t.TempDir(), "game-infra.yaml")
-	if err := os.WriteFile(gamePath, []byte(infraConfigYAML+"gate_to_game:\n  listen_addr: 127.0.0.1:0\n"), 0o600); err != nil {
+	if err := os.WriteFile(gamePath, []byte(infraConfigYAML+"grpc:\n  server:\n    listen_addr: 127.0.0.1:0\n  clients:\n    gate:\n      timeout: 1s\n      fanout:\n        target: dns:///gate-headless:9091\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	gatePath := filepath.Join(t.TempDir(), "gate-infra.yaml")
-	if err := os.WriteFile(gatePath, []byte(infraConfigYAML+"gate_to_game:\n  target: dns:///gameproduct:9090\n"), 0o600); err != nil {
+	if err := os.WriteFile(gatePath, []byte(infraConfigYAML+"grpc:\n  server:\n    listen_addr: 127.0.0.1:0\n  clients:\n    game:\n      target: dns:///gameproduct:9090\n  endpoint_registration:\n    ttl: 30s\nsession_ownership:\n  lease_ttl: 30s\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	tests := map[string]func() error{

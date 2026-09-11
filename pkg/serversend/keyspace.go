@@ -32,12 +32,11 @@ func (k Keyspace) gateEndpoint(gateID GateID) string {
 	return k.prefix + ":gate:" + opaqueKeyPart(string(gateID))
 }
 
-func (k Keyspace) roomChannel(roomID RoomID) string {
-	return k.prefix + ":broadcast:room:" + opaqueKeyPart(string(roomID))
-}
-
-func (k Keyspace) roomChannelPattern() string {
-	return k.prefix + ":broadcast:room:*"
+// broadcastChannel is shared by every Gate subscriber. Room routing belongs to
+// the registered command handler, so transport never creates per-room Redis
+// channels.
+func (k Keyspace) broadcastChannel() string {
+	return k.prefix + ":broadcast"
 }
 
 func opaqueKeyPart(value string) string {

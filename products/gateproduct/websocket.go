@@ -74,7 +74,7 @@ type webSocketServerInputs struct {
 	Dispatcher *dispatcher.Dispatcher
 	GameClient *gatelink.Client
 	Sessions   *SessionRegistry
-	ServerSend *gateServerSendRuntime `optional:"true"`
+	Identity   gateIdentity
 	Metrics    *gateMetrics
 }
 
@@ -86,7 +86,7 @@ type WebSocketServer struct {
 	dispatcher *dispatcher.Dispatcher
 	gameClient *gatelink.Client
 	registry   *SessionRegistry
-	serverSend *gateServerSendRuntime
+	gateID     string
 	metrics    *gateMetrics
 
 	mu       sync.Mutex
@@ -103,7 +103,7 @@ func newGateWebSocketServer(inputs webSocketServerInputs) (*WebSocketServer, err
 		dispatcher: inputs.Dispatcher,
 		gameClient: inputs.GameClient,
 		registry:   inputs.Sessions,
-		serverSend: inputs.ServerSend,
+		gateID:     string(inputs.Identity.GateID),
 		metrics:    inputs.Metrics,
 	}
 	if server.dispatcher == nil {
@@ -114,6 +114,9 @@ func newGateWebSocketServer(inputs webSocketServerInputs) (*WebSocketServer, err
 	}
 	if server.registry == nil {
 		return nil, errors.New("gate websocket: session registry is nil")
+	}
+	if server.gateID == "" {
+		return nil, errors.New("gate websocket: Gate identity is required")
 	}
 	if inputs.Snapshot == nil {
 		return nil, fmt.Errorf("gate websocket: config snapshot is nil")
@@ -342,12 +345,7 @@ func (s *WebSocketServer) dispatchPacket(ctx context.Context, session *webSocket
 	if ctx.Err() != nil {
 		return false
 	}
-	source := gatelink.RequestSource{ConnectionID: string(session.ID())}
-	if s.serverSend != nil {
-		route := s.serverSend.Route()
-		source.GateID = route.GateID
-		source.ReplyEndpoint = route.ReplyEndpoint
-	}
+	source := gatelink.RequestSource{GateID: s.gateID, ConnectionID: string(session.ID())}
 	ctx = WithWebSocketRequestContext(ctx, WebSocketRequestContext{
 		Request: gatelink.GateRequestContext{
 			Source: source,

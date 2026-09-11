@@ -7,9 +7,7 @@ import (
 	"strings"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
 )
 
 type requestContextCarrierKey struct{}
@@ -42,21 +40,17 @@ type Request struct {
 }
 
 // RequestSource identifies the Gate connection that originated Request.
-// GateID and ReplyEndpoint are optional for ordinary Gate-to-Game requests and
-// for the unary request-player reply path. ReplyEndpoint is retained for the
-// legacy reverse server-send path and is produced by Gate's server-send
-// listener, never by the player payload.
+// GateID is optional for ordinary Gate-to-Game requests; ConnectionID is the
+// required identity of the originating WebSocket connection.
 type RequestSource struct {
-	GateID        string
-	ConnectionID  string
-	ReplyEndpoint string
+	GateID       string
+	ConnectionID string
 }
 
 const (
-	traceIDMetadataKey       = "x-gate-request-trace-id"
-	gateIDMetadataKey        = "x-gate-request-gate-id"
-	connectionIDMetadataKey  = "x-gate-request-connection-id"
-	replyEndpointMetadataKey = "x-gate-request-reply-endpoint"
+	traceIDMetadataKey      = "x-gate-request-trace-id"
+	gateIDMetadataKey       = "x-gate-request-gate-id"
+	connectionIDMetadataKey = "x-gate-request-connection-id"
 )
 
 // WithGateRequestContext returns a context carrying metadata for one Gate
@@ -112,19 +106,6 @@ func outgoingRequestContextInterceptor(
 	return invoker(ctx, method, req, reply, connection, options...)
 }
 
-func incomingRequestContextInterceptor(
-	ctx context.Context,
-	req any,
-	info *grpc.UnaryServerInfo,
-	handler grpc.UnaryHandler,
-) (any, error) {
-	ctx, err := withIncomingRequestContext(ctx)
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
-	return handler(ctx, req)
-}
-
 func withOutgoingRequestMetadata(ctx context.Context) (context.Context, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -141,9 +122,6 @@ func withOutgoingRequestMetadata(ctx context.Context) (context.Context, error) {
 	}
 	if gateID := strings.TrimSpace(requestContext.Source.GateID); gateID != "" {
 		metadataValues.Set(gateIDMetadataKey, gateID)
-	}
-	if replyEndpoint := strings.TrimSpace(requestContext.Source.ReplyEndpoint); replyEndpoint != "" {
-		metadataValues.Set(replyEndpointMetadataKey, replyEndpoint)
 	}
 	return metadata.NewOutgoingContext(ctx, metadataValues), nil
 }
@@ -168,13 +146,9 @@ func withIncomingRequestContext(ctx context.Context) (context.Context, error) {
 	if err != nil {
 		return nil, err
 	}
-	replyEndpoint, err := singleMetadataValue(metadataValues, replyEndpointMetadataKey, false)
-	if err != nil {
-		return nil, err
-	}
 	return WithGateRequestContext(ctx, GateRequestContext{
 		TraceID: traceID,
-		Source:  RequestSource{GateID: gateID, ConnectionID: connectionID, ReplyEndpoint: replyEndpoint},
+		Source:  RequestSource{GateID: gateID, ConnectionID: connectionID},
 	}), nil
 }
 

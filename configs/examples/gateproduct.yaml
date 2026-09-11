@@ -1,33 +1,48 @@
-# Gate player WebSocket transport.
+# Gate 對玩家提供的 WebSocket listener。
 websocket:
-  # 必填：Gate 對玩家提供 WebSocket 的監聽位址。
+  # 必填：Gate 玩家 WebSocket listener。
   client_addr: ":8082"
-
-  # 非必要：每條連線等待 writer 處理的 binary packet 數量；預設 256。
+  # 非必要：每條連線 write queue；預設 256。
   # write_chan_size: 256
-
-  # 非必要：單一 binary frame 寫入逾時（毫秒）；預設 5000。
+  # 非必要：單一 frame write timeout（毫秒）；預設 5000。
   # write_timeout_ms: 5000
 
-# 必填：Gate 轉送玩家 binary request 到 Game 的 gRPC client。
-# 應使用可解析多個 Game instance 的 target；client 預設 round_robin。
-gate_to_game:
-  target: "dns:///gameproduct:9090"
-
-  # 非必要：單次轉送 deadline；預設 10s。
-  # timeout: "10s"
-
-# Game → Gate 的 Server Send receiver；請和 infra.yaml 的 server_send 合併載入。
-server_send:
-  presence:
-    # 必填：Gate session owner lease；較長 TTL 降低大量在線玩家的 renew write volume。
-    lease_ttl: "5m"
-
-  gate:
-    # 必填：接收 Game server-send gRPC 的監聽位址。
+grpc:
+  # Gate product 的單一 gRPC listener；GateDelivery 與未來其他 service
+  # 共用此 listener。
+  server:
+    # 必填：Gate product 唯一 gRPC listener。
     listen_addr: ":9091"
+    # 非必要：0 使用 grpc-go default；預設 0。
+    # max_concurrent_streams: 0
 
+  clients:
+    game:
+      # 必填：GateRequestService target。
+      target: "dns:///gameproduct:9090"
+      # 非必要：單次 Gate -> Game request timeout；預設 10s。
+      # timeout: "10s"
+    gate:
+      # 非必要：Gate-to-Gate fan-out RPC timeout；預設 3s。
+      # timeout: "3s"
+      fanout:
+        # 必填：Gate-to-Gate fan-out 的 headless DNS target。
+        target: "dns:///gate-grpc-headless:9091"
+        # 非必要：最多 fan-out endpoint；預設 256。
+        # max_endpoints: 256
+
+  endpoint_registration:
     # 必填：Gate endpoint Redis lease TTL。
-    endpoint_ttl: "30s"
-    # 非必要：續租間隔；預設 endpoint_ttl/3。
-    # endpoint_refresh: "10s"
+    ttl: "30s"
+    # 非必要：省略時為 ttl / 3，且必須小於 ttl。
+    # refresh: "10s"
+
+# Gate 永遠使用 distributed session ownership。
+session_ownership:
+  # 必填：玩家 ownership lease TTL。
+  lease_ttl: "5m"
+
+server_send:
+  broadcast:
+    # 非必要：redis 或 grpc；預設 redis，Redis 失敗時固定 fallback gRPC。
+    primary: redis

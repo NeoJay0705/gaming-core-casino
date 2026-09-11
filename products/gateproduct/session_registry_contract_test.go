@@ -5,8 +5,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-
-	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 )
 
 func TestSessionRegistryContractRejectsInvalidOperations(t *testing.T) {
@@ -87,31 +85,6 @@ func TestSessionRegistryContractRegistersAndDelivers(t *testing.T) {
 	}
 	if err := registry.SendToLoginName("missing", packet); !errors.Is(err, ErrLoginSessionNotFound) {
 		t.Fatalf("send missing login error = %v, want ErrLoginSessionNotFound", err)
-	}
-}
-
-func TestSessionRegistryContractDeliversOnlyToExactConnectionAndExpectedLogin(t *testing.T) {
-	registry := NewSessionRegistry()
-	alice := &registrySession{id: "connection-alice"}
-	bob := &registrySession{id: "connection-bob"}
-	if err := registry.Register(alice, "alice"); err != nil {
-		t.Fatal(err)
-	}
-	if err := registry.Register(bob, "bob"); err != nil {
-		t.Fatal(err)
-	}
-	if err := registry.SendToConnection(alice.ID(), "alice", []byte("direct")); err != nil {
-		t.Fatalf("send exact connection: %v", err)
-	}
-	if len(alice.Sent()) != 1 || len(bob.Sent()) != 0 {
-		t.Fatalf("direct delivery = alice:%d bob:%d, want 1/0", len(alice.Sent()), len(bob.Sent()))
-	}
-	if err := registry.SendToConnection(alice.ID(), "bob", nil); !errors.Is(err, serversend.ErrTargetNotConnected) {
-		t.Fatalf("mismatched login error = %v, want ErrTargetNotConnected", err)
-	}
-	registry.Remove(alice)
-	if err := registry.SendToConnection(alice.ID(), "alice", nil); !errors.Is(err, serversend.ErrTargetNotConnected) {
-		t.Fatalf("disconnected connection error = %v, want ErrTargetNotConnected", err)
 	}
 }
 

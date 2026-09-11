@@ -17,13 +17,12 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/grpcserver"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 	"github.com/NeoJay0705/gaming-core-casino/products/gameproduct"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gorilla/websocket"
 )
-
-const gateToGameTestYAML = "gate_to_game:\n  target: dns:///gameproduct:9090\n"
 
 func TestGateWebSocketContractDispatchesReadsWritesAndStops(t *testing.T) {
 	configPath := writeWebSocketConfig(t)
@@ -111,7 +110,7 @@ func TestGateWebSocketContractForwardsUnhandledCommandToGame(t *testing.T) {
 		context gatelink.GateRequestContext
 	}
 	received := make(chan receivedRequest, 2)
-	gameServer, err := gatelink.NewServer(gatelink.ServerConfig{ListenAddr: "127.0.0.1:0"}, gatelink.RequestHandlerFunc(func(ctx context.Context, request gatelink.Request) error {
+	gameServer := newContractGameServer(t, gatelink.RequestHandlerFunc(func(ctx context.Context, request gatelink.Request) error {
 		requestContext, ok := gatelink.GateRequestContextFrom(ctx)
 		if !ok {
 			return errors.New("missing Gate request context")
@@ -119,9 +118,6 @@ func TestGateWebSocketContractForwardsUnhandledCommandToGame(t *testing.T) {
 		received <- receivedRequest{request: request, context: requestContext}
 		return nil
 	}))
-	if err != nil {
-		t.Fatalf("new Game server: %v", err)
-	}
 	if err := gameServer.Start(context.Background()); err != nil {
 		t.Fatalf("start Game server: %v", err)
 	}
@@ -218,12 +214,12 @@ func TestGateWebSocketContractUnaryGameReplyReturnsToOriginalConnection(t *testi
 	miniRedis := miniredis.RunT(t)
 
 	gameConfig := filepath.Join(t.TempDir(), "game.yaml")
-	gameYAML := observabilityTestYAML + "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\ngate_to_game:\n  listen_addr: 127.0.0.1:0\nserver_send:\n  max_payload_bytes: 1024\n  broadcast:\n    primary: redis\n"
+	gameYAML := observabilityTestYAML + "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\ngrpc:\n  server:\n    listen_addr: 127.0.0.1:0\n  clients:\n    gate:\n      timeout: 1s\n      fanout:\n        target: dns:///gate-headless:9091\n"
 	if err := os.WriteFile(gameConfig, []byte(gameYAML), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var requestSender serversend.RequestPlayerSender
-	var gameServer *gatelink.Server
+	var gameServer *grpcserver.Server
 	gameReady := make(chan struct{})
 	gameApp, err := gameproduct.NewApp(context.Background(), gameproduct.AppOptions{Config: config.ConfigInputs{MergedPaths: []string{gameConfig}}, EnvPrefix: "CORE_CASINO_GATE_DIRECT_REPLY_GAME_TEST__"}, dispatcher.Register(dispatcher.Registration{
 		Channel:   gameproduct.GateRequestChannel,
@@ -236,7 +232,7 @@ func TestGateWebSocketContractUnaryGameReplyReturnsToOriginalConnection(t *testi
 			return err
 		},
 	}), func(r framework.Registry) error {
-		return r.AddHook(func(sender serversend.RequestPlayerSender, server *gatelink.Server) framework.Hook {
+		return r.AddHook(func(sender serversend.RequestPlayerSender, server *grpcserver.Server) framework.Hook {
 			requestSender, gameServer = sender, server
 			return framework.Hook{Name: "capture-direct-reply-game-server", Phase: framework.PhaseIngress, OnStart: func(context.Context) error {
 				close(gameReady)
@@ -461,7 +457,9 @@ func TestEncodeWebSocketPacketContract(t *testing.T) {
 
 func TestNewAppRejectsConfiguredWebSocketWithoutClientAddr(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "gate.yaml")
-	if err := os.WriteFile(configPath, []byte(observabilityTestYAML+"websocket:\n  write_chan_size: 1\n"+gateToGameTestYAML), 0o600); err != nil {
+	miniRedis := miniredis.RunT(t)
+	contents := observabilityTestYAML + "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\ngrpc:\n  server:\n    listen_addr: 127.0.0.1:0\n  clients:\n    game:\n      target: dns:///gameproduct:9090\n  endpoint_registration:\n    ttl: 30s\nsession_ownership:\n  lease_ttl: 30s\nwebsocket:\n  write_chan_size: 1\n"
+	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	_, err := NewApp(context.Background(), AppOptions{Config: config.ConfigInputs{MergedPaths: []string{configPath}}, EnvPrefix: "CORE_CASINO_GATE_WEBSOCKET_REQUIRED_TEST__"})
@@ -565,7 +563,8 @@ func writeWebSocketConfig(t *testing.T) string {
 func writeWebSocketConfigWithGameTarget(t *testing.T, target string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "gate.yaml")
-	contents := observabilityTestYAML + "websocket:\n  client_addr: 127.0.0.1:0\ngate_to_game:\n  target: " + target + "\n"
+	miniRedis := miniredis.RunT(t)
+	contents := observabilityTestYAML + "redis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\nwebsocket:\n  client_addr: 127.0.0.1:0\ngrpc:\n  server:\n    listen_addr: 127.0.0.1:0\n  clients:\n    game:\n      target: " + target + "\n      timeout: 1s\n  endpoint_registration:\n    ttl: 30s\nsession_ownership:\n  lease_ttl: 30s\n"
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}

@@ -11,6 +11,7 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gateproto"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 	"github.com/NeoJay0705/gaming-core-casino/products/gateproduct"
 	"google.golang.org/protobuf/proto"
 )
@@ -30,11 +31,42 @@ func GateModule() framework.Module {
 			}); err != nil {
 				return err
 			}
+			if err := commandDispatcher.Register(serversend.RemoteCommandChannel, dispatcher.CommandID(protocol.BroadcastRoomCommandID), func(ctx context.Context, payload []byte) error {
+				return broadcastRoomHandler(registry, ctx, payload)
+			}); err != nil {
+				return err
+			}
 			return commandDispatcher.Register(gateproduct.WebSocketChannel, dispatcher.CommandID(protocol.LocalEchoRequestCommandID), func(ctx context.Context, payload []byte) error {
 				return localEchoHandler(registry, ctx, payload)
 			})
 		})
 	}
+}
+
+func broadcastRoomHandler(registry *gateproduct.SessionRegistry, _ context.Context, payload []byte) error {
+	command := new(protocol.BroadcastRoomCommand)
+	if err := proto.Unmarshal(payload, command); err != nil {
+		return fmt.Errorf("decode broadcast room command: %w", err)
+	}
+	roomID := strings.TrimSpace(command.GetRoomId())
+	if roomID == "" {
+		return gateproduct.ErrRoomIDInvalid
+	}
+	if command.GetClientCommandId() == 0 {
+		return fmt.Errorf("client_command_id is required")
+	}
+	if registry == nil {
+		return fmt.Errorf("session registry is required")
+	}
+	packet := gateproduct.EncodeWebSocketPacket(gateproduct.WebSocketPacket{
+		CommandID: command.GetClientCommandId(),
+		Payload:   append([]byte(nil), command.GetClientPayload()...),
+	})
+	_, err := registry.BroadcastRoom(gateproduct.RoomID(roomID), packet)
+	if err != nil {
+		return fmt.Errorf("broadcast room %q: %w", roomID, err)
+	}
+	return nil
 }
 
 func loginHandler(registry *gateproduct.SessionRegistry, ctx context.Context, payload []byte) error {

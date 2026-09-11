@@ -16,8 +16,8 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/examples/metrics/internal/workflow"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
-	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gateproto"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/grpcserver"
 	"github.com/NeoJay0705/gaming-core-casino/products/gameproduct"
 	"github.com/NeoJay0705/gaming-core-casino/products/gateproduct"
 	"github.com/alicebob/miniredis/v2"
@@ -31,15 +31,20 @@ func TestMetricsExampleGateGameFlowContract(t *testing.T) {
 	miniRedis := miniredis.RunT(t)
 	gameConfig := writeFlowConfig(t, fmt.Sprintf(`observability:
   listen_addr: "127.0.0.1:0"
-gate_to_game:
-  listen_addr: "127.0.0.1:0"
+grpc:
+  server:
+    listen_addr: "127.0.0.1:0"
+  clients:
+    gate:
+      timeout: "2s"
+      fanout:
+        target: "dns:///gate-grpc-headless:9091"
+server_send:
+  broadcast:
+    primary: "redis"
 redis:
   addr: %q
   key_prefix: "metrics-flow"
-server_send:
-  request_timeout: "2s"
-  broadcast:
-    primary: "redis"
 `, miniRedis.Addr()))
 
 	gameAddress := make(chan string, 1)
@@ -63,20 +68,27 @@ server_send:
   listen_addr: "127.0.0.1:0"
 websocket:
   client_addr: "127.0.0.1:0"
-gate_to_game:
-  target: %q
+grpc:
+  server:
+    listen_addr: "127.0.0.1:0"
+  clients:
+    game:
+      target: %q
+      timeout: "2s"
+    gate:
+      timeout: "2s"
+      fanout:
+        target: "dns:///gate-grpc-headless:9091"
+  endpoint_registration:
+    ttl: "30s"
+session_ownership:
+  lease_ttl: "30s"
+server_send:
+  broadcast:
+    primary: "redis"
 redis:
   addr: %q
   key_prefix: "metrics-flow"
-server_send:
-  presence:
-    lease_ttl: "30s"
-  gate:
-    listen_addr: "127.0.0.1:0"
-    endpoint_ttl: "30s"
-    endpoint_refresh: "10s"
-  broadcast:
-    primary: "redis"
 `, gameAddr, miniRedis.Addr()))
 
 	gateAddress := make(chan string, 1)
@@ -106,6 +118,26 @@ server_send:
 	}
 	if err := flowRoundTrip(conn, protocol.EnterRoomRequestCommandID, &protocol.EnterRoomRequest{RoomId: "flow-room"}, protocol.EnterRoomResponseCommandID); err != nil {
 		t.Fatalf("enter-room flow: %v", err)
+	}
+	broadcastPayload := mustFlowMarshal(&protocol.EchoResponse{Payload: []byte("metrics-broadcast")})
+	broadcastCommand := &protocol.BroadcastRoomCommand{
+		RoomId:          "flow-room",
+		ClientCommandId: protocol.EchoResponseCommandID,
+		ClientPayload:   broadcastPayload,
+	}
+	if err := writeFlowPacket(conn, protocol.BroadcastRoomCommandID, 3, mustFlowMarshal(broadcastCommand)); err != nil {
+		t.Fatalf("write room broadcast: %v", err)
+	}
+	broadcastResponse, err := readFlowPacket(conn, protocol.EchoResponseCommandID)
+	if err != nil {
+		t.Fatalf("read room broadcast: %v", err)
+	}
+	var broadcastEcho protocol.EchoResponse
+	if err := proto.Unmarshal(broadcastResponse, &broadcastEcho); err != nil {
+		t.Fatalf("decode room broadcast: %v", err)
+	}
+	if string(broadcastEcho.GetPayload()) != "metrics-broadcast" {
+		t.Fatalf("room broadcast payload = %q, want metrics-broadcast", broadcastEcho.GetPayload())
 	}
 	echoPayload := []byte("metrics-flow")
 	echoRequest, err := proto.Marshal(&protocol.EchoRequest{Payload: echoPayload})
@@ -209,7 +241,7 @@ server_send:
 	}, 1)
 	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_commands_total", map[string]string{
 		"route": "game", "command": "forward", "result": "success",
-	}, 1)
+	}, 2)
 	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_commands_total", map[string]string{
 		"route": "game", "command": "forward", "result": "error",
 	}, 1)
@@ -219,10 +251,11 @@ server_send:
 	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_commands_total", map[string]string{
 		"route": "local", "command": strconv.FormatUint(uint64(protocol.LocalEchoRequestCommandID), 10), "result": "error",
 	}, 2)
-	assertCounterSample(t, gateRegisterer, "gaming_core_gate_game_grpc_requests_total", map[string]string{"code": "OK"}, 1)
+	assertCounterSample(t, gateRegisterer, "gaming_core_gate_game_grpc_requests_total", map[string]string{"code": "OK"}, 2)
 	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_writes_total", map[string]string{"source": "handler", "result": "success"}, 5)
-	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_writes_total", map[string]string{"source": "server_send", "result": "success"}, 1)
+	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_writes_total", map[string]string{"source": "server_send", "result": "success"}, 2)
 	assertHistogramSample(t, gateRegisterer, "gaming_core_gate_server_send_delivery_duration_seconds", map[string]string{"target": "connection", "result": "success"}, 1)
+	assertHistogramSample(t, gateRegisterer, "gaming_core_gate_server_send_delivery_duration_seconds", map[string]string{"target": "room", "result": "success"}, 1)
 	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_connection_closes_total", map[string]string{"reason": "login_required"}, 2)
 	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_connection_closes_total", map[string]string{"reason": "room_required"}, 2)
 	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_connection_closes_total", map[string]string{"reason": "client_closed"}, 1)
@@ -234,8 +267,12 @@ server_send:
 	assertGaugeZero(t, gateRegisterer, "gaming_core_gate_websocket_write_queue_messages")
 	assertGatheredFamily(t, gameRegisterer, "gaming_core_game_gate_commands_total")
 	assertGatheredFamily(t, gameRegisterer, "gaming_core_game_server_send_requests_total")
-	assertOnlyCounterSample(t, gameRegisterer, "gaming_core_game_gate_commands_total", map[string]string{
+	assertCounterSample(t, gameRegisterer, "gaming_core_game_gate_commands_total", map[string]string{
 		"command": strconv.FormatUint(uint64(protocol.EchoRequestCommandID), 10),
+		"result":  "success",
+	}, 1)
+	assertCounterSample(t, gameRegisterer, "gaming_core_game_gate_commands_total", map[string]string{
+		"command": strconv.FormatUint(uint64(protocol.BroadcastRoomCommandID), 10),
 		"result":  "success",
 	}, 1)
 	assertOnlyCounterSample(t, gameRegisterer, "gaming_core_game_server_send_requests_total", map[string]string{
@@ -247,7 +284,7 @@ server_send:
 
 func captureGameServer(address chan<- string) framework.Module {
 	return func(r framework.Registry) error {
-		return r.AddHook(func(server *gatelink.Server) framework.Hook {
+		return r.AddHook(func(server *grpcserver.Server) framework.Hook {
 			return framework.Hook{Name: "capture-flow-game-server", Phase: framework.PhaseIngress, OnStart: func(context.Context) error {
 				if value := server.Addr(); value != "" {
 					address <- value

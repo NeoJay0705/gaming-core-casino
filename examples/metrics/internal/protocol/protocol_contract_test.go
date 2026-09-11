@@ -18,6 +18,7 @@ func TestExampleCommandContractIDsAndDescriptors(t *testing.T) {
 		{name: "EchoResponse", got: EchoResponseCommandID, want: 0xF1000012},
 		{name: "LocalEchoRequest", got: LocalEchoRequestCommandID, want: 0xF1000021},
 		{name: "LocalEchoResponse", got: LocalEchoResponseCommandID, want: 0xF1000022},
+		{name: "BroadcastRoom", got: BroadcastRoomCommandID, want: 0xF1000031},
 	}
 	seen := make(map[uint32]struct{}, len(ids))
 	for _, item := range ids {
@@ -45,6 +46,7 @@ func TestExampleCommandContractIDsAndDescriptors(t *testing.T) {
 		{name: "EnterRoomResponse", message: (&EnterRoomResponse{}).ProtoReflect(), fullName: "metrics.example.v1.EnterRoomResponse", fieldName: "code", fieldKind: protoreflect.Uint32Kind},
 		{name: "EchoRequest", message: (&EchoRequest{}).ProtoReflect(), fullName: "metrics.example.v1.EchoRequest", fieldName: "payload", fieldKind: protoreflect.BytesKind},
 		{name: "EchoResponse", message: (&EchoResponse{}).ProtoReflect(), fullName: "metrics.example.v1.EchoResponse", fieldName: "payload", fieldKind: protoreflect.BytesKind},
+		{name: "BroadcastRoomCommand", message: (&BroadcastRoomCommand{}).ProtoReflect(), fullName: "metrics.example.v1.BroadcastRoomCommand", fieldName: "room_id", fieldKind: protoreflect.StringKind},
 	} {
 		t.Run(item.name, func(t *testing.T) {
 			descriptor := item.message.Descriptor()
@@ -59,5 +61,18 @@ func TestExampleCommandContractIDsAndDescriptors(t *testing.T) {
 				t.Fatalf("field 1 = name:%q kind:%v, want name:%q kind:%v", field.Name(), field.Kind(), item.fieldName, item.fieldKind)
 			}
 		})
+	}
+	if fields := (&BroadcastRoomCommand{}).ProtoReflect().Descriptor().Fields(); fields.Len() != 3 {
+		t.Fatalf("BroadcastRoomCommand field count = %d, want 3", fields.Len())
+	}
+	for name, number := range map[protoreflect.Name]protoreflect.FieldNumber{
+		"room_id":           1,
+		"client_command_id": 2,
+		"client_payload":    3,
+	} {
+		field := (&BroadcastRoomCommand{}).ProtoReflect().Descriptor().Fields().ByName(name)
+		if field == nil || field.Number() != number {
+			t.Fatalf("BroadcastRoomCommand.%s = %v, want field number %d", name, field, number)
+		}
 	}
 }

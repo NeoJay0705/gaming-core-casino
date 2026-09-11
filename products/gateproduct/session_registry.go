@@ -33,7 +33,7 @@ var (
 type LoginName = serversend.LoginName
 
 // RoomID identifies one caller-authorized local room membership.
-type RoomID = serversend.RoomID
+type RoomID string
 
 // SessionState is a read-only snapshot of the canonical connection state.
 type SessionState struct {
@@ -117,8 +117,9 @@ func newLocalSessionRegistry() *SessionRegistry {
 	}
 }
 
-// newSessionRegistry is used by Gate DI when server-send is enabled. A
-// presence owner and a positive lease duration must be configured together.
+// newSessionRegistry builds the registry used by direct unit tests and by the
+// distributed Gate constructor. Production Gate composition always supplies
+// a presence owner and a positive lease duration.
 func newSessionRegistry(presence sessionPresence, leaseTTL time.Duration) (*SessionRegistry, error) {
 	if presence == nil {
 		if leaseTTL > 0 {
@@ -290,28 +291,6 @@ func (r *SessionRegistry) sendToLoginNameAt(loginName LoginName, data []byte, re
 	r.mu.RUnlock()
 	if !exists {
 		return fmt.Errorf("%w: %q", ErrLoginSessionNotFound, loginName)
-	}
-	return sendOutbound(entry.session, outboundMessage{data: data, source: outboundSourceServerSend, receivedAt: receivedAt, target: target})
-}
-
-// SendToConnection sends one complete client wire packet to the exact local
-// connection that originated a request. When expectedLoginName is non-empty,
-// it must still be the authenticated owner of that connection; a reconnect
-// cannot receive a stale request response through its predecessor's route.
-func (r *SessionRegistry) SendToConnection(connectionID WebSocketConnectionID, expectedLoginName LoginName, data []byte) error {
-	return r.sendToConnectionAt(connectionID, expectedLoginName, data, time.Now(), serverSendTargetConnection)
-}
-
-func (r *SessionRegistry) sendToConnectionAt(connectionID WebSocketConnectionID, expectedLoginName LoginName, data []byte, receivedAt time.Time, target serverSendTarget) error {
-	r.mu.RLock()
-	loginName, exists := r.byConnection[connectionID]
-	entry := r.byLoginName[loginName]
-	r.mu.RUnlock()
-	if !exists || entry.connectionID != connectionID {
-		return fmt.Errorf("%w: connection %q", serversend.ErrTargetNotConnected, connectionID)
-	}
-	if expectedLoginName != "" && loginName != expectedLoginName {
-		return fmt.Errorf("%w: connection %q is not login %q", serversend.ErrTargetNotConnected, connectionID, expectedLoginName)
 	}
 	return sendOutbound(entry.session, outboundMessage{data: data, source: outboundSourceServerSend, receivedAt: receivedAt, target: target})
 }

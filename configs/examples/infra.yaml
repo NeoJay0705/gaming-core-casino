@@ -58,13 +58,3 @@ rocketmq:
   # namespace: ""
   # access_key: ""
   # secret_key: ""
-
-# 跨 Gate Server Send 的共用 transport 設定；Gate 與 Game 請一同載入本檔。
-server_send:
-  # 非必要：單一 payload 上限；gRPC 與 Redis subscriber 共用，預設 1 MiB。
-  # max_payload_bytes: 1048576
-
-  broadcast:
-    # 必填：一次部署只選一種 broadcast transport；redis 使用 Pub/Sub，
-    # grpc 直接對每個 Gate fan-out。
-    primary: redis

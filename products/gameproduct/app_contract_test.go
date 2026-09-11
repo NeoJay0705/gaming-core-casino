@@ -11,7 +11,7 @@ import (
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
-	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/grpcserver"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/observability"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -85,7 +85,7 @@ func TestProductModuleCanInjectPrometheusRegisterer(t *testing.T) {
 
 func TestNewAppProvidesSnapshotsToProductModule(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "app.yaml")
-	if err := os.WriteFile(path, []byte("observability:\n  listen_addr: 127.0.0.1:0\nproduct:\n  code: core-casino\ngate_to_game:\n  listen_addr: 127.0.0.1:0\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("observability:\n  listen_addr: 127.0.0.1:0\nproduct:\n  code: core-casino\ngrpc:\n  server:\n    listen_addr: 127.0.0.1:0\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var sourceCode, mergedCode string
@@ -151,7 +151,7 @@ func TestNewAppValidatesFileIntegrityManifest(t *testing.T) {
 			dir := t.TempDir()
 			mergedPath := filepath.Join(dir, "app.yaml")
 			sourcePath := filepath.Join(dir, "planner.yaml")
-			merged := []byte("observability:\n  listen_addr: 127.0.0.1:0\nfile_integrity:\n  version: 1\n  sources:\n    - source: planner\n      md5: \"" + test.digest + "\"\ngate_to_game:\n  listen_addr: 127.0.0.1:0\n")
+			merged := []byte("observability:\n  listen_addr: 127.0.0.1:0\nfile_integrity:\n  version: 1\n  sources:\n    - source: planner\n      md5: \"" + test.digest + "\"\ngrpc:\n  server:\n    listen_addr: 127.0.0.1:0\n")
 			if err := os.WriteFile(mergedPath, merged, 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -173,7 +173,7 @@ func TestNewAppValidatesFileIntegrityManifest(t *testing.T) {
 func testInputs(t *testing.T) config.ConfigInputs {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "app.yaml")
-	if err := os.WriteFile(path, []byte("observability:\n  listen_addr: 127.0.0.1:0\nproduct: {}\ngate_to_game:\n  listen_addr: 127.0.0.1:0\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("observability:\n  listen_addr: 127.0.0.1:0\nproduct: {}\ngrpc:\n  server:\n    listen_addr: 127.0.0.1:0\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return config.ConfigInputs{MergedPaths: []string{path}}
@@ -187,13 +187,13 @@ func (contractSnapshot) Bind(path string, target any, _ ...config.BindOption) er
 	if path == "observability" {
 		target.(*observability.Config).ListenAddr = "127.0.0.1:0"
 	}
-	if path == "gate_to_game" {
-		target.(*gatelink.ServerConfig).ListenAddr = "127.0.0.1:0"
+	if path == "grpc.server" {
+		target.(*grpcserver.Config).ListenAddr = "127.0.0.1:0"
 	}
 	return nil
 }
 func (contractSnapshot) Has(path string) bool {
-	return path == "gate_to_game" || path == "observability"
+	return path == "grpc.server" || path == "observability"
 }
 func (contractSnapshot) HasSource(string) bool                                      { return false }
 func (contractSnapshot) BindSource(string, string, any, ...config.BindOption) error { return nil }

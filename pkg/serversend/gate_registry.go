@@ -73,7 +73,10 @@ func (c EndpointRegistrarConfig) normalized() (EndpointRegistrarConfig, error) {
 	if c.TTL <= 0 {
 		return EndpointRegistrarConfig{}, fmt.Errorf("%w: endpoint ttl must be positive", ErrDestinationInvalid)
 	}
-	if c.Refresh <= 0 {
+	if c.Refresh < 0 {
+		return EndpointRegistrarConfig{}, fmt.Errorf("%w: endpoint refresh must not be negative", ErrDestinationInvalid)
+	}
+	if c.Refresh == 0 {
 		c.Refresh = c.TTL / 3
 	}
 	if c.Refresh <= 0 || c.Refresh >= c.TTL {

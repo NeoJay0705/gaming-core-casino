@@ -7,6 +7,11 @@ import (
 	"time"
 )
 
+// DefaultMaxPayloadBytes is the fixed logical payload contract shared by all
+// delivery boundaries. Transport-specific wire limits remain grpc-go's
+// responsibility and are intentionally separate.
+const DefaultMaxPayloadBytes = 1 << 20
+
 var (
 	// ErrMessageInvalid indicates a malformed client-facing message.
 	ErrMessageInvalid = errors.New("server send: message is invalid")
@@ -30,7 +35,7 @@ var (
 	// unavailable. Callers must decide explicitly whether a retry is safe.
 	ErrRouteStoreUnavailable = errors.New("server send: route store is unavailable")
 	// ErrTargetNotConnected indicates that a Gate does not currently own the
-	// requested local connection, player, or room.
+	// requested local player session.
 	ErrTargetNotConnected = errors.New("server send: target is not connected")
 	// ErrPayloadTooLarge indicates that a delivery payload exceeds the shared
 	// transport limit.
@@ -44,18 +49,14 @@ var (
 // this package does not trim, case-fold, or otherwise normalize it.
 type LoginName string
 
-// RoomID identifies a caller-authorized room audience. It is opaque for the
-// same reason as LoginName.
-type RoomID string
-
 // GateID identifies one running Gate instance.
 type GateID string
 
 // ConnectionID identifies one accepted player connection at a Gate.
 type ConnectionID string
 
-// Message is a client-facing command. Gate owns framing this command as a
-// WebSocket packet; callers only provide the opaque business payload.
+// Message 是 opaque command。Gate product handler 可將 business payload 編成
+// WebSocket packet；此 transport 不解讀任一欄位。
 type Message struct {
 	CommandID uint32
 	Payload   []byte
@@ -77,16 +78,6 @@ func (m Message) validatePayload(maxBytes int) error {
 		return fmt.Errorf("%w: %d bytes exceeds %d", ErrPayloadTooLarge, len(m.Payload), maxBytes)
 	}
 	return nil
-}
-
-func normalizedPayloadLimit(value int) (int, error) {
-	if value < 0 {
-		return 0, fmt.Errorf("%w: max payload bytes cannot be negative", ErrDestinationInvalid)
-	}
-	if value == 0 {
-		return DefaultMaxPayloadBytes, nil
-	}
-	return value, nil
 }
 
 func (m Message) clone() Message {
@@ -141,32 +132,6 @@ func (m RequestPlayerMessage) clone() RequestPlayerMessage {
 	return m
 }
 
-// BroadcastMessage targets the local members of one room at every Gate.
-type BroadcastMessage struct {
-	RoomID RoomID
-	Message
-}
-
-// Validate checks a room broadcast target and its message.
-func (m BroadcastMessage) Validate() error {
-	if m.RoomID == "" {
-		return fmt.Errorf("%w: room id is required", ErrDestinationInvalid)
-	}
-	return m.Message.Validate()
-}
-
-func (m BroadcastMessage) validatePayload(maxBytes int) error {
-	if err := m.Validate(); err != nil {
-		return err
-	}
-	return m.Message.validatePayload(maxBytes)
-}
-
-func (m BroadcastMessage) clone() BroadcastMessage {
-	m.Message = m.Message.clone()
-	return m
-}
-
 // Receipt records that the sender accepted a message for its documented
 // delivery path. For RequestPlayerSender, it means the message was accepted
 // into the current Gate-to-Game unary response; it does not mean Gate queued or
@@ -182,15 +147,15 @@ type RequestPlayerSender interface {
 	SendToRequestPlayer(context.Context, RequestPlayerMessage) (Receipt, error)
 }
 
-// PlayerSender sends to the Gate that currently owns a player. Route lookup
-// failures are returned; this API never turns a private message into a
-// broadcast.
+// PlayerSender sends to the Gate that currently owns a player. If the exact
+// route fails, its configured bounded all-Gate fallback checks each local
+// owner; this API never turns a private message into a room broadcast.
 type PlayerSender interface {
 	SendToPlayer(context.Context, PlayerMessage) (Receipt, error)
 }
 
-// BroadcastSender sends a room message to every Gate through one explicitly
-// selected transport.
+// BroadcastSender 透過明確選用的 transport 將一筆 opaque command 傳給所有
+// Gate。command 的業務語意與 target 由已註冊的 Gate handler 擁有，而非本 package。
 type BroadcastSender interface {
-	Broadcast(context.Context, BroadcastMessage) (Receipt, error)
+	Broadcast(context.Context, Message) (Receipt, error)
 }

@@ -121,7 +121,7 @@ func TestKeyspaceContractUsesOnePrefixAndOpaqueComponents(t *testing.T) {
 	if keys.Prefix() != "core-casino:server-send" {
 		t.Fatalf("prefix = %q, want core-casino:server-send", keys.Prefix())
 	}
-	for _, key := range []string{keys.presence("alice:one"), keys.gateEndpoint("gate/a"), keys.roomChannel("room a")} {
+	for _, key := range []string{keys.presence("alice:one"), keys.gateEndpoint("gate/a"), keys.broadcastChannel()} {
 		if len(key) == 0 || key[:len("core-casino:server-send:")] != "core-casino:server-send:" {
 			t.Fatalf("key = %q, want shared prefix", key)
 		}

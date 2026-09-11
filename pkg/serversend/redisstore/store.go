@@ -77,4 +77,4 @@ func (s *Store) Publish(ctx context.Context, channel string, message any) *clien
 
 var _ serversend.PresenceStore = (*Store)(nil)
 var _ serversend.GateEndpointStore = (*Store)(nil)
-var _ serversend.RoomPublisher = (*Store)(nil)
+var _ serversend.BroadcastPublisher = (*Store)(nil)

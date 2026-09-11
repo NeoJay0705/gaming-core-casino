@@ -2,6 +2,8 @@ package gameproduct
 
 import (
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/infra/redis"
@@ -10,26 +12,82 @@ import (
 	"go.uber.org/dig"
 )
 
-func gameServerSendConfig(snapshot config.SourceSnapshot) (serversend.Config, bool, error) {
+type gameGRPCGateClientConfig struct {
+	Timeout time.Duration    `config:"timeout" yaml:"timeout"`
+	Fanout  gameFanoutConfig `config:"fanout" yaml:"fanout"`
+}
+
+type gameFanoutConfig struct {
+	Target       string `config:"target" yaml:"target"`
+	MaxEndpoints int    `config:"max_endpoints" yaml:"max_endpoints"`
+}
+
+type gameServerSendBroadcastConfig struct {
+	Primary string `config:"primary" yaml:"primary"`
+}
+
+type gameServerSendConfig struct {
+	Broadcast gameServerSendBroadcastConfig `config:"broadcast" yaml:"broadcast"`
+}
+
+func gameGRPCGateClient(snapshot config.SourceSnapshot) (serversend.TransportConfig, gameFanoutConfig, bool, error) {
 	if snapshot == nil {
-		return serversend.Config{}, false, fmt.Errorf("game server send: config snapshot is nil")
+		return serversend.TransportConfig{}, gameFanoutConfig{}, false, fmt.Errorf("game gRPC: config snapshot is nil")
+	}
+	var cfg gameGRPCGateClientConfig
+	if !snapshot.Has("grpc.clients.gate") {
+		return serversend.TransportConfig{}, gameFanoutConfig{}, false, nil
+	}
+	if err := snapshot.Bind("grpc.clients.gate", &cfg, config.Strict()); err != nil {
+		return serversend.TransportConfig{}, gameFanoutConfig{}, false, fmt.Errorf("game gRPC: bind grpc.clients.gate: %w", err)
+	}
+	if cfg.Timeout < 0 {
+		return serversend.TransportConfig{}, gameFanoutConfig{}, false, fmt.Errorf("game gRPC: gate client timeout must not be negative")
+	}
+	cfg.Fanout.Target = strings.TrimSpace(cfg.Fanout.Target)
+	if cfg.Fanout.Target == "" {
+		return serversend.TransportConfig{}, gameFanoutConfig{}, false, fmt.Errorf("game gRPC: grpc.clients.gate.fanout.target is required")
+	}
+	if cfg.Fanout.MaxEndpoints < 0 {
+		return serversend.TransportConfig{}, gameFanoutConfig{}, false, fmt.Errorf("game gRPC: grpc.clients.gate.fanout.max_endpoints cannot be negative")
+	}
+	if _, err := serversend.NewDNSGateDirectory(cfg.Fanout.Target, nil); err != nil {
+		return serversend.TransportConfig{}, gameFanoutConfig{}, false, fmt.Errorf("game gRPC: validate grpc.clients.gate.fanout.target: %w", err)
+	}
+	return serversend.TransportConfig{RequestTimeout: cfg.Timeout}, cfg.Fanout, true, nil
+}
+
+func gameServerSendBroadcast(snapshot config.SourceSnapshot) (gameServerSendBroadcastConfig, bool, error) {
+	if snapshot == nil {
+		return gameServerSendBroadcastConfig{}, false, fmt.Errorf("game broadcast: config snapshot is nil")
+	}
+	defaultConfig := gameServerSendBroadcastConfig{Primary: "redis"}
+	if snapshot.Has("room_broadcast") {
+		return gameServerSendBroadcastConfig{}, false, fmt.Errorf("game broadcast: legacy room_broadcast key is unsupported; use server_send.broadcast")
 	}
 	if !snapshot.Has("server_send") {
-		return serversend.Config{}, false, nil
+		return defaultConfig, false, nil
 	}
-	var cfg serversend.Config
-	if err := snapshot.Bind("server_send", &cfg, config.Strict()); err != nil {
-		return serversend.Config{}, false, fmt.Errorf("game server send: bind config: %w", err)
+	if !snapshot.Has("server_send.broadcast") {
+		return gameServerSendBroadcastConfig{}, false, fmt.Errorf("game broadcast: server_send.broadcast is required")
 	}
-	var err error
-	if cfg, err = cfg.NormalizeForGame(); err != nil {
-		return serversend.Config{}, false, fmt.Errorf("game server send: validate config: %w", err)
+	var root gameServerSendConfig
+	if err := snapshot.Bind("server_send", &root, config.Strict()); err != nil {
+		return gameServerSendBroadcastConfig{}, false, fmt.Errorf("game broadcast: bind server_send: %w", err)
+	}
+	cfg := root.Broadcast
+	cfg.Primary = strings.ToLower(strings.TrimSpace(cfg.Primary))
+	if cfg.Primary == "" {
+		cfg.Primary = "redis"
+	}
+	if cfg.Primary != "redis" && cfg.Primary != "grpc" {
+		return gameServerSendBroadcastConfig{}, false, fmt.Errorf("game broadcast: primary %q is invalid", cfg.Primary)
 	}
 	return cfg, true, nil
 }
 
-func newGameServerSendTransport(cfg serversend.Config) (*serversend.GRPCTransport, error) {
-	return serversend.NewGRPCTransport(serversend.TransportConfig{RequestTimeout: cfg.RequestTimeout, MaxPayloadBytes: cfg.MaxPayloadBytes})
+func newGameServerSendTransport(cfg serversend.TransportConfig) (*serversend.GRPCTransport, error) {
+	return serversend.NewGRPCTransport(cfg)
 }
 
 func newGameServerSendKeyspace(prefix redis.KeyPrefix) (serversend.Keyspace, error) {
@@ -44,16 +102,16 @@ func newGameGateDirectory(redisClient *redis.Client, keys serversend.Keyspace) (
 	return serversend.NewRedisGateDirectory(redisstore.New(redisClient), keys)
 }
 
-func newGameFanoutSender(cfg serversend.Config, transport *serversend.GRPCTransport) (*serversend.FanoutSender, error) {
-	directory, err := serversend.NewDNSGateDirectory(cfg.Fanout.GRPCTarget, nil)
+func newGameFanoutSender(cfg gameFanoutConfig, transport *serversend.GRPCTransport) (*serversend.FanoutSender, error) {
+	directory, err := serversend.NewDNSGateDirectory(cfg.Target, nil)
 	if err != nil {
 		return nil, err
 	}
-	return serversend.NewFanoutSender(directory, transport, serversend.FanoutConfig{MaxEndpoints: cfg.Fanout.MaxEndpoints})
+	return serversend.NewFanoutSender(directory, transport, serversend.FanoutConfig{MaxEndpoints: cfg.MaxEndpoints})
 }
 
-func newGameRequestPlayerSender(cfg serversend.Config, metrics *gameMetrics) (serversend.RequestPlayerSender, error) {
-	sender, err := serversend.NewDirectRequestPlayerSender(cfg.MaxPayloadBytes)
+func newGameRequestPlayerSender(metrics *gameMetrics) (serversend.RequestPlayerSender, error) {
+	sender, err := serversend.NewDirectRequestPlayerSender()
 	if err != nil {
 		return nil, err
 	}
@@ -63,55 +121,44 @@ func newGameRequestPlayerSender(cfg serversend.Config, metrics *gameMetrics) (se
 type gamePlayerSenderInputs struct {
 	dig.In
 
-	Config    serversend.Config
 	Presence  *serversend.RedisPresenceResolver
 	Directory *serversend.RedisGateDirectory
 	Transport *serversend.GRPCTransport
-	Fanout    *serversend.FanoutSender `optional:"true"`
+	Fallback  *serversend.FanoutSender `optional:"true"`
 }
 
 func newGamePlayerSender(inputs gamePlayerSenderInputs) (serversend.PlayerSender, error) {
-	var fallback *serversend.FanoutSender
-	if inputs.Config.Player.Fallback == "grpc" {
-		if inputs.Fanout == nil {
-			return nil, fmt.Errorf("game server send: gRPC player fallback is not configured")
-		}
-		fallback = inputs.Fanout
-	}
-	return serversend.NewRoutedPlayerSender(inputs.Presence, inputs.Directory, inputs.Transport, fallback)
+	return serversend.NewRoutedPlayerSender(inputs.Presence, inputs.Directory, inputs.Transport, inputs.Fallback)
 }
 
-func newGameRedisBroadcastSender(cfg serversend.Config, redisClient *redis.Client, keys serversend.Keyspace) (*serversend.RedisBroadcastSender, error) {
-	return serversend.NewRedisBroadcastSender(redisstore.New(redisClient), keys, serversend.RedisBroadcastConfig{MaxPayloadBytes: cfg.MaxPayloadBytes})
+func newGameRedisBroadcastSender(redisClient *redis.Client, keys serversend.Keyspace) (*serversend.RedisBroadcastSender, error) {
+	return serversend.NewRedisBroadcastSender(redisstore.New(redisClient), keys)
 }
 
 type gameBroadcastSenderInputs struct {
 	dig.In
 
-	Config serversend.Config
+	Config gameServerSendBroadcastConfig
 	Redis  *serversend.RedisBroadcastSender `optional:"true"`
 	Fanout *serversend.FanoutSender         `optional:"true"`
 }
 
 func newGameBroadcastSender(inputs gameBroadcastSenderInputs) (serversend.BroadcastSender, error) {
-	switch inputs.Config.Broadcast.Primary {
+	switch inputs.Config.Primary {
 	case "redis":
 		if inputs.Redis == nil {
-			return nil, fmt.Errorf("game server send: Redis broadcast sender is not configured")
+			return nil, fmt.Errorf("game broadcast: Redis sender is not configured")
 		}
-		if inputs.Config.Broadcast.Fallback == "grpc" {
-			if inputs.Fanout == nil {
-				return nil, fmt.Errorf("game server send: gRPC broadcast fallback is not configured")
-			}
-			return serversend.NewFallbackBroadcastSender(inputs.Redis, inputs.Fanout, serversend.BroadcastFallbackConfig{MaxPayloadBytes: inputs.Config.MaxPayloadBytes})
+		if inputs.Fanout == nil {
+			return nil, fmt.Errorf("game broadcast: gRPC fan-out sender is not configured")
 		}
-		return inputs.Redis, nil
+		return serversend.NewFallbackBroadcastSender(inputs.Redis, inputs.Fanout)
 	case "grpc":
 		if inputs.Fanout == nil {
-			return nil, fmt.Errorf("game server send: gRPC broadcast sender is not configured")
+			return nil, fmt.Errorf("game broadcast: gRPC fan-out sender is not configured")
 		}
 		return inputs.Fanout, nil
 	default:
-		return nil, fmt.Errorf("game server send: unsupported broadcast primary %q", inputs.Config.Broadcast.Primary)
+		return nil, fmt.Errorf("game broadcast: unsupported primary %q", inputs.Config.Primary)
 	}
 }

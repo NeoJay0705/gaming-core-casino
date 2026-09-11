@@ -5,173 +5,265 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
-	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/grpcserver"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/infra/redis"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend/redisstore"
+	"go.uber.org/dig"
 )
 
-// gateServerSendRuntime owns the Gate-side Game-to-Gate listener, endpoint
-// registration, and Redis room broadcast subscription as one lifecycle unit.
-type gateServerSendRuntime struct {
-	receiver      *serversend.ReceiverServer
-	local         *gateServerSendReceiver
-	store         *redisstore.Store
-	keys          serversend.Keyspace
-	gateID        serversend.GateID
-	replyEndpoint string
-	config        serversend.Config
-
-	mu         sync.RWMutex
-	registrar  *serversend.EndpointRegistrar
-	subscriber *serversend.RedisBroadcastSubscriber
-	started    bool
+type gateServerSendBroadcastConfig struct {
+	Primary string `config:"primary" yaml:"primary"`
 }
 
-func gateServerSendConfig(snapshot config.SourceSnapshot) (serversend.Config, bool, error) {
+type gateServerSendConfig struct {
+	Broadcast gateServerSendBroadcastConfig `config:"broadcast" yaml:"broadcast"`
+}
+
+// gateIdentity is process-scoped Gate identity shared by session ownership
+// and endpoint registration. It is deliberately independent from delivery
+// service configuration.
+type gateIdentity = serversend.RuntimeGateIdentity
+
+func newGateIdentity() (gateIdentity, error) {
+	return serversend.NewRuntimeGateIdentity()
+}
+
+func gateSessionOwnershipConfig(snapshot config.SourceSnapshot) (serversend.PresenceConfig, error) {
 	if snapshot == nil {
-		return serversend.Config{}, false, fmt.Errorf("gate server send: config snapshot is nil")
+		return serversend.PresenceConfig{}, fmt.Errorf("gate ownership: config snapshot is nil")
+	}
+	if !snapshot.Has("session_ownership") {
+		return serversend.PresenceConfig{}, fmt.Errorf("gate ownership: session_ownership is required")
+	}
+	var cfg serversend.PresenceConfig
+	if err := snapshot.Bind("session_ownership", &cfg, config.Strict()); err != nil {
+		return serversend.PresenceConfig{}, fmt.Errorf("gate ownership: bind session_ownership: %w", err)
+	}
+	if cfg.LeaseTTL <= 0 {
+		return serversend.PresenceConfig{}, fmt.Errorf("gate ownership: lease_ttl must be positive")
+	}
+	return cfg, nil
+}
+
+func gateServerSendBroadcast(snapshot config.SourceSnapshot) (gateServerSendBroadcastConfig, bool, error) {
+	if snapshot == nil {
+		return gateServerSendBroadcastConfig{}, false, fmt.Errorf("gate broadcast: config snapshot is nil")
+	}
+	defaultConfig := gateServerSendBroadcastConfig{Primary: "redis"}
+	if snapshot.Has("room_broadcast") {
+		return gateServerSendBroadcastConfig{}, false, fmt.Errorf("gate broadcast: legacy room_broadcast key is unsupported; use server_send.broadcast")
 	}
 	if !snapshot.Has("server_send") {
-		return serversend.Config{}, false, nil
+		return defaultConfig, false, nil
 	}
-	var cfg serversend.Config
-	if err := snapshot.Bind("server_send", &cfg, config.Strict()); err != nil {
-		return serversend.Config{}, false, fmt.Errorf("gate server send: bind config: %w", err)
+	if !snapshot.Has("server_send.broadcast") {
+		return gateServerSendBroadcastConfig{}, false, fmt.Errorf("gate broadcast: server_send.broadcast is required")
 	}
-	normalized, err := cfg.NormalizeForGate()
-	if err != nil {
-		return serversend.Config{}, false, fmt.Errorf("gate server send: validate config: %w", err)
+	var root gateServerSendConfig
+	if err := snapshot.Bind("server_send", &root, config.Strict()); err != nil {
+		return gateServerSendBroadcastConfig{}, false, fmt.Errorf("gate broadcast: bind server_send: %w", err)
 	}
-	return normalized, true, nil
+	cfg := root.Broadcast
+	cfg.Primary = strings.ToLower(strings.TrimSpace(cfg.Primary))
+	if cfg.Primary == "" {
+		cfg.Primary = "redis"
+	}
+	if cfg.Primary != "redis" && cfg.Primary != "grpc" {
+		return gateServerSendBroadcastConfig{}, false, fmt.Errorf("gate broadcast: primary %q is invalid", cfg.Primary)
+	}
+	return cfg, true, nil
 }
 
-func newGateServerSendRuntime(identity serversend.RuntimeGateIdentity, cfg serversend.Config, sessions *SessionRegistry, redisClient *redis.Client, keys serversend.Keyspace, metrics *gateMetrics) (*gateServerSendRuntime, error) {
+func newGatePresenceRegistry(identity gateIdentity, cfg serversend.PresenceConfig, redisClient *redis.Client, keys serversend.Keyspace) (*serversend.GatePresenceRegistry, error) {
 	if identity.GateID == "" {
-		return nil, fmt.Errorf("gate server send: runtime Gate identity is required")
+		return nil, fmt.Errorf("gate ownership: runtime Gate identity is required")
 	}
-	local, err := newGateServerSendReceiver(sessions, metrics)
-	if err != nil {
-		return nil, err
-	}
-	receiver, err := serversend.NewReceiverServer(serversend.ReceiverConfig{ListenAddr: cfg.Gate.ListenAddr, MaxPayloadBytes: cfg.MaxPayloadBytes}, local)
-	if err != nil {
-		return nil, err
-	}
-	return &gateServerSendRuntime{receiver: receiver, local: local, store: redisstore.New(redisClient), keys: keys, gateID: identity.GateID, config: cfg}, nil
-}
-
-func (r *gateServerSendRuntime) Start(ctx context.Context) error {
-	if r == nil {
-		return errors.New("gate server send: runtime is nil")
-	}
-	if err := r.receiver.Start(ctx); err != nil {
-		return err
-	}
-	address, err := net.ResolveTCPAddr("tcp", r.receiver.Addr())
-	if err != nil {
-		_ = r.receiver.Stop(context.Background())
-		return fmt.Errorf("gate server send: resolve listener address: %w", err)
-	}
-	advertiseAddress, err := serversend.ResolveAdvertiseEndpoint(address)
-	if err != nil {
-		_ = r.receiver.Stop(context.Background())
-		return err
-	}
-	registrar, err := serversend.NewEndpointRegistrar(r.store, r.keys, serversend.GateEndpoint{GateID: r.gateID, Address: advertiseAddress}, serversend.EndpointRegistrarConfig{TTL: r.config.Gate.EndpointTTL, Refresh: r.config.Gate.EndpointRefresh})
-	if err != nil {
-		_ = r.receiver.Stop(context.Background())
-		return err
-	}
-	if err := registrar.Start(ctx); err != nil {
-		_ = r.receiver.Stop(context.Background())
-		return err
-	}
-	var subscriber *serversend.RedisBroadcastSubscriber
-	if r.config.Broadcast.Primary == "redis" {
-		rawRedis, err := r.store.Client()
-		if err != nil {
-			_ = registrar.Stop(context.Background())
-			_ = r.receiver.Stop(context.Background())
-			return fmt.Errorf("gate server send: get Redis client for room subscription: %w", err)
-		}
-		subscriber, err = serversend.NewRedisBroadcastSubscriber(rawRedis, r.keys, r.local, serversend.RedisSubscriberConfig{MaxPayloadBytes: r.config.MaxPayloadBytes})
-		if err != nil {
-			_ = registrar.Stop(context.Background())
-			_ = r.receiver.Stop(context.Background())
-			return err
-		}
-		if err := subscriber.Start(ctx); err != nil {
-			_ = registrar.Stop(context.Background())
-			_ = r.receiver.Stop(context.Background())
-			return err
-		}
-	}
-	r.mu.Lock()
-	r.registrar, r.subscriber, r.replyEndpoint, r.started = registrar, subscriber, advertiseAddress, true
-	r.mu.Unlock()
-	return nil
-}
-
-func (r *gateServerSendRuntime) Stop(ctx context.Context) error {
-	if r == nil {
-		return nil
-	}
-	r.mu.Lock()
-	registrar, subscriber := r.registrar, r.subscriber
-	r.registrar, r.subscriber, r.replyEndpoint, r.started = nil, nil, "", false
-	r.mu.Unlock()
-	var errs []error
-	if subscriber != nil {
-		if err := subscriber.Stop(ctx); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if registrar != nil {
-		if err := registrar.Stop(ctx); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if err := r.receiver.Stop(ctx); err != nil {
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
-}
-
-// Route returns the current Gate identity and legacy reverse server-send
-// endpoint injected into Gate-to-Game metadata. Both values come from the
-// managed server-send listener and are unavailable before it starts or after
-// it stops. The request-player unary reply path does not use this route.
-func (r *gateServerSendRuntime) Route() gatelink.RequestSource {
-	if r == nil {
-		return gatelink.RequestSource{}
-	}
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if !r.started {
-		return gatelink.RequestSource{}
-	}
-	return gatelink.RequestSource{GateID: string(r.gateID), ReplyEndpoint: r.replyEndpoint}
-}
-
-func newGatePresenceRegistry(identity serversend.RuntimeGateIdentity, cfg serversend.Config, redisClient *redis.Client, keys serversend.Keyspace) (*serversend.GatePresenceRegistry, error) {
-	if identity.GateID == "" {
-		return nil, fmt.Errorf("gate server send: runtime Gate identity is required")
-	}
-	presence, err := serversend.NewPresenceRegistry(redisstore.New(redisClient), keys, cfg.Presence)
+	presence, err := serversend.NewPresenceRegistry(redisstore.New(redisClient), keys, cfg)
 	if err != nil {
 		return nil, err
 	}
 	return serversend.NewGatePresenceRegistry(presence, identity.GateID)
 }
 
-func newGateSessionRegistry(presence *serversend.GatePresenceRegistry, cfg serversend.Config) (*SessionRegistry, error) {
-	return newSessionRegistry(presence, cfg.Presence.LeaseTTL)
+func newGateSessionRegistry(presence *serversend.GatePresenceRegistry, cfg serversend.PresenceConfig) (*SessionRegistry, error) {
+	return newSessionRegistry(presence, cfg.LeaseTTL)
 }
 
 func newServerSendKeyspace(prefix redis.KeyPrefix) (serversend.Keyspace, error) {
 	return serversend.NewKeyspace(prefix)
+}
+
+func newGateServerSendTransport(cfg serversend.TransportConfig) (*serversend.GRPCTransport, error) {
+	return serversend.NewGRPCTransport(cfg)
+}
+
+func newGateFanoutSender(cfg gateFanoutConfig, transport *serversend.GRPCTransport) (*serversend.FanoutSender, error) {
+	directory, err := serversend.NewDNSGateDirectory(cfg.Target, nil)
+	if err != nil {
+		return nil, err
+	}
+	return serversend.NewFanoutSender(directory, transport, serversend.FanoutConfig{MaxEndpoints: cfg.MaxEndpoints})
+}
+
+func newGateRedisBroadcastSender(redisClient *redis.Client, keys serversend.Keyspace) (*serversend.RedisBroadcastSender, error) {
+	return serversend.NewRedisBroadcastSender(redisstore.New(redisClient), keys)
+}
+
+type gateBroadcastSenderInputs struct {
+	dig.In
+
+	Config gateServerSendBroadcastConfig
+	Redis  *serversend.RedisBroadcastSender `optional:"true"`
+	Fanout *serversend.FanoutSender         `optional:"true"`
+}
+
+func newGateBroadcastSender(inputs gateBroadcastSenderInputs) (serversend.BroadcastSender, error) {
+	if inputs.Fanout == nil {
+		return nil, fmt.Errorf("gate broadcast: gRPC fan-out sender is not configured")
+	}
+	switch inputs.Config.Primary {
+	case "redis":
+		if inputs.Redis == nil {
+			return nil, fmt.Errorf("gate broadcast: Redis sender is not configured")
+		}
+		return serversend.NewFallbackBroadcastSender(inputs.Redis, inputs.Fanout)
+	case "grpc":
+		return inputs.Fanout, nil
+	default:
+		return nil, fmt.Errorf("gate broadcast: unsupported primary %q", inputs.Config.Primary)
+	}
+}
+
+// gateGRPCEndpointRegistration publishes the address of the product-level
+// Gate gRPC server. It does not own or register a particular business service.
+type gateGRPCEndpointRegistration struct {
+	server *grpcserver.Server
+	store  *redisstore.Store
+	keys   serversend.Keyspace
+	gateID serversend.GateID
+	config serversend.EndpointRegistrarConfig
+
+	mu        sync.Mutex
+	registrar *serversend.EndpointRegistrar
+}
+
+func newGateGRPCEndpointRegistration(server *grpcserver.Server, identity gateIdentity, cfg serversend.EndpointRegistrarConfig, redisClient *redis.Client, keys serversend.Keyspace) (*gateGRPCEndpointRegistration, error) {
+	if server == nil {
+		return nil, fmt.Errorf("gate gRPC endpoint: server is required")
+	}
+	if identity.GateID == "" {
+		return nil, fmt.Errorf("gate gRPC endpoint: runtime Gate identity is required")
+	}
+	if redisClient == nil {
+		return nil, fmt.Errorf("gate gRPC endpoint: Redis client is required")
+	}
+	if keys.Prefix() == "" {
+		return nil, fmt.Errorf("gate gRPC endpoint: keyspace is required")
+	}
+	return &gateGRPCEndpointRegistration{server: server, store: redisstore.New(redisClient), keys: keys, gateID: identity.GateID, config: cfg}, nil
+}
+
+func (r *gateGRPCEndpointRegistration) Start(ctx context.Context) error {
+	if r == nil {
+		return errors.New("gate gRPC endpoint: registration is nil")
+	}
+	address := r.server.Addr()
+	if address == "" {
+		return errors.New("gate gRPC endpoint: gRPC server is not started")
+	}
+	listenerAddress, err := net.ResolveTCPAddr("tcp", address)
+	if err != nil {
+		return fmt.Errorf("gate gRPC endpoint: resolve listener address: %w", err)
+	}
+	advertiseAddress, err := serversend.ResolveAdvertiseEndpoint(listenerAddress)
+	if err != nil {
+		return err
+	}
+	registrar, err := serversend.NewEndpointRegistrar(r.store, r.keys, serversend.GateEndpoint{GateID: r.gateID, Address: advertiseAddress}, r.config)
+	if err != nil {
+		return err
+	}
+	if err := registrar.Start(ctx); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.registrar = registrar
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *gateGRPCEndpointRegistration) Stop(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	registrar := r.registrar
+	r.registrar = nil
+	r.mu.Unlock()
+	if registrar == nil {
+		return nil
+	}
+	return registrar.Stop(ctx)
+}
+
+// gateServerSendBroadcastRuntime 只擁有 optional Redis broadcast subscriber；
+// GateDelivery gRPC service 與 endpoint registration 各自維持獨立 lifecycle。
+type gateServerSendBroadcastRuntime struct {
+	dispatcher *dispatcher.Dispatcher
+	store      *redisstore.Store
+	keys       serversend.Keyspace
+
+	mu         sync.Mutex
+	subscriber *serversend.RedisBroadcastSubscriber
+}
+
+func newGateServerSendBroadcastRuntime(cfg gateServerSendBroadcastConfig, commandDispatcher *dispatcher.Dispatcher, redisClient *redis.Client, keys serversend.Keyspace) (*gateServerSendBroadcastRuntime, error) {
+	if cfg.Primary != "redis" {
+		return nil, fmt.Errorf("gate broadcast: runtime requires redis primary")
+	}
+	if commandDispatcher == nil || redisClient == nil || keys.Prefix() == "" {
+		return nil, fmt.Errorf("gate broadcast: dependencies are required")
+	}
+	return &gateServerSendBroadcastRuntime{dispatcher: commandDispatcher, store: redisstore.New(redisClient), keys: keys}, nil
+}
+
+func (r *gateServerSendBroadcastRuntime) Start(ctx context.Context) error {
+	if r == nil {
+		return errors.New("gate broadcast: runtime is nil")
+	}
+	rawRedis, err := r.store.Client()
+	if err != nil {
+		return fmt.Errorf("gate broadcast: get Redis client: %w", err)
+	}
+	subscriber, err := serversend.NewRedisBroadcastSubscriber(rawRedis, r.keys, r.dispatcher)
+	if err != nil {
+		return err
+	}
+	if err := subscriber.Start(ctx); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.subscriber = subscriber
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *gateServerSendBroadcastRuntime) Stop(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	subscriber := r.subscriber
+	r.subscriber = nil
+	r.mu.Unlock()
+	if subscriber == nil {
+		return nil
+	}
+	return subscriber.Stop(ctx)
 }

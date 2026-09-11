@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package metrics.example.v1;
+
+option go_package = "github.com/NeoJay0705/gaming-core-casino/examples/metrics/internal/protocol;protocol";
+
+// BroadcastRoomCommand 是範例層的 room routing envelope。framework transport
+// 只傳遞此 message 的 opaque bytes；client_payload 不在 Gate 解碼。
+message BroadcastRoomCommand {
+  string room_id = 1;
+  uint32 client_command_id = 2;
+  bytes client_payload = 3;
+}

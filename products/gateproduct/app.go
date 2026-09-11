@@ -10,6 +10,7 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/grpcserver"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/infra"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/observability"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
@@ -41,8 +42,9 @@ func (a *App) Run(ctx context.Context) error {
 	return a.frameworkApp.Run(ctx)
 }
 
-// moduleWithSnapshot deliberately stops at the configuration/lifecycle
-// contract. Gate business providers, transports, and handlers are not moved.
+// moduleWithSnapshot wires shared infrastructure, distributed ownership,
+// delivery lifecycles, and the generic Gate gRPC ingress; business handlers
+// remain product modules.
 func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 	return func(r framework.Registry) error {
 		if snapshot == nil || framework.IsNilDependency(snapshot) {
@@ -60,12 +62,31 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 		if err := r.Provide(newGateMetrics); err != nil {
 			return err
 		}
-		grpcConfig, err := gateGameGRPCConfig(snapshot)
+		serverConfig, err := gateGRPCServerConfig(snapshot)
 		if err != nil {
 			return err
 		}
-		if err := r.Provide(func() gatelink.ClientConfig { return grpcConfig }); err != nil {
+		if err := r.Provide(func() grpcserver.Config { return serverConfig }); err != nil {
 			return err
+		}
+		clientConfig, err := gateGameGRPCConfig(snapshot)
+		if err != nil {
+			return err
+		}
+		if err := r.Provide(func() gatelink.ClientConfig { return clientConfig }); err != nil {
+			return err
+		}
+		gateTransportConfig, gateFanout, gateClientEnabled, err := gateGateGRPCClient(snapshot)
+		if err != nil {
+			return err
+		}
+		broadcastConfig, broadcastConfigured, err := gateServerSendBroadcast(snapshot)
+		if err != nil {
+			return err
+		}
+		broadcastEnabled := broadcastConfigured
+		if broadcastEnabled && !gateClientEnabled {
+			return fmt.Errorf("gate broadcast: grpc.clients.gate is required")
 		}
 		if err := dispatcher.Module(r); err != nil {
 			return err
@@ -73,31 +94,84 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 		if err := infra.Module(r); err != nil {
 			return err
 		}
-		serverSendConfig, serverSendEnabled, err := gateServerSendConfig(snapshot)
+		ownershipConfig, err := gateSessionOwnershipConfig(snapshot)
 		if err != nil {
 			return err
 		}
-		if serverSendEnabled {
-			if err := r.Provide(func() serversend.Config { return serverSendConfig }); err != nil {
-				return err
-			}
-			if err := r.Provide(newServerSendKeyspace); err != nil {
-				return err
-			}
-			if err := r.Provide(serversend.NewRuntimeGateIdentity); err != nil {
-				return err
-			}
-			if err := r.Provide(newGatePresenceRegistry); err != nil {
-				return err
-			}
-			if err := r.Provide(newGateSessionRegistry); err != nil {
-				return err
-			}
-			if err := r.ProvideManaged("gate-server-send", framework.PhaseIngress, newGateServerSendRuntime); err != nil {
-				return err
-			}
-		} else if err := r.Provide(NewSessionRegistry); err != nil {
+		if err := r.Provide(func() serversend.PresenceConfig { return ownershipConfig }); err != nil {
 			return err
+		}
+		if err := r.Provide(newServerSendKeyspace); err != nil {
+			return err
+		}
+		if err := r.Provide(newGateIdentity); err != nil {
+			return err
+		}
+		if err := r.Provide(newGatePresenceRegistry); err != nil {
+			return err
+		}
+		if err := r.Provide(newGateSessionRegistry); err != nil {
+			return err
+		}
+		if err := r.Provide(newGateDeliveryReceiver); err != nil {
+			return err
+		}
+		if err := r.Provide(newGateDeliveryService); err != nil {
+			return err
+		}
+		if err := r.ProvideManaged("gate-grpc-server", framework.PhaseIngress, newGateGRPCServer); err != nil {
+			return err
+		}
+		if err := r.Configure(registerGateDeliveryService); err != nil {
+			return err
+		}
+		endpointConfig, err := gateGRPCServerEndpointRegistration(snapshot)
+		if err != nil {
+			return err
+		}
+		if err := r.Provide(func() serversend.EndpointRegistrarConfig { return endpointConfig }); err != nil {
+			return err
+		}
+		if err := r.ProvideManaged("gate-grpc-endpoint-registration", framework.PhaseIngress, newGateGRPCEndpointRegistration); err != nil {
+			return err
+		}
+		if err := r.Configure(func(*gateGRPCEndpointRegistration) error { return nil }); err != nil {
+			return err
+		}
+		if gateClientEnabled {
+			if err := r.Provide(func() serversend.TransportConfig { return gateTransportConfig }); err != nil {
+				return err
+			}
+			if err := r.Provide(func() gateFanoutConfig { return gateFanout }); err != nil {
+				return err
+			}
+			if err := r.ProvideManaged("gate-gate-grpc-client", framework.PhaseInfrastructure, newGateServerSendTransport); err != nil {
+				return err
+			}
+			if err := r.Provide(newGateFanoutSender); err != nil {
+				return err
+			}
+		}
+		if broadcastEnabled {
+			if err := r.Provide(func() gateServerSendBroadcastConfig { return broadcastConfig }); err != nil {
+				return err
+			}
+			if broadcastConfig.Primary == "redis" {
+				if err := r.Provide(newGateRedisBroadcastSender); err != nil {
+					return err
+				}
+			}
+			if err := r.Provide(newGateBroadcastSender); err != nil {
+				return err
+			}
+			if broadcastConfig.Primary == "redis" {
+				if err := r.ProvideManaged("gate-server-send-broadcast", framework.PhaseIngress, newGateServerSendBroadcastRuntime); err != nil {
+					return err
+				}
+				if err := r.Configure(func(*gateServerSendBroadcastRuntime) error { return nil }); err != nil {
+					return err
+				}
+			}
 		}
 		if err := r.ProvideManaged("gate-game-grpc-client", framework.PhaseInfrastructure, newGateGameGRPCClient); err != nil {
 			return err

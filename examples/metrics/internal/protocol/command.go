@@ -14,4 +14,8 @@ const (
 	LocalEchoRequestCommandID uint32 = 0xF1000021
 	// LocalEchoResponseCommandID 是 Gate-local 對照路徑的 response。
 	LocalEchoResponseCommandID uint32 = 0xF1000022
+	// BroadcastRoomCommandID 是範例 remote-command dispatcher 的 routing ID。
+	// room_id 與 client payload 位於 BroadcastRoomCommand protobuf，不屬於
+	// framework transport contract。
+	BroadcastRoomCommandID uint32 = 0xF1000031
 )

@@ -12,7 +12,9 @@ import (
 
 	"github.com/NeoJay0705/gaming-core-casino/examples/metrics/internal/protocol"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/grpcserver"
 	"github.com/prometheus/client_golang/prometheus"
+	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -199,7 +201,7 @@ func TestWarmupCoversEveryClientConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal response: %v", err)
 	}
-	server, err := gatelink.NewServer(gatelink.ServerConfig{ListenAddr: "127.0.0.1:0"}, gatelink.RequestHandlerFunc(func(ctx context.Context, _ gatelink.Request) error {
+	server := newTestGateRequestServer(t, gatelink.RequestHandlerFunc(func(ctx context.Context, _ gatelink.Request) error {
 		requestContext, ok := gatelink.GateRequestContextFrom(ctx)
 		if !ok {
 			return errors.New("missing connection metadata")
@@ -209,12 +211,6 @@ func TestWarmupCoversEveryClientConnection(t *testing.T) {
 		countsMu.Unlock()
 		return gatelink.SetForwardReply(ctx, gatelink.Reply{CommandID: protocol.EchoResponseCommandID, Payload: responsePayload})
 	}))
-	if err != nil {
-		t.Fatalf("gatelink.NewServer() error = %v", err)
-	}
-	if err := server.Start(context.Background()); err != nil {
-		t.Fatalf("server.Start() error = %v", err)
-	}
 	clients := make([]*gatelink.Client, 2)
 	t.Cleanup(func() {
 		for index := len(clients) - 1; index >= 0; index-- {
@@ -291,18 +287,11 @@ func TestMeasuredLoadStopsFailedWorkersAndBalancesMetrics(t *testing.T) {
 	}
 }
 
-func newTestGRPCEchoPair(t *testing.T, handler func(context.Context, gatelink.Request) error) (*gatelink.Server, *gatelink.Client) {
+func newTestGRPCEchoPair(t *testing.T, handler func(context.Context, gatelink.Request) error) (*grpcserver.Server, *gatelink.Client) {
 	t.Helper()
-	server, err := gatelink.NewServer(gatelink.ServerConfig{ListenAddr: "127.0.0.1:0"}, gatelink.RequestHandlerFunc(handler))
-	if err != nil {
-		t.Fatalf("gatelink.NewServer() error = %v", err)
-	}
-	if err := server.Start(context.Background()); err != nil {
-		t.Fatalf("server.Start() error = %v", err)
-	}
+	server := newTestGateRequestServer(t, gatelink.RequestHandlerFunc(handler))
 	client, err := gatelink.NewClient(gatelink.ClientConfig{Target: server.Addr(), Timeout: time.Second})
 	if err != nil {
-		_ = server.Stop(context.Background())
 		t.Fatalf("gatelink.NewClient() error = %v", err)
 	}
 	if err := client.Start(context.Background()); err != nil {
@@ -312,7 +301,7 @@ func newTestGRPCEchoPair(t *testing.T, handler func(context.Context, gatelink.Re
 	return server, client
 }
 
-func stopTestGRPCEchoPair(t *testing.T, server *gatelink.Server, client *gatelink.Client) {
+func stopTestGRPCEchoPair(t *testing.T, server *grpcserver.Server, client *gatelink.Client) {
 	t.Helper()
 	if err := client.Stop(context.Background()); err != nil {
 		t.Fatalf("client.Stop() error = %v", err)
@@ -322,6 +311,27 @@ func stopTestGRPCEchoPair(t *testing.T, server *gatelink.Server, client *gatelin
 	if err := server.Stop(ctx); err != nil {
 		t.Fatalf("server.Stop() error = %v", err)
 	}
+}
+
+func newTestGateRequestServer(t *testing.T, handler gatelink.RequestHandler) *grpcserver.Server {
+	t.Helper()
+	service, err := gatelink.NewGateRequestService(handler)
+	if err != nil {
+		t.Fatalf("gatelink.NewGateRequestService() error = %v", err)
+	}
+	server, err := grpcserver.New(grpcserver.Config{ListenAddr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatalf("grpcserver.New() error = %v", err)
+	}
+	if err := server.Register(gatelink.GateRequestService_ServiceDesc.ServiceName, func(registrar grpc.ServiceRegistrar) {
+		gatelink.RegisterGateRequestServiceServer(registrar, service)
+	}); err != nil {
+		t.Fatalf("register GateRequest service: %v", err)
+	}
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatalf("server.Start() error = %v", err)
+	}
+	return server
 }
 
 func contains(value, fragment string) bool {

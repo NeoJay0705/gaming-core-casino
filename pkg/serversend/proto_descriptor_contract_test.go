@@ -19,28 +19,25 @@ func TestServerSendProtoDescriptorContractKeepsWireSchema(t *testing.T) {
 	if service == nil {
 		t.Fatal("GateDelivery service is missing")
 	}
-	for _, methodName := range []protoreflect.Name{"SendToConnection", "SendToPlayer", "BroadcastRoom"} {
+	for _, methodName := range []protoreflect.Name{"SendToPlayer", "Forward"} {
 		if service.Methods().ByName(methodName) == nil {
 			t.Fatalf("GateDelivery method %q is missing", methodName)
 		}
 	}
-
-	assertDescriptorFieldNumbers(t, file.Messages().ByName("SendToConnectionRequest"), map[protoreflect.Name]protoreflect.FieldNumber{
-		"connection_id":       1,
-		"expected_login_name": 2,
-		"command_id":          3,
-		"payload":             4,
-	})
+	if method := service.Methods().ByName("Forward"); method.Input().FullName() != "gatelink.v1.GateRequest" {
+		t.Fatalf("Forward input = %q, want gatelink.v1.GateRequest", method.Input().FullName())
+	}
+	if method := service.Methods().ByName("Forward"); method.Output().FullName() != "google.protobuf.Empty" {
+		t.Fatalf("Forward output = %q, want google.protobuf.Empty", method.Output().FullName())
+	}
 	assertDescriptorFieldNumbers(t, file.Messages().ByName("SendToPlayerRequest"), map[protoreflect.Name]protoreflect.FieldNumber{
 		"login_name": 1,
 		"command_id": 2,
 		"payload":    3,
 	})
-	assertDescriptorFieldNumbers(t, file.Messages().ByName("BroadcastRoomRequest"), map[protoreflect.Name]protoreflect.FieldNumber{
-		"room_id":    1,
-		"command_id": 2,
-		"payload":    3,
-	})
+	if file.Messages().ByName("BroadcastRoomRequest") != nil || file.Messages().ByName("RedisBroadcastEnvelope") != nil {
+		t.Fatal("room-specific broadcast messages must not be part of the transport schema")
+	}
 	assertDescriptorFieldNumbers(t, file.Messages().ByName("DeliveryResponse"), map[protoreflect.Name]protoreflect.FieldNumber{
 		"status":          1,
 		"delivered_count": 2,

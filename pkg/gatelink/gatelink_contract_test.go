@@ -43,7 +43,7 @@ func TestContractForwardsOpaquePayloadAndRequestContext(t *testing.T) {
 		CommandID: 0xE10003,
 		Payload:   payload,
 	}
-	ctx := WithGateRequestContext(context.Background(), GateRequestContext{TraceID: "trace-123", Source: RequestSource{GateID: "gate-a", ConnectionID: "connection-42", ReplyEndpoint: "127.0.0.1:19091"}})
+	ctx := WithGateRequestContext(context.Background(), GateRequestContext{TraceID: "trace-123", Source: RequestSource{GateID: "gate-a", ConnectionID: "connection-42"}})
 	if _, err := client.Forward(ctx, request); err != nil {
 		t.Fatalf("forward: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestContractForwardsOpaquePayloadAndRequestContext(t *testing.T) {
 		if string(got.request.Payload) != string([]byte{0x00, 0xE1, 0xFF}) {
 			t.Fatalf("payload = %x, want original binary bytes", got.request.Payload)
 		}
-		if got.requestContext.Source != (RequestSource{GateID: "gate-a", ConnectionID: "connection-42", ReplyEndpoint: "127.0.0.1:19091"}) {
+		if got.requestContext.Source != (RequestSource{GateID: "gate-a", ConnectionID: "connection-42"}) {
 			t.Fatalf("source = %#v, want Gate connection source", got.requestContext.Source)
 		}
 		if got.requestContext.TraceID != "trace-123" {
@@ -239,14 +239,14 @@ func TestContractClientCopiesForwardReplyPayload(t *testing.T) {
 	}
 }
 
-func TestContractRejectsDuplicateReplyEndpointMetadata(t *testing.T) {
+func TestContractRejectsDuplicateGateIDMetadata(t *testing.T) {
 	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(
 		connectionIDMetadataKey, "connection-1",
-		replyEndpointMetadataKey, "127.0.0.1:19091",
-		replyEndpointMetadataKey, "127.0.0.1:19092",
+		gateIDMetadataKey, "gate-a",
+		gateIDMetadataKey, "gate-b",
 	))
-	if _, err := withIncomingRequestContext(ctx); err == nil || !strings.Contains(err.Error(), "duplicate "+replyEndpointMetadataKey) {
-		t.Fatalf("duplicate reply endpoint error = %v, want duplicate metadata error", err)
+	if _, err := withIncomingRequestContext(ctx); err == nil || !strings.Contains(err.Error(), "duplicate "+gateIDMetadataKey) {
+		t.Fatalf("duplicate Gate ID error = %v, want duplicate metadata error", err)
 	}
 }
 
@@ -293,7 +293,7 @@ func TestContractDefaultsForwardTimeout(t *testing.T) {
 
 func TestContractRejectsMissingListenAddress(t *testing.T) {
 	_, err := NewServer(ServerConfig{}, nil)
-	if err == nil || !strings.Contains(err.Error(), "listen_addr is required") {
+	if err == nil || !strings.Contains(err.Error(), "listen address is required") {
 		t.Fatalf("new server error = %v, want missing listen_addr", err)
 	}
 }

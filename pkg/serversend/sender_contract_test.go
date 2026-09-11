@@ -3,8 +3,6 @@ package serversend
 import (
 	"context"
 	"errors"
-	"net"
-	"strings"
 	"testing"
 	"time"
 
@@ -12,13 +10,13 @@ import (
 )
 
 func TestDirectRequestPlayerSenderContractUsesForwardReplySlot(t *testing.T) {
-	sender, err := NewDirectRequestPlayerSender(0)
+	sender, err := NewDirectRequestPlayerSender()
 	if err != nil {
 		t.Fatal(err)
 	}
 	payload := []byte("reply")
 	var secondErr error
-	server, err := gatelink.NewServer(gatelink.ServerConfig{ListenAddr: "127.0.0.1:0"}, gatelink.RequestHandlerFunc(func(ctx context.Context, _ gatelink.Request) error {
+	server := newTestGateRequestServer(t, gatelink.RequestHandlerFunc(func(ctx context.Context, _ gatelink.Request) error {
 		if _, err := sender.SendToRequestPlayer(ctx, RequestPlayerMessage{ExpectedLoginName: "alice", Message: Message{CommandID: 1, Payload: payload}}); err != nil {
 			return err
 		}
@@ -28,9 +26,6 @@ func TestDirectRequestPlayerSenderContractUsesForwardReplySlot(t *testing.T) {
 		}()
 		return nil
 	}))
-	if err != nil {
-		t.Fatal(err)
-	}
 	response, err := server.Forward(context.Background(), &gatelink.GateRequest{CommandId: 99})
 	if err != nil {
 		t.Fatalf("forward: %v", err)
@@ -45,7 +40,7 @@ func TestDirectRequestPlayerSenderContractUsesForwardReplySlot(t *testing.T) {
 }
 
 func TestDirectRequestPlayerSenderContractRequiresActiveReplyAndPayloadBound(t *testing.T) {
-	sender, err := NewDirectRequestPlayerSender(3)
+	sender, err := NewDirectRequestPlayerSender()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,17 +50,11 @@ func TestDirectRequestPlayerSenderContractRequiresActiveReplyAndPayloadBound(t *
 	if _, err := sender.SendToRequestPlayer(context.Background(), RequestPlayerMessage{Message: Message{CommandID: 1}}); !errors.Is(err, ErrRequestRouteUnavailable) {
 		t.Fatalf("missing reply slot error = %v, want ErrRequestRouteUnavailable", err)
 	}
-	if _, err := NewDirectRequestPlayerSender(-1); err == nil || !strings.Contains(err.Error(), "max payload") {
-		t.Fatalf("negative payload limit error = %v, want payload validation", err)
-	}
 	var senderErr error
-	server, err := gatelink.NewServer(gatelink.ServerConfig{ListenAddr: "127.0.0.1:0"}, gatelink.RequestHandlerFunc(func(ctx context.Context, _ gatelink.Request) error {
-		_, senderErr = sender.SendToRequestPlayer(ctx, RequestPlayerMessage{Message: Message{CommandID: 1, Payload: []byte("1234")}})
+	server := newTestGateRequestServer(t, gatelink.RequestHandlerFunc(func(ctx context.Context, _ gatelink.Request) error {
+		_, senderErr = sender.SendToRequestPlayer(ctx, RequestPlayerMessage{Message: Message{CommandID: 1, Payload: make([]byte, DefaultMaxPayloadBytes+1)}})
 		return nil
 	}))
-	if err != nil {
-		t.Fatal(err)
-	}
 	response, err := server.Forward(context.Background(), &gatelink.GateRequest{CommandId: 99})
 	if err != nil || response.GetReply() != nil {
 		t.Fatalf("oversized reply forward = response:%#v error:%v, want no reply/nil", response, err)
@@ -75,56 +64,26 @@ func TestDirectRequestPlayerSenderContractRequiresActiveReplyAndPayloadBound(t *
 	}
 }
 
-func TestRoutedPlayerSenderContractFansOutAfterPrimaryRouteErrors(t *testing.T) {
-	ignored, ignoredEndpoint := newTestReceiverEndpoint(t, "gate-a", DeliveryStatus_DELIVERY_STATUS_IGNORED)
-	delivered, deliveredEndpoint := newTestReceiverEndpoint(t, "gate-b", DeliveryStatus_DELIVERY_STATUS_DELIVERED)
+func TestRoutedPlayerSenderContractReturnsPrimaryRouteError(t *testing.T) {
 	transport, err := NewGRPCTransport(TransportConfig{RequestTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = transport.Stop(context.Background()) })
-	directory := testDirectory{byID: map[GateID]GateEndpoint{ignoredEndpoint.GateID: ignoredEndpoint, deliveredEndpoint.GateID: deliveredEndpoint}, endpoints: []GateEndpoint{ignoredEndpoint, deliveredEndpoint}}
-	fanout, err := NewFanoutSender(directory, transport)
-	if err != nil {
-		t.Fatal(err)
-	}
+	listCalls := 0
+	directory := testDirectory{byID: map[GateID]GateEndpoint{}}
+	directory.listHook = func() { listCalls++ }
 	sender, err := NewRoutedPlayerSender(presenceResolverFunc(func(context.Context, LoginName) (Presence, error) {
 		return Presence{}, ErrRouteStoreUnavailable
-	}), directory, transport, fanout)
+	}), directory, transport, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if receipt, err := sender.SendToPlayer(context.Background(), PlayerMessage{LoginName: "alice", Message: Message{CommandID: 2, Payload: []byte("private")}}); err != nil || receipt.AcceptedAt.IsZero() {
-		t.Fatalf("route store fallback = receipt:%#v error:%v, want accepted/nil", receipt, err)
+	if receipt, err := sender.SendToPlayer(context.Background(), PlayerMessage{LoginName: "alice", Message: Message{CommandID: 2}}); !errors.Is(err, ErrRouteStoreUnavailable) || !receipt.AcceptedAt.IsZero() {
+		t.Fatalf("route error = receipt:%#v error:%v, want empty/ErrRouteStoreUnavailable", receipt, err)
 	}
-	ignored.mu.Lock()
-	ignoredCount := ignored.player.CommandID
-	ignored.mu.Unlock()
-	delivered.mu.Lock()
-	deliveredCount := delivered.player.CommandID
-	delivered.mu.Unlock()
-	if ignoredCount != 2 || deliveredCount != 2 {
-		t.Fatalf("private route fallback commands = ignored:%d delivered:%d, want 2/2", ignoredCount, deliveredCount)
-	}
-
-	missing, err := NewRoutedPlayerSender(presenceResolverFunc(func(context.Context, LoginName) (Presence, error) {
-		return Presence{}, ErrPresenceNotFound
-	}), directory, transport, fanout)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if receipt, err := missing.SendToPlayer(context.Background(), PlayerMessage{LoginName: "missing", Message: Message{CommandID: 3}}); err != nil || receipt.AcceptedAt.IsZero() {
-		t.Fatalf("missing presence fallback = receipt:%#v error:%v, want accepted/nil", receipt, err)
-	}
-
-	endpointFailure, err := NewRoutedPlayerSender(presenceResolverFunc(func(context.Context, LoginName) (Presence, error) {
-		return Presence{GateID: "gate-a"}, nil
-	}), testDirectory{byID: map[GateID]GateEndpoint{}, endpoints: []GateEndpoint{ignoredEndpoint, deliveredEndpoint}}, transport, fanout)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if receipt, err := endpointFailure.SendToPlayer(context.Background(), PlayerMessage{LoginName: "alice", Message: Message{CommandID: 4}}); err != nil || receipt.AcceptedAt.IsZero() {
-		t.Fatalf("endpoint route fallback = receipt:%#v error:%v, want accepted/nil", receipt, err)
+	if listCalls != 0 {
+		t.Fatalf("route error enumerated fan-out directory %d times, want 0", listCalls)
 	}
 }
 
@@ -136,14 +95,10 @@ func TestRoutedPlayerSenderContractDoesNotFallbackInvalidMessage(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = transport.Stop(context.Background()) })
 	directory := testDirectory{byID: map[GateID]GateEndpoint{endpoint.GateID: endpoint}, endpoints: []GateEndpoint{endpoint}}
-	fanout, err := NewFanoutSender(directory, transport)
-	if err != nil {
-		t.Fatal(err)
-	}
 	sender, err := NewRoutedPlayerSender(presenceResolverFunc(func(context.Context, LoginName) (Presence, error) {
 		t.Fatal("invalid message reached primary presence resolver")
 		return Presence{}, nil
-	}), directory, transport, fanout)
+	}), directory, transport, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,207 +108,64 @@ func TestRoutedPlayerSenderContractDoesNotFallbackInvalidMessage(t *testing.T) {
 	delivered.mu.Lock()
 	defer delivered.mu.Unlock()
 	if delivered.player.CommandID != 0 {
-		t.Fatalf("invalid player message reached fallback: %#v", delivered.player)
+		t.Fatalf("invalid player message reached delivery path: %#v", delivered.player)
 	}
 }
 
-func TestRoutedPlayerSenderContractFansOutAfterPrimaryTransportError(t *testing.T) {
-	ignored, ignoredEndpoint := newTestReceiverEndpoint(t, "gate-a", DeliveryStatus_DELIVERY_STATUS_IGNORED)
-	delivered, deliveredEndpoint := newTestReceiverEndpoint(t, "gate-b", DeliveryStatus_DELIVERY_STATUS_DELIVERED)
-	downListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	downAddress := downListener.Addr().String()
-	if err := downListener.Close(); err != nil {
-		t.Fatal(err)
-	}
-	transport, err := NewGRPCTransport(TransportConfig{RequestTimeout: 100 * time.Millisecond})
+func TestRoutedPlayerSenderContractFallsBackToAllGatesAfterPrimaryFailure(t *testing.T) {
+	receiver, endpoint := newTestReceiverEndpoint(t, "gate-a", DeliveryStatus_DELIVERY_STATUS_DELIVERED, 6)
+	transport, err := NewGRPCTransport(TransportConfig{RequestTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = transport.Stop(context.Background()) })
-	directory := testDirectory{
-		byID:      map[GateID]GateEndpoint{"gate-down": {GateID: "gate-down", Address: downAddress}},
-		endpoints: []GateEndpoint{ignoredEndpoint, deliveredEndpoint},
-	}
+	directory := testDirectory{endpoints: []GateEndpoint{endpoint}}
 	fanout, err := NewFanoutSender(directory, transport)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sender, err := NewRoutedPlayerSender(presenceResolverFunc(func(context.Context, LoginName) (Presence, error) {
-		return Presence{GateID: "gate-down"}, nil
+		return Presence{}, ErrRouteStoreUnavailable
 	}), directory, transport, fanout)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if receipt, err := sender.SendToPlayer(context.Background(), PlayerMessage{LoginName: "alice", Message: Message{CommandID: 6}}); err != nil || receipt.AcceptedAt.IsZero() {
-		t.Fatalf("transport fallback = receipt:%#v error:%v, want accepted/nil", receipt, err)
+	if _, err := sender.SendToPlayer(context.Background(), PlayerMessage{LoginName: "alice", Message: Message{CommandID: 6, Payload: []byte("fallback")}}); err != nil {
+		t.Fatalf("fallback player send: %v", err)
 	}
-	ignored.mu.Lock()
-	ignoredCommand := ignored.player.CommandID
-	ignored.mu.Unlock()
-	delivered.mu.Lock()
-	deliveredCommand := delivered.player.CommandID
-	delivered.mu.Unlock()
-	if ignoredCommand != 6 || deliveredCommand != 6 {
-		t.Fatalf("transport fallback commands = ignored:%d delivered:%d, want 6/6", ignoredCommand, deliveredCommand)
+	receiver.mu.Lock()
+	defer receiver.mu.Unlock()
+	if receiver.player.LoginName != "alice" || string(receiver.player.Payload) != "fallback" {
+		t.Fatalf("fallback receiver message = %#v", receiver.player)
 	}
 }
 
-func TestFanoutSenderContractPlayerAllIgnoredReturnsNotConnected(t *testing.T) {
-	first, firstEndpoint := newTestReceiverEndpoint(t, "gate-a", DeliveryStatus_DELIVERY_STATUS_IGNORED)
-	second, secondEndpoint := newTestReceiverEndpoint(t, "gate-b", DeliveryStatus_DELIVERY_STATUS_IGNORED)
+func TestRoutedPlayerSenderContractDoesNotFallbackCanceledContext(t *testing.T) {
+	_, endpoint := newTestReceiverEndpoint(t, "gate-a", DeliveryStatus_DELIVERY_STATUS_DELIVERED, 7)
 	transport, err := NewGRPCTransport(TransportConfig{RequestTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = transport.Stop(context.Background()) })
-	directory := testDirectory{endpoints: []GateEndpoint{firstEndpoint, secondEndpoint}}
-	sender, err := NewFanoutSender(directory, transport)
-	if err != nil {
-		t.Fatal(err)
-	}
-	receipt, err := sender.SendToPlayer(context.Background(), PlayerMessage{LoginName: "alice", Message: Message{CommandID: 7}})
-	if !errors.Is(err, ErrTargetNotConnected) || !receipt.AcceptedAt.IsZero() {
-		t.Fatalf("all ignored fan-out = receipt:%#v error:%v, want empty/ErrTargetNotConnected", receipt, err)
-	}
-	first.mu.Lock()
-	firstCommand := first.player.CommandID
-	first.mu.Unlock()
-	second.mu.Lock()
-	secondCommand := second.player.CommandID
-	second.mu.Unlock()
-	if firstCommand != 7 || secondCommand != 7 {
-		t.Fatalf("all ignored attempts = first:%d second:%d, want 7/7", firstCommand, secondCommand)
-	}
-}
-
-func TestFanoutSenderContractPlayerPartialDeliveryKeepsReceiptAndErrors(t *testing.T) {
-	delivered, deliveredEndpoint := newTestReceiverEndpoint(t, "gate-live", DeliveryStatus_DELIVERY_STATUS_DELIVERED)
-	downListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	downAddress := downListener.Addr().String()
-	if err := downListener.Close(); err != nil {
-		t.Fatal(err)
-	}
-	transport, err := NewGRPCTransport(TransportConfig{RequestTimeout: 100 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = transport.Stop(context.Background()) })
-	directory := testDirectory{endpoints: []GateEndpoint{deliveredEndpoint, {GateID: "gate-down", Address: downAddress}}}
-	sender, err := NewFanoutSender(directory, transport)
-	if err != nil {
-		t.Fatal(err)
-	}
-	receipt, err := sender.SendToPlayer(context.Background(), PlayerMessage{LoginName: "alice", Message: Message{CommandID: 8}})
-	if err == nil || receipt.AcceptedAt.IsZero() || !strings.Contains(err.Error(), "gate-down") {
-		t.Fatalf("partial player fan-out = receipt:%#v error:%v, want receipt and gate-down error", receipt, err)
-	}
-	delivered.mu.Lock()
-	defer delivered.mu.Unlock()
-	if delivered.player.CommandID != 8 {
-		t.Fatalf("partial fan-out delivered command = %d, want 8", delivered.player.CommandID)
-	}
-}
-
-func TestFallbackBroadcastSenderContractUsesFallbackOnlyAfterPrimaryError(t *testing.T) {
-	primaryErr := errors.New("redis publish failed")
-	fallbackErr := errors.New("fan-out failed")
-	primary := &recordingBroadcastSender{err: primaryErr}
-	fallback := &recordingBroadcastSender{receipt: newReceipt(), err: fallbackErr}
-	sender, err := NewFallbackBroadcastSender(primary, fallback)
-	if err != nil {
-		t.Fatal(err)
-	}
-	receipt, err := sender.Broadcast(context.Background(), BroadcastMessage{RoomID: "room-a", Message: Message{CommandID: 9}})
-	if !errors.Is(err, primaryErr) || !errors.Is(err, fallbackErr) || receipt.AcceptedAt.IsZero() {
-		t.Fatalf("fallback errors = receipt:%#v error:%v, want joined errors and fallback receipt", receipt, err)
-	}
-	if primary.calls != 1 || fallback.calls != 1 {
-		t.Fatalf("fallback calls = primary:%d fallback:%d, want 1/1", primary.calls, fallback.calls)
-	}
-
-	primary = &recordingBroadcastSender{receipt: newReceipt()}
-	fallback = &recordingBroadcastSender{}
-	sender, err = NewFallbackBroadcastSender(primary, fallback)
-	if err != nil {
-		t.Fatal(err)
-	}
-	receipt, err = sender.Broadcast(context.Background(), BroadcastMessage{RoomID: "room-a", Message: Message{CommandID: 10}})
-	if err != nil || receipt.AcceptedAt.IsZero() || fallback.calls != 0 {
-		t.Fatalf("successful primary = receipt:%#v error:%v fallback calls:%d, want primary receipt/nil/0", receipt, err, fallback.calls)
-	}
-}
-
-func TestFallbackBroadcastSenderContractValidatesBeforeBothPaths(t *testing.T) {
-	primary := &recordingBroadcastSender{}
-	fallback := &recordingBroadcastSender{}
-	sender, err := NewFallbackBroadcastSender(primary, fallback)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sender.Broadcast(context.Background(), BroadcastMessage{Message: Message{CommandID: 11}}); !errors.Is(err, ErrDestinationInvalid) {
-		t.Fatalf("invalid broadcast error = %v, want ErrDestinationInvalid", err)
-	}
-	if primary.calls != 0 || fallback.calls != 0 {
-		t.Fatalf("invalid broadcast calls = primary:%d fallback:%d, want 0/0", primary.calls, fallback.calls)
-	}
-
-	primary = &recordingBroadcastSender{}
-	fallback = &recordingBroadcastSender{}
-	sender, err = NewFallbackBroadcastSender(primary, fallback, BroadcastFallbackConfig{MaxPayloadBytes: 3})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sender.Broadcast(context.Background(), BroadcastMessage{RoomID: "room-a", Message: Message{CommandID: 12, Payload: []byte("1234")}}); !errors.Is(err, ErrPayloadTooLarge) {
-		t.Fatalf("oversized broadcast error = %v, want ErrPayloadTooLarge", err)
-	}
-	if primary.calls != 0 || fallback.calls != 0 {
-		t.Fatalf("oversized broadcast calls = primary:%d fallback:%d, want 0/0", primary.calls, fallback.calls)
-	}
-}
-
-func TestFallbackBroadcastSenderContractUsesRedisPrimaryAndGRPCFallback(t *testing.T) {
-	first, firstEndpoint := newTestReceiverEndpoint(t, "gate-a", DeliveryStatus_DELIVERY_STATUS_DELIVERED)
-	second, secondEndpoint := newTestReceiverEndpoint(t, "gate-b", DeliveryStatus_DELIVERY_STATUS_DELIVERED)
-	transport, err := NewGRPCTransport(TransportConfig{RequestTimeout: time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = transport.Stop(context.Background()) })
-	directory := testDirectory{endpoints: []GateEndpoint{firstEndpoint, secondEndpoint}}
+	listCalls := 0
+	directory := testDirectory{endpoints: []GateEndpoint{endpoint}, listHook: func() { listCalls++ }}
 	fanout, err := NewFanoutSender(directory, transport)
 	if err != nil {
 		t.Fatal(err)
 	}
-	keys, err := NewKeyspace("core-casino")
+	sender, err := NewRoutedPlayerSender(presenceResolverFunc(func(ctx context.Context, _ LoginName) (Presence, error) {
+		return Presence{}, ctx.Err()
+	}), directory, transport, fanout)
 	if err != nil {
 		t.Fatal(err)
 	}
-	primary, err := NewRedisBroadcastSender(&recordingRoomPublisher{err: errors.New("Redis unavailable")}, keys)
-	if err != nil {
-		t.Fatal(err)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := sender.SendToPlayer(ctx, PlayerMessage{LoginName: "alice", Message: Message{CommandID: 7}}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled player send error = %v, want context.Canceled", err)
 	}
-	sender, err := NewFallbackBroadcastSender(primary, fanout)
-	if err != nil {
-		t.Fatal(err)
-	}
-	receipt, err := sender.Broadcast(context.Background(), BroadcastMessage{RoomID: "room-a", Message: Message{CommandID: 13, Payload: []byte("fallback")}})
-	if err != nil || receipt.AcceptedAt.IsZero() {
-		t.Fatalf("Redis-to-gRPC fallback = receipt:%#v error:%v, want accepted/nil", receipt, err)
-	}
-	first.mu.Lock()
-	firstCommand := first.broadcast.CommandID
-	first.mu.Unlock()
-	second.mu.Lock()
-	secondCommand := second.broadcast.CommandID
-	second.mu.Unlock()
-	if firstCommand != 13 || secondCommand != 13 {
-		t.Fatalf("fallback broadcast commands = first:%d second:%d, want 13/13", firstCommand, secondCommand)
+	if listCalls != 0 {
+		t.Fatalf("canceled player send enumerated fallback directory %d times", listCalls)
 	}
 }
 
@@ -373,14 +185,14 @@ func TestFanoutSenderContractUsesEveryUniqueEndpointExactlyOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := sender.Broadcast(context.Background(), BroadcastMessage{RoomID: "room-a", Message: Message{CommandID: 4}}); err != nil {
+	if _, err := sender.Broadcast(context.Background(), Message{CommandID: 4}); err != nil {
 		t.Fatalf("fan-out broadcast: %v", err)
 	}
 	first.mu.Lock()
-	firstCommand := first.broadcast.CommandID
+	firstCommand := first.remoteCommandID
 	first.mu.Unlock()
 	second.mu.Lock()
-	secondCommand := second.broadcast.CommandID
+	secondCommand := second.remoteCommandID
 	second.mu.Unlock()
 	if firstCommand != 4 || secondCommand != 4 {
 		t.Fatalf("broadcast commands = first:%d second:%d, want 4/4", firstCommand, secondCommand)
@@ -400,24 +212,79 @@ func TestFanoutSenderContractRejectsEndpointLimitBeforeDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := sender.Broadcast(context.Background(), BroadcastMessage{RoomID: "room-a", Message: Message{CommandID: 5}}); !errors.Is(err, ErrFanoutLimitExceeded) {
+	if _, err := sender.Broadcast(context.Background(), Message{CommandID: 5}); !errors.Is(err, ErrFanoutLimitExceeded) {
 		t.Fatalf("fan-out limit error = %v, want ErrFanoutLimitExceeded", err)
 	}
 	first.mu.Lock()
-	firstDelivered := first.broadcast.CommandID
+	firstDelivered := first.remoteCommandID
 	first.mu.Unlock()
 	second.mu.Lock()
-	secondDelivered := second.broadcast.CommandID
+	secondDelivered := second.remoteCommandID
 	second.mu.Unlock()
 	if firstDelivered != 0 || secondDelivered != 0 {
 		t.Fatalf("fan-out limit sent before rejection: first:%d second:%d", firstDelivered, secondDelivered)
 	}
 }
 
-func newTestReceiverEndpoint(t *testing.T, gateID GateID, playerStatus DeliveryStatus) (*recordingReceiver, GateEndpoint) {
+func TestFallbackBroadcastSenderContractUsesGRPCAfterRedisFailure(t *testing.T) {
+	primary := &recordingBroadcastSender{err: ErrRouteStoreUnavailable}
+	fallback := &recordingBroadcastSender{receipt: Receipt{AcceptedAt: time.Now()}}
+	sender, err := NewFallbackBroadcastSender(primary, fallback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := Message{CommandID: 8}
+	receipt, err := sender.Broadcast(context.Background(), message)
+	if err != nil || receipt.AcceptedAt.IsZero() {
+		t.Fatalf("fallback broadcast = receipt:%#v error:%v, want accepted/nil", receipt, err)
+	}
+	if primary.calls != 1 || fallback.calls != 1 {
+		t.Fatalf("fallback broadcast calls = primary:%d fallback:%d, want 1/1", primary.calls, fallback.calls)
+	}
+
+	successPrimary := &recordingBroadcastSender{receipt: newReceipt()}
+	successFallback := &recordingBroadcastSender{receipt: newReceipt()}
+	successSender, err := NewFallbackBroadcastSender(successPrimary, successFallback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := successSender.Broadcast(context.Background(), message); err != nil {
+		t.Fatalf("successful primary broadcast = %v", err)
+	}
+	if successPrimary.calls != 1 || successFallback.calls != 0 {
+		t.Fatalf("successful primary fallback calls = primary:%d fallback:%d, want 1/0", successPrimary.calls, successFallback.calls)
+	}
+}
+
+func TestFallbackBroadcastSenderContractUsesGRPCAfterZeroRedisSubscribers(t *testing.T) {
+	keys, err := NewKeyspace("core-casino")
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary, err := NewRedisBroadcastSender(&recordingBroadcastPublisher{returnZero: true}, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fallback := &recordingBroadcastSender{receipt: newReceipt()}
+	sender, err := NewFallbackBroadcastSender(primary, fallback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sender.Broadcast(context.Background(), Message{CommandID: 9}); err != nil {
+		t.Fatalf("zero-subscriber fallback = %v", err)
+	}
+	if fallback.calls != 1 {
+		t.Fatalf("zero-subscriber fallback calls = %d, want 1", fallback.calls)
+	}
+}
+
+func newTestReceiverEndpoint(t *testing.T, gateID GateID, playerStatus DeliveryStatus, commandIDs ...uint32) (*recordingReceiver, GateEndpoint) {
 	t.Helper()
 	receiver := &recordingReceiver{playerStatus: playerStatus}
-	server, err := NewReceiverServer(ReceiverConfig{ListenAddr: "127.0.0.1:0"}, receiver)
+	if len(commandIDs) == 0 {
+		commandIDs = []uint32{4, 5}
+	}
+	server, err := NewReceiverServer(ReceiverConfig{ListenAddr: "127.0.0.1:0"}, receiver, commandIDs...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -437,6 +304,7 @@ func (f presenceResolverFunc) Resolve(ctx context.Context, loginName LoginName) 
 type testDirectory struct {
 	byID      map[GateID]GateEndpoint
 	endpoints []GateEndpoint
+	listHook  func()
 }
 
 func (d testDirectory) Resolve(_ context.Context, gateID GateID) (GateEndpoint, error) {
@@ -448,6 +316,9 @@ func (d testDirectory) Resolve(_ context.Context, gateID GateID) (GateEndpoint, 
 }
 
 func (d testDirectory) List(context.Context) ([]GateEndpoint, error) {
+	if d.listHook != nil {
+		d.listHook()
+	}
 	return append([]GateEndpoint(nil), d.endpoints...), nil
 }
 
@@ -471,7 +342,7 @@ type recordingBroadcastSender struct {
 	err     error
 }
 
-func (s *recordingBroadcastSender) Broadcast(context.Context, BroadcastMessage) (Receipt, error) {
+func (s *recordingBroadcastSender) Broadcast(context.Context, Message) (Receipt, error) {
 	s.calls++
 	return s.receipt, s.err
 }

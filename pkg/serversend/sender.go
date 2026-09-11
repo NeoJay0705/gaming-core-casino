@@ -12,39 +12,37 @@ import (
 
 const defaultFanoutConcurrency = 16
 
-// GateResolver resolves one trusted Gate instance to its delivery endpoint.
-// It is used by the routed player primary path; request-player replies do not
-// use this resolver because they return through the originating unary call.
+// DefaultMaxFanoutEndpoints 限制明確選用的 broadcast gRPC directory，在
+// 任何 RPC 前先拒絕超過上限的 endpoint 數量。
+const DefaultMaxFanoutEndpoints = 256
+
+// GateResolver 將一個受信任的 Gate instance 解析為 delivery endpoint。它用
+// 於 player exact primary path；request-player reply 沿原 unary call 返回，
+// 不使用此 resolver。
 type GateResolver interface {
 	Resolve(context.Context, GateID) (GateEndpoint, error)
 }
 
-// GateEndpointLister enumerates every trusted Gate endpoint for the explicitly
-// selected gRPC room-broadcast and fallback transports.
+// GateEndpointLister 列舉明確選用的 gRPC broadcast／player fallback 所需的
+// 全部受信任 Gate endpoint。
 type GateEndpointLister interface {
 	List(context.Context) ([]GateEndpoint, error)
 }
 
-// DirectRequestPlayerSender accepts a reply for the exact connection that
-// originated the inbound request. The gatelink server returns the reply over
-// the original unary response; this sender does not perform network I/O.
+// DirectRequestPlayerSender 接受原始 request connection 的單一回覆。gatelink
+// server 會透過原 unary response 返回回覆；此 sender 不進行網路 I/O。
 type DirectRequestPlayerSender struct {
-	maxPayloadBytes int
 }
 
-func NewDirectRequestPlayerSender(maxPayloadBytes int) (*DirectRequestPlayerSender, error) {
-	maxPayloadBytes, err := normalizedPayloadLimit(maxPayloadBytes)
-	if err != nil {
-		return nil, err
-	}
-	return &DirectRequestPlayerSender{maxPayloadBytes: maxPayloadBytes}, nil
+func NewDirectRequestPlayerSender() (*DirectRequestPlayerSender, error) {
+	return &DirectRequestPlayerSender{}, nil
 }
 
 func (s *DirectRequestPlayerSender) SendToRequestPlayer(ctx context.Context, message RequestPlayerMessage) (Receipt, error) {
 	if s == nil {
 		return Receipt{}, errors.New("server send: direct request sender is not configured")
 	}
-	if err := message.validatePayload(s.maxPayloadBytes); err != nil {
+	if err := message.validatePayload(DefaultMaxPayloadBytes); err != nil {
 		return Receipt{}, err
 	}
 	err := gatelink.SetForwardReply(ctx, gatelink.Reply{
@@ -64,9 +62,8 @@ func (s *DirectRequestPlayerSender) SendToRequestPlayer(ctx context.Context, mes
 	return newReceipt(), nil
 }
 
-// RoutedPlayerSender resolves player presence first. Once the validated
-// primary route fails, the explicitly configured fan-out sender is attempted;
-// it is never used for an invalid message.
+// RoutedPlayerSender 先解析 player presence，再送至擁有該 player 的 exact
+// Gate endpoint。驗證過的 primary route 失敗時才使用設定的 fan-out sender。
 type RoutedPlayerSender struct {
 	presence  PresenceResolver
 	directory GateResolver
@@ -90,14 +87,23 @@ func (s *RoutedPlayerSender) SendToPlayer(ctx context.Context, message PlayerMes
 	if s == nil || s.presence == nil || s.directory == nil || s.transport == nil {
 		return Receipt{}, errors.New("server send: routed player sender is not configured")
 	}
-	if err := message.validatePayload(s.transport.cfg.MaxPayloadBytes); err != nil {
+	if err := message.validatePayload(DefaultMaxPayloadBytes); err != nil {
+		return Receipt{}, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
 		return Receipt{}, err
 	}
 	receipt, err := s.sendToPlayerPrimary(ctx, message)
 	if err == nil || s.fallback == nil {
 		return receipt, err
 	}
-	fallbackReceipt, fallbackErr := s.fallback.sendToPlayerValidated(ctx, message)
+	if contextErr := ctx.Err(); contextErr != nil {
+		return Receipt{}, contextErr
+	}
+	fallbackReceipt, fallbackErr := s.fallback.SendToPlayer(ctx, message)
 	if fallbackErr != nil {
 		return fallbackReceipt, errors.Join(err, fallbackErr)
 	}
@@ -119,15 +125,15 @@ func (s *RoutedPlayerSender) sendToPlayerPrimary(ctx context.Context, message Pl
 	return newReceipt(), nil
 }
 
-// FanoutSender is the explicitly selected gRPC all-Gate transport. It sends
-// one message to every endpoint returned by its directory with bounded
-// concurrency.
+// FanoutSender 是明確選用的 gRPC all-Gate transport，會以 bounded concurrency
+// 對 directory 回傳的每個 endpoint 各送一筆訊息。
 type FanoutSender struct {
 	directory    GateEndpointLister
 	transport    *GRPCTransport
 	maxEndpoints int
 }
 
+// FanoutConfig 設定 all-Gate fan-out 的 endpoint 上限；0 使用預設值。
 type FanoutConfig struct{ MaxEndpoints int }
 
 func NewFanoutSender(directory GateEndpointLister, transport *GRPCTransport, configs ...FanoutConfig) (*FanoutSender, error) {
@@ -149,45 +155,49 @@ func NewFanoutSender(directory GateEndpointLister, transport *GRPCTransport, con
 	return &FanoutSender{directory: directory, transport: transport, maxEndpoints: maxEndpoints}, nil
 }
 
-func (s *FanoutSender) Broadcast(ctx context.Context, message BroadcastMessage) (Receipt, error) {
-	if err := message.validatePayload(s.transportPayloadLimit()); err != nil {
+func (s *FanoutSender) Broadcast(ctx context.Context, message Message) (Receipt, error) {
+	if err := message.validatePayload(DefaultMaxPayloadBytes); err != nil {
 		return Receipt{}, err
 	}
-	return s.broadcastValidated(ctx, message)
-}
-
-func (s *FanoutSender) broadcastValidated(ctx context.Context, message BroadcastMessage) (Receipt, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return Receipt{}, err
+	}
 	endpoints, err := s.list(ctx)
 	if err != nil {
 		return Receipt{}, err
 	}
 	results := s.fanout(ctx, endpoints, func(endpoint GateEndpoint) (DeliveryStatus, error) {
-		delivered, err := s.transport.BroadcastRoom(ctx, endpoint, message)
+		err := s.transport.Forward(ctx, endpoint, message)
 		if err != nil {
-			return DeliveryStatus_DELIVERY_STATUS_UNSPECIFIED, fmt.Errorf("fan out room %q to gate %q endpoint %q: %w", message.RoomID, endpoint.GateID, endpoint.Address, err)
-		}
-		if delivered == 0 {
-			return DeliveryStatus_DELIVERY_STATUS_IGNORED, nil
+			return DeliveryStatus_DELIVERY_STATUS_UNSPECIFIED, fmt.Errorf("fan out command %d to gate %q endpoint %q: %w", message.CommandID, endpoint.GateID, endpoint.Address, err)
 		}
 		return DeliveryStatus_DELIVERY_STATUS_DELIVERED, nil
 	})
 	errs := fanoutErrors(results)
+	if ctx != nil && ctx.Err() != nil {
+		return Receipt{}, errors.Join(append(errs, ctx.Err())...)
+	}
 	if len(errs) == len(endpoints) {
 		return Receipt{}, errors.Join(errs...)
 	}
 	return newReceipt(), errors.Join(errs...)
 }
 
-// SendToPlayer tries the local session registry of every Gate. IGNORED means
-// that Gate does not own the player and is not an error for this fan-out.
+// SendToPlayer 嘗試每個 Gate 的本機 session registry。IGNORED 表示該 Gate
+// 不擁有 player，對這輪 fan-out 不算錯誤。
 func (s *FanoutSender) SendToPlayer(ctx context.Context, message PlayerMessage) (Receipt, error) {
-	if err := message.validatePayload(s.transportPayloadLimit()); err != nil {
+	if err := message.validatePayload(DefaultMaxPayloadBytes); err != nil {
 		return Receipt{}, err
 	}
-	return s.sendToPlayerValidated(ctx, message)
-}
-
-func (s *FanoutSender) sendToPlayerValidated(ctx context.Context, message PlayerMessage) (Receipt, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return Receipt{}, err
+	}
 	endpoints, err := s.list(ctx)
 	if err != nil {
 		return Receipt{}, err
@@ -195,7 +205,7 @@ func (s *FanoutSender) sendToPlayerValidated(ctx context.Context, message Player
 	results := s.fanout(ctx, endpoints, func(endpoint GateEndpoint) (DeliveryStatus, error) {
 		statusValue, err := s.transport.SendToPlayer(ctx, endpoint, message)
 		if err != nil {
-			if statusValue == DeliveryStatus_DELIVERY_STATUS_IGNORED || errors.Is(err, ErrTargetNotConnected) {
+			if errors.Is(err, ErrTargetNotConnected) {
 				return DeliveryStatus_DELIVERY_STATUS_IGNORED, nil
 			}
 			return DeliveryStatus_DELIVERY_STATUS_UNSPECIFIED, fmt.Errorf("fan out player %q to gate %q endpoint %q: %w", message.LoginName, endpoint.GateID, endpoint.Address, err)
@@ -214,10 +224,13 @@ func (s *FanoutSender) sendToPlayerValidated(ctx context.Context, message Player
 		case DeliveryStatus_DELIVERY_STATUS_DELIVERED:
 			delivered++
 		case DeliveryStatus_DELIVERY_STATUS_IGNORED:
-			// This Gate does not own the player; continue checking others.
+			// 該 Gate 不擁有 player，繼續檢查其他 Gate。
 		default:
 			errs = append(errs, fmt.Errorf("fan out player %q to gate %q endpoint %q: invalid delivery status %s", message.LoginName, result.endpoint.GateID, result.endpoint.Address, result.status))
 		}
+	}
+	if ctx != nil && ctx.Err() != nil {
+		errs = append(errs, ctx.Err())
 	}
 	if delivered > 0 {
 		return newReceipt(), errors.Join(errs...)
@@ -226,13 +239,6 @@ func (s *FanoutSender) sendToPlayerValidated(ctx context.Context, message Player
 		return Receipt{}, errors.Join(errs...)
 	}
 	return Receipt{}, fmt.Errorf("%w: player %q was ignored by every Gate", ErrTargetNotConnected, message.LoginName)
-}
-
-func (s *FanoutSender) transportPayloadLimit() int {
-	if s == nil || s.transport == nil {
-		return DefaultMaxPayloadBytes
-	}
-	return s.transport.cfg.MaxPayloadBytes
 }
 
 func (s *FanoutSender) list(ctx context.Context) ([]GateEndpoint, error) {
@@ -273,11 +279,13 @@ type fanoutResult struct {
 	err      error
 }
 
-// fanout bounds concurrent RPCs so one unavailable Gate cannot turn an
-// explicitly selected delivery into endpoint-count multiplied timeouts.
-// Every endpoint still receives one attempt; callers decide how to aggregate
-// statuses.
+// fanout 限制並行 RPC，避免單一不可用 Gate 讓一次明確 delivery 變成
+// endpoint 數量倍增的 timeout；每個 endpoint 仍會嘗試一次，結果如何聚合
+// 由呼叫端決定。
 func (s *FanoutSender) fanout(ctx context.Context, endpoints []GateEndpoint, deliver func(GateEndpoint) (DeliveryStatus, error)) []fanoutResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	workerCount := min(defaultFanoutConcurrency, len(endpoints))
 	jobs := make(chan GateEndpoint)
 	results := make(chan fanoutResult, len(endpoints))
@@ -292,8 +300,13 @@ func (s *FanoutSender) fanout(ctx context.Context, endpoints []GateEndpoint, del
 			}
 		}()
 	}
+schedule:
 	for _, endpoint := range endpoints {
-		jobs <- endpoint
+		select {
+		case jobs <- endpoint:
+		case <-ctx.Done():
+			break schedule
+		}
 	}
 	close(jobs)
 	workers.Wait()
@@ -315,62 +328,45 @@ func fanoutErrors(results []fanoutResult) []error {
 	return errs
 }
 
-// FallbackBroadcastSender runs one explicitly configured fallback after any
-// primary error. It deliberately does not classify errors: a primary error may
-// be ambiguous and this best-effort policy can produce a duplicate frame.
+// FallbackBroadcastSender 在 Redis primary error 後執行一次 gRPC fallback。
+// primary error 可能是結果不明，因此此 best-effort policy 可能產生重複 frame。
 type FallbackBroadcastSender struct {
-	primary         BroadcastSender
-	fallback        BroadcastSender
-	maxPayloadBytes int
+	primary  BroadcastSender
+	fallback BroadcastSender
 }
 
-type BroadcastFallbackConfig struct{ MaxPayloadBytes int }
-
-func NewFallbackBroadcastSender(primary, fallback BroadcastSender, configs ...BroadcastFallbackConfig) (*FallbackBroadcastSender, error) {
+func NewFallbackBroadcastSender(primary, fallback BroadcastSender) (*FallbackBroadcastSender, error) {
 	if primary == nil || fallback == nil {
 		return nil, errors.New("server send: primary and fallback broadcast senders are required")
 	}
-	if len(configs) > 1 {
-		return nil, fmt.Errorf("%w: only one broadcast fallback config is supported", ErrDestinationInvalid)
-	}
-	maxPayloadBytes := 0
-	if len(configs) == 1 {
-		maxPayloadBytes = configs[0].MaxPayloadBytes
-	}
-	maxPayloadBytes, err := normalizedPayloadLimit(maxPayloadBytes)
-	if err != nil {
-		return nil, err
-	}
-	return &FallbackBroadcastSender{primary: primary, fallback: fallback, maxPayloadBytes: maxPayloadBytes}, nil
+	return &FallbackBroadcastSender{primary: primary, fallback: fallback}, nil
 }
 
-func (s *FallbackBroadcastSender) Broadcast(ctx context.Context, message BroadcastMessage) (Receipt, error) {
+func (s *FallbackBroadcastSender) Broadcast(ctx context.Context, message Message) (Receipt, error) {
 	if s == nil || s.primary == nil || s.fallback == nil {
 		return Receipt{}, errors.New("server send: fallback broadcast sender is not configured")
 	}
-	if err := message.validatePayload(s.maxPayloadBytes); err != nil {
+	if err := message.validatePayload(DefaultMaxPayloadBytes); err != nil {
 		return Receipt{}, err
 	}
-	primaryReceipt, primaryErr := callValidatedBroadcast(s.primary, ctx, message)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return Receipt{}, err
+	}
+	primaryReceipt, primaryErr := s.primary.Broadcast(ctx, message)
 	if primaryErr == nil {
 		return primaryReceipt, nil
 	}
-	fallbackReceipt, fallbackErr := callValidatedBroadcast(s.fallback, ctx, message)
+	if err := ctx.Err(); err != nil {
+		return Receipt{}, err
+	}
+	fallbackReceipt, fallbackErr := s.fallback.Broadcast(ctx, message)
 	if fallbackErr == nil {
 		return fallbackReceipt, nil
 	}
 	return fallbackReceipt, errors.Join(primaryErr, fallbackErr)
-}
-
-type validatedBroadcastSender interface {
-	broadcastValidated(context.Context, BroadcastMessage) (Receipt, error)
-}
-
-func callValidatedBroadcast(sender BroadcastSender, ctx context.Context, message BroadcastMessage) (Receipt, error) {
-	if validated, ok := sender.(validatedBroadcastSender); ok {
-		return validated.broadcastValidated(ctx, message)
-	}
-	return sender.Broadcast(ctx, message)
 }
 
 var _ RequestPlayerSender = (*DirectRequestPlayerSender)(nil)

@@ -8,12 +8,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/grpcserver"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc"
 )
 
 func TestGameServerSendContractDeliversAcrossTwoGates(t *testing.T) {
-	gateASessions, gateAEndpoint := startContractGateReceiver(t, "gate-a")
-	gateBSessions, gateBEndpoint := startContractGateReceiver(t, "gate-b")
+	gateASessions, gateADispatcher, gateAEndpoint := startContractGateReceiver(t, "gate-a")
+	gateBSessions, gateBDispatcher, gateBEndpoint := startContractGateReceiver(t, "gate-b")
 
 	alice := &registrySession{id: "gate-a-alice"}
 	carol := &registrySession{id: "gate-a-carol"}
@@ -59,21 +64,69 @@ func TestGameServerSendContractDeliversAcrossTwoGates(t *testing.T) {
 	assertServerSendPacket(t, bob, 102, "private")
 	assertNoServerSendPacket(t, alice, 102)
 
+	miniRedis := miniredis.RunT(t)
+	subscriberClient := redis.NewClient(&redis.Options{Addr: miniRedis.Addr()})
+	t.Cleanup(func() { _ = subscriberClient.Close() })
+	producerClient := redis.NewClient(&redis.Options{Addr: miniRedis.Addr()})
+	t.Cleanup(func() { _ = producerClient.Close() })
+	keys, err := serversend.NewKeyspace("dual-gate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateASubscriber, err := serversend.NewRedisBroadcastSubscriber(subscriberClient, keys, gateADispatcher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateBSubscriber, err := serversend.NewRedisBroadcastSubscriber(subscriberClient, keys, gateBDispatcher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, subscriber := range map[string]*serversend.RedisBroadcastSubscriber{
+		"gate-a": gateASubscriber,
+		"gate-b": gateBSubscriber,
+	} {
+		if err := subscriber.Start(context.Background()); err != nil {
+			t.Fatalf("start %s Redis subscriber: %v", name, err)
+		}
+		t.Cleanup(func() { _ = subscriber.Stop(context.Background()) })
+	}
 	fanout, err := serversend.NewFanoutSender(directory, transport)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fanout.Broadcast(context.Background(), serversend.BroadcastMessage{RoomID: "room-a", Message: serversend.Message{CommandID: 103, Payload: []byte("room")}}); err != nil {
-		t.Fatalf("room fan-out: %v", err)
+	redisSender, err := serversend.NewRedisBroadcastSender(producerClient, keys)
+	if err != nil {
+		t.Fatal(err)
 	}
-	assertServerSendPacket(t, alice, 103, "room")
-	assertServerSendPacket(t, bob, 103, "room")
+	broadcastSender, err := serversend.NewFallbackBroadcastSender(
+		redisSender,
+		fanout,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := broadcastSender.Broadcast(context.Background(), serversend.Message{CommandID: 103, Payload: []byte("redis")}); err != nil {
+		t.Fatalf("Redis broadcast: %v", err)
+	}
+	waitForServerSendPacket(t, alice, 103, "redis")
+	waitForServerSendPacket(t, bob, 103, "redis")
+	assertNoServerSendPacket(t, carol, 103)
+	assertNoServerSendPacket(t, dave, 103)
+
+	if err := producerClient.Close(); err != nil {
+		t.Fatalf("close Redis producer: %v", err)
+	}
+	if _, err := broadcastSender.Broadcast(context.Background(), serversend.Message{CommandID: 103, Payload: []byte("grpc-fallback")}); err != nil {
+		t.Fatalf("gRPC fallback broadcast: %v", err)
+	}
+	assertServerSendPacket(t, alice, 103, "grpc-fallback")
+	assertServerSendPacket(t, bob, 103, "grpc-fallback")
 	assertNoServerSendPacket(t, carol, 103)
 	assertNoServerSendPacket(t, dave, 103)
 }
 
 func TestGameServerSendContractReportsUnavailableGateInPartialFanout(t *testing.T) {
-	gateSessions, endpoint := startContractGateReceiver(t, "gate-live")
+	gateSessions, _, endpoint := startContractGateReceiver(t, "gate-live")
 	session := &registrySession{id: "gate-live-alice"}
 	if err := gateSessions.Register(session, "alice"); err != nil {
 		t.Fatal(err)
@@ -103,15 +156,15 @@ func TestGameServerSendContractReportsUnavailableGateInPartialFanout(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fanout.Broadcast(context.Background(), serversend.BroadcastMessage{RoomID: "room-a", Message: serversend.Message{CommandID: 104, Payload: []byte("partial")}}); err == nil || !strings.Contains(err.Error(), "gate-down") {
+	if _, err := fanout.Broadcast(context.Background(), serversend.Message{CommandID: 104, Payload: []byte("partial")}); err == nil || !strings.Contains(err.Error(), "gate-down") {
 		t.Fatalf("partial fan-out error = %v, want gate-down identity", err)
 	}
 	assertServerSendPacket(t, session, 104, "partial")
 }
 
-func TestGameServerSendContractPlayerFallbackFindsOwnerAfterStalePrimaryRoute(t *testing.T) {
-	_, gateAEndpoint := startContractGateReceiver(t, "gate-a")
-	gateBSessions, gateBEndpoint := startContractGateReceiver(t, "gate-b")
+func TestGameServerSendContractPlayerRouteReturnsStalePrimaryError(t *testing.T) {
+	_, _, gateAEndpoint := startContractGateReceiver(t, "gate-a")
+	gateBSessions, _, gateBEndpoint := startContractGateReceiver(t, "gate-b")
 	bob := &registrySession{id: "gate-b-bob"}
 	if err := gateBSessions.Register(bob, "bob"); err != nil {
 		t.Fatal(err)
@@ -130,60 +183,46 @@ func TestGameServerSendContractPlayerFallbackFindsOwnerAfterStalePrimaryRoute(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if receipt, err := routed.SendToPlayer(context.Background(), serversend.PlayerMessage{LoginName: "bob", Message: serversend.Message{CommandID: 105, Payload: []byte("fallback")}}); err != nil || receipt.AcceptedAt.IsZero() {
-		t.Fatalf("player fallback = receipt:%#v error:%v, want accepted/nil", receipt, err)
+	if receipt, err := routed.SendToPlayer(context.Background(), serversend.PlayerMessage{LoginName: "bob", Message: serversend.Message{CommandID: 105, Payload: []byte("route")}}); err != nil || receipt.AcceptedAt.IsZero() {
+		t.Fatalf("stale player route fallback = receipt:%#v error:%v, want accepted/nil", receipt, err)
 	}
-	assertServerSendPacket(t, bob, 105, "fallback")
+	assertServerSendPacket(t, bob, 105, "route")
 }
 
-func TestGameServerSendContractPlayerFallbackMayReachDuplicateGateLocalSessionsUntilGlobalOwnershipExists(t *testing.T) {
-	gateASessions, gateAEndpoint := startContractGateReceiver(t, "gate-a")
-	gateBSessions, gateBEndpoint := startContractGateReceiver(t, "gate-b")
-	aliceA := &registrySession{id: "gate-a-alice"}
-	aliceB := &registrySession{id: "gate-b-alice"}
-	if err := gateASessions.Register(aliceA, "alice"); err != nil {
-		t.Fatal(err)
-	}
-	if err := gateBSessions.Register(aliceB, "alice"); err != nil {
-		t.Fatal(err)
-	}
-	directory := dualGateDirectory{endpoints: []serversend.GateEndpoint{gateAEndpoint, gateBEndpoint}}
-	transport, err := serversend.NewGRPCTransport(serversend.TransportConfig{RequestTimeout: time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = transport.Stop(context.Background()) })
-	fanout, err := serversend.NewFanoutSender(directory, transport)
-	if err != nil {
-		t.Fatal(err)
-	}
-	routed, err := serversend.NewRoutedPlayerSender(dualGatePresenceResolver{presence: serversend.Presence{LoginName: "alice", GateID: "missing-gate", Epoch: 1}}, directory, transport, fanout)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := routed.SendToPlayer(context.Background(), serversend.PlayerMessage{LoginName: "alice", Message: serversend.Message{CommandID: 106, Payload: []byte("duplicate-limited")}}); err != nil {
-		t.Fatalf("duplicate local-session fallback: %v", err)
-	}
-	assertServerSendPacket(t, aliceA, 106, "duplicate-limited")
-	assertServerSendPacket(t, aliceB, 106, "duplicate-limited")
-}
-
-func startContractGateReceiver(t *testing.T, gateID serversend.GateID) (*SessionRegistry, serversend.GateEndpoint) {
+func startContractGateReceiver(t *testing.T, gateID serversend.GateID) (*SessionRegistry, *dispatcher.Dispatcher, serversend.GateEndpoint) {
 	t.Helper()
 	sessions := NewSessionRegistry()
-	receiver, err := newGateServerSendReceiver(sessions)
+	receiver, err := newGateDeliveryReceiver(sessions)
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := serversend.NewReceiverServer(serversend.ReceiverConfig{ListenAddr: "127.0.0.1:0"}, receiver)
+	commandDispatcher := dispatcher.New()
+	for _, commandID := range []uint32{102, 103, 104, 105} {
+		if err := commandDispatcher.Register(serversend.RemoteCommandChannel, dispatcher.CommandID(commandID), func(_ context.Context, payload []byte) error {
+			_, err := sessions.BroadcastRoom("room-a", EncodeWebSocketPacket(WebSocketPacket{CommandID: commandID, Payload: append([]byte(nil), payload...)}))
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service, err := serversend.NewGateDeliveryService(receiver, commandDispatcher)
 	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := grpcserver.New(grpcserver.Config{ListenAddr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Register(serversend.GateDelivery_ServiceDesc.ServiceName, func(registrar grpc.ServiceRegistrar) {
+		serversend.RegisterGateDeliveryServer(registrar, service)
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = server.Stop(context.Background()) })
-	return sessions, serversend.GateEndpoint{GateID: gateID, Address: server.Addr()}
+	return sessions, commandDispatcher, serversend.GateEndpoint{GateID: gateID, Address: server.Addr()}
 }
 
 type dualGateDirectory struct {
@@ -213,12 +252,31 @@ func (r dualGatePresenceResolver) Resolve(context.Context, serversend.LoginName)
 
 func assertServerSendPacket(t *testing.T, session *registrySession, commandID uint32, payload string) {
 	t.Helper()
-	for _, packet := range session.Sent() {
-		if len(packet) >= webSocketPacketHeaderSize && binary.BigEndian.Uint32(packet[:4]) == commandID && string(packet[webSocketPacketHeaderSize:]) == payload {
-			return
-		}
+	if hasServerSendPacket(session, commandID, payload) {
+		return
 	}
 	t.Fatalf("session %q did not receive command %#x payload %q; packets=%x", session.ID(), commandID, payload, session.Sent())
+}
+
+func waitForServerSendPacket(t *testing.T, session *registrySession, commandID uint32, payload string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if hasServerSendPacket(session, commandID, payload) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	assertServerSendPacket(t, session, commandID, payload)
+}
+
+func hasServerSendPacket(session *registrySession, commandID uint32, payload string) bool {
+	for _, packet := range session.Sent() {
+		if len(packet) >= webSocketPacketHeaderSize && binary.BigEndian.Uint32(packet[:4]) == commandID && string(packet[webSocketPacketHeaderSize:]) == payload {
+			return true
+		}
+	}
+	return false
 }
 
 func assertNoServerSendPacket(t *testing.T, session *registrySession, commandID uint32) {

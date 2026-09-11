@@ -9,7 +9,7 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
-	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/grpcserver"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/infra"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/observability"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
@@ -45,8 +45,8 @@ func (a *App) Run(ctx context.Context) error {
 	return a.frameworkApp.Run(ctx)
 }
 
-// moduleWithSnapshot registers only the shallow SDK contract; Game business
-// resources, handlers, consumers, and transports remain out of this move.
+// moduleWithSnapshot wires shared product infrastructure, delivery boundaries,
+// and the generic Game gRPC ingress; business handlers remain product modules.
 func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 	return func(r framework.Registry) error {
 		if snapshot == nil || framework.IsNilDependency(snapshot) {
@@ -64,11 +64,15 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 		if err := r.Provide(newGameMetrics); err != nil {
 			return err
 		}
-		grpcConfig, err := gameGateGRPCConfig(snapshot)
+		grpcConfig, err := gameGRPCServerConfig(snapshot)
 		if err != nil {
 			return err
 		}
-		if err := r.Provide(func() gatelink.ServerConfig { return grpcConfig }); err != nil {
+		if err := r.Provide(func() grpcserver.Config { return grpcConfig }); err != nil {
+			return err
+		}
+		gateTransportConfig, gateFanout, gateClientEnabled, err := gameGRPCGateClient(snapshot)
+		if err != nil {
 			return err
 		}
 		if err := dispatcher.Module(r); err != nil {
@@ -77,18 +81,31 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 		if err := infra.Module(r); err != nil {
 			return err
 		}
-		serverSendConfig, serverSendEnabled, err := gameServerSendConfig(snapshot)
+		broadcastConfig, broadcastConfigured, err := gameServerSendBroadcast(snapshot)
 		if err != nil {
 			return err
 		}
-		if serverSendEnabled {
-			if err := r.Provide(func() serversend.Config { return serverSendConfig }); err != nil {
+		broadcastEnabled := broadcastConfigured
+		if broadcastEnabled && !gateClientEnabled {
+			return fmt.Errorf("game broadcast: grpc.clients.gate is required")
+		}
+		if err := r.Provide(newGameServerSendKeyspace); err != nil {
+			return err
+		}
+		if err := r.Provide(newGameRequestPlayerSender); err != nil {
+			return err
+		}
+		if gateClientEnabled {
+			if err := r.Provide(func() serversend.TransportConfig { return gateTransportConfig }); err != nil {
 				return err
 			}
-			if err := r.Provide(newGameServerSendKeyspace); err != nil {
+			if err := r.Provide(func() gameFanoutConfig { return gateFanout }); err != nil {
 				return err
 			}
-			if err := r.ProvideManaged("game-server-send-grpc", framework.PhaseInfrastructure, newGameServerSendTransport); err != nil {
+			if err := r.ProvideManaged("game-gate-grpc-client", framework.PhaseInfrastructure, newGameServerSendTransport); err != nil {
+				return err
+			}
+			if err := r.Provide(newGameFanoutSender); err != nil {
 				return err
 			}
 			if err := r.Provide(newGamePresenceResolver); err != nil {
@@ -97,19 +114,16 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 			if err := r.Provide(newGameGateDirectory); err != nil {
 				return err
 			}
-			if err := r.Provide(newGameRequestPlayerSender); err != nil {
-				return err
-			}
 			if err := r.Provide(newGamePlayerSender); err != nil {
 				return err
 			}
-			if serverSendConfig.Broadcast.Primary == "redis" {
-				if err := r.Provide(newGameRedisBroadcastSender); err != nil {
-					return err
-				}
+		}
+		if broadcastEnabled {
+			if err := r.Provide(func() gameServerSendBroadcastConfig { return broadcastConfig }); err != nil {
+				return err
 			}
-			if gameServerSendNeedsFanout(serverSendConfig) {
-				if err := r.Provide(newGameFanoutSender); err != nil {
+			if broadcastConfig.Primary == "redis" {
+				if err := r.Provide(newGameRedisBroadcastSender); err != nil {
 					return err
 				}
 			}
@@ -117,16 +131,15 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 				return err
 			}
 		}
-		if err := r.Provide(newGameGateGRPCServer); err != nil {
+		if err := r.Provide(newGameGateGRPCService); err != nil {
 			return err
 		}
-		if err := r.AddHook(newGameGateGRPCHook); err != nil {
+		if err := r.ProvideManaged("game-grpc-server", framework.PhaseIngress, newGameGRPCServer); err != nil {
+			return err
+		}
+		if err := r.Configure(registerGameGateRequestService); err != nil {
 			return err
 		}
 		return nil
 	}
-}
-
-func gameServerSendNeedsFanout(cfg serversend.Config) bool {
-	return cfg.Broadcast.Primary == "grpc" || cfg.Player.Fallback == "grpc" || cfg.Broadcast.Fallback == "grpc"
 }

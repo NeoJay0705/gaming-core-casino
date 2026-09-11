@@ -5,15 +5,19 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
-	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/grpcserver"
+	infraRedis "github.com/NeoJay0705/gaming-core-casino/pkg/infra/redis"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/observability"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
+	"github.com/alicebob/miniredis/v2"
 )
 
 func TestModuleWithSnapshotBuildsRunnableNoopApp(t *testing.T) {
-	app, err := framework.New(moduleWithSnapshot(contractSnapshot{}))
+	app, err := framework.New(moduleWithSnapshot(newContractSnapshot(t)))
 	if err != nil {
 		t.Fatalf("build app: %v", err)
 	}
@@ -46,8 +50,10 @@ func TestNewAppUsesProductModule(t *testing.T) {
 }
 
 func TestNewAppProvidesSnapshotsToProductModule(t *testing.T) {
+	miniRedis := miniredis.RunT(t)
 	path := filepath.Join(t.TempDir(), "app.yaml")
-	if err := os.WriteFile(path, []byte("observability:\n  listen_addr: 127.0.0.1:0\nproduct:\n  code: core-casino\ngate_to_game:\n  target: dns:///gameproduct:9090\n"), 0o600); err != nil {
+	contents := "observability:\n  listen_addr: 127.0.0.1:0\nproduct:\n  code: core-casino\ngrpc:\n  server:\n    listen_addr: 127.0.0.1:0\n  clients:\n    game:\n      target: dns:///gameproduct:9090\n  endpoint_registration:\n    ttl: 30s\nsession_ownership:\n  lease_ttl: 30s\nredis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var sourceCode, mergedCode string
@@ -89,31 +95,52 @@ func TestNewAppProvidesSnapshotsToProductModule(t *testing.T) {
 
 func testInputs(t *testing.T) config.ConfigInputs {
 	t.Helper()
+	miniRedis := miniredis.RunT(t)
 	path := filepath.Join(t.TempDir(), "app.yaml")
-	if err := os.WriteFile(path, []byte("observability:\n  listen_addr: 127.0.0.1:0\nproduct: {}\ngate_to_game:\n  target: dns:///gameproduct:9090\n"), 0o600); err != nil {
+	contents := "observability:\n  listen_addr: 127.0.0.1:0\nproduct: {}\ngrpc:\n  server:\n    listen_addr: 127.0.0.1:0\n  clients:\n    game:\n      target: dns:///gameproduct:9090\n  endpoint_registration:\n    ttl: 30s\nsession_ownership:\n  lease_ttl: 30s\nredis:\n  addr: " + miniRedis.Addr() + "\n  key_prefix: core-casino\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return config.ConfigInputs{MergedPaths: []string{path}}
 }
 
-type contractSnapshot struct{}
+type contractSnapshot struct{ redisAddr string }
 
 const observabilityTestYAML = "observability:\n  listen_addr: 127.0.0.1:0\n"
 
-func (contractSnapshot) Bind(path string, target any, _ ...config.BindOption) error {
+func (s contractSnapshot) Bind(path string, target any, _ ...config.BindOption) error {
 	if path == "observability" {
 		target.(*observability.Config).ListenAddr = "127.0.0.1:0"
 	}
-	if path == "gate_to_game" {
-		target.(*gatelink.ClientConfig).Target = "dns:///gameproduct:9090"
+	if path == "grpc.server" {
+		target.(*grpcserver.Config).ListenAddr = "127.0.0.1:0"
+	}
+	if path == "grpc.clients.game" {
+		target.(*gateGRPCClientConfig).Target = "dns:///gameproduct:9090"
+	}
+	if path == "grpc.endpoint_registration" {
+		target.(*gateEndpointRegistrationConfig).TTL = 30 * time.Second
+	}
+	if path == "session_ownership" {
+		target.(*serversend.PresenceConfig).LeaseTTL = 30 * time.Second
+	}
+	if path == "redis" {
+		value := target.(*infraRedis.Config)
+		value.Addr = s.redisAddr
+		value.KeyPrefix = "core-casino"
 	}
 	return nil
 }
 func (contractSnapshot) Has(path string) bool {
-	return path == "gate_to_game" || path == "observability"
+	return path == "grpc.server" || path == "grpc.clients.game" || path == "grpc.endpoint_registration" || path == "session_ownership" || path == "redis" || path == "observability"
 }
 func (contractSnapshot) HasSource(string) bool                                      { return false }
 func (contractSnapshot) BindSource(string, string, any, ...config.BindOption) error { return nil }
+
+func newContractSnapshot(t *testing.T) contractSnapshot {
+	t.Helper()
+	return contractSnapshot{redisAddr: miniredis.RunT(t).Addr()}
+}
 
 type contractNoop struct{}
 
