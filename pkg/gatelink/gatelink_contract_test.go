@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -305,6 +306,91 @@ func TestContractRejectsRequestsWithoutRegisteredHandler(t *testing.T) {
 	_, err = server.Forward(context.Background(), &GateRequest{CommandId: 1})
 	if status.Code(err) != codes.Unimplemented {
 		t.Fatalf("forward without handler status = %s, want %s", status.Code(err), codes.Unimplemented)
+	}
+}
+
+func TestContractMaxConcurrentStreamsLimitsHandlerAdmission(t *testing.T) {
+	firstEntered := make(chan struct{})
+	secondEntered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	handler := RequestHandlerFunc(func(context.Context, Request) error {
+		current := active.Add(1)
+		for {
+			previous := maxActive.Load()
+			if current <= previous || maxActive.CompareAndSwap(previous, current) {
+				break
+			}
+		}
+		switch calls.Add(1) {
+		case 1:
+			close(firstEntered)
+		case 2:
+			close(secondEntered)
+		}
+		<-release
+		active.Add(-1)
+		return nil
+	})
+	server, err := NewServer(ServerConfig{
+		ListenAddr:           "127.0.0.1:0",
+		MaxConcurrentStreams: 1,
+	}, handler)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+	var releaseOnce sync.Once
+	releaseHandlers := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		releaseHandlers()
+		_ = server.Stop(context.Background())
+	})
+
+	client, err := NewClient(ClientConfig{Target: server.Addr(), Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Stop(context.Background()) })
+
+	done := make(chan error, 2)
+	forward := func() {
+		ctx := WithGateRequestContext(context.Background(), GateRequestContext{
+			Source: RequestSource{ConnectionID: "stream-limit-test"},
+		})
+		_, err := client.Forward(ctx, Request{CommandID: 1})
+		done <- err
+	}
+	go forward()
+	select {
+	case <-firstEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first handler did not start")
+	}
+	go forward()
+	select {
+	case <-secondEntered:
+		t.Fatal("second handler entered before first handler was released")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	releaseHandlers()
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("forward %d: %v", i+1, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("forward %d did not complete after release", i+1)
+		}
+	}
+	if got := maxActive.Load(); got != 1 {
+		t.Fatalf("maximum active handlers = %d, want 1", got)
 	}
 }
 

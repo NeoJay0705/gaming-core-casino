@@ -18,6 +18,8 @@ import (
 // ServerConfig configures the Game-side Gate request listener.
 type ServerConfig struct {
 	ListenAddr string `config:"listen_addr" yaml:"listen_addr"`
+	// MaxConcurrentStreams 限制每條 gRPC transport 的並行 stream；0 保留 grpc-go default。
+	MaxConcurrentStreams uint32 `config:"max_concurrent_streams" yaml:"max_concurrent_streams"`
 }
 
 // RequestHandler is the Game product registration point for requests received
@@ -145,7 +147,13 @@ func (s *Server) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("gatelink: listen on %s: %w", s.cfg.ListenAddr, err)
 	}
-	server := grpc.NewServer(grpc.ChainUnaryInterceptor(incomingRequestContextInterceptor, recoveryInterceptor))
+	serverOptions := []grpc.ServerOption{
+		grpc.ChainUnaryInterceptor(incomingRequestContextInterceptor, recoveryInterceptor),
+	}
+	if s.cfg.MaxConcurrentStreams > 0 {
+		serverOptions = append(serverOptions, grpc.MaxConcurrentStreams(s.cfg.MaxConcurrentStreams))
+	}
+	server := grpc.NewServer(serverOptions...)
 	RegisterGateRequestServiceServer(server, s)
 	s.listener, s.server = listener, server
 	go func() { _ = server.Serve(listener) }()
