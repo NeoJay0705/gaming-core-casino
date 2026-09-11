@@ -31,6 +31,87 @@ Load client 另外在 `http://127.0.0.1:22081/metrics` 暴露 example-local Echo
 Histogram、in-flight Gauge，以及 Go runtime/process collectors，可用 `-metrics-addr` 調整 listener。這個 endpoint 只觀測壓測端，
 不屬於 framework product；完整的 client／Gate／Game 比對方法見 repository root 的
 `ACTIONABLE_METRICS_EXAMPLE_VALIDATION.md`。
+
+若要單獨隔離 GateLink gRPC transport（不經 WebSocket、Login、EnterRoom 或 Gate writer），可啟動 direct
+gRPC load client。它固定呼叫本範例的 Echo command，使用固定總 worker 數，只有
+`-client-connections` 是 A/B 變因：
+
+```sh
+go run ./examples/metrics/game
+go run ./examples/metrics/grpcload \
+  -game-target 127.0.0.1:19090 \
+  -client-connections 1 \
+  -concurrency 400 \
+  -warmup-requests 1 \
+  -duration 30s
+```
+
+direct client 預設在 `http://127.0.0.1:22082/metrics` 提供上述 metrics，可用 `-metrics-addr` 調整。
+
+在相同 `-concurrency`、`-payload-bytes`、`-duration` 與 `GOMAXPROCS=4` 下依序比較
+`-client-connections 1`、`2`、`4`，每個組合至少重複三次並交錯順序。每輪記錄 grpcload
+`completed_rps`，並從 `/metrics` 讀取
+`gaming_core_example_grpc_load_round_trips_total`、
+`gaming_core_example_grpc_load_round_trip_duration_seconds` 與
+`gaming_core_example_grpc_load_round_trips_in_flight`；`result="error"` 或測量結束後
+in-flight 非零的 run 不具比較資格。此 direct 結果只代表 loopback 與 plaintext gRPC，不能單獨取代完整
+Gate/WebSocket 壓測。
+
+要判斷是否已到達 capacity knee，先固定 `-client-connections 1`，以相同 payload 與 duration
+測試 concurrency `100`、`200`、`400`、`800`（每組至少三次）。若提高 concurrency 後 median RPS
+已沒有超過 run-to-run variation 的增加，但 p95/p99 latency 持續上升，才表示該組合已接近飽和；
+`in_flight` 只是 active unary requests，在 closed-loop 穩態下接近 concurrency 是預期行為，不是
+saturation ratio。再於該 concurrency 固定總 workers 比較 `ClientConn=1/2/4`，避免把 offered load
+誤認成 connection 效果。
+
+最小 PromQL（以 scrape interval 小於查詢窗口為前提）如下：
+
+```promql
+# completed RPS（只計成功）
+rate(gaming_core_example_grpc_load_round_trips_total{result="success"}[30s])
+
+# 成功 request 的 p95 latency
+histogram_quantile(0.95, sum by (le) (
+  rate(gaming_core_example_grpc_load_round_trip_duration_seconds_bucket{result="success"}[30s])
+))
+
+# error rate
+rate(gaming_core_example_grpc_load_round_trips_total{result="error"}[30s])
+
+# active unary requests；不是 saturation ratio
+gaming_core_example_grpc_load_round_trips_in_flight
+
+# grpcload 約略使用的 Go CPU capacity 比例（job label 依 Prometheus 設定調整）
+rate(process_cpu_seconds_total{job="grpcload"}[30s])
+/
+go_sched_gomaxprocs_threads{job="grpcload"}
+```
+
+CPU 比例接近 `1` 表示該 process 接近可用 `GOMAXPROCS`；若 CPU 未接近上限但增加
+`ClientConn` 可持續改善 RPS，才支持 single-transport contention 候選。CPU、latency knee 與
+pprof／trace 必須一起判讀，不能由單一 Gauge 宣稱飽和。
+
+需要 function-level evidence 時，在 Gate、Game 或 grpcload 另外開啟 loopback-only pprof listener；不帶
+`-pprof-addr` 時不會建立該 listener：
+
+```sh
+GOMAXPROCS=4 go run ./examples/metrics/game -pprof-addr 127.0.0.1:19082
+GOMAXPROCS=4 go run ./examples/metrics/gate -pprof-addr 127.0.0.1:18082
+GOMAXPROCS=4 go run ./examples/metrics/grpcload \
+  -client-connections 1 \
+  -pprof-addr 127.0.0.1:22083
+
+go tool pprof -http=:0 \
+  'http://127.0.0.1:19082/debug/pprof/profile?seconds=20'
+curl -o /tmp/game-gatelink.trace \
+  'http://127.0.0.1:19082/debug/pprof/trace?seconds=5'
+go tool trace /tmp/game-gatelink.trace
+```
+
+pprof／trace run 只用來找 CPU、goroutine、network block 或 scheduler hotspot，不納入正式 RPS／latency
+比較。只有在未 profile 的 direct `1/2/4 ClientConn` A/B 至少三輪可重現、CPU／runtime saturation 未由
+其他 process 先達上限，且 profile stack 與 A/B 方向一致時，才可把結果寫成 root-cause candidate；不能
+僅憑 broad Gate unary latency 或單次 pprof 宣稱 `MaxConcurrentStreams`、grpc-go defect 或硬體極限。
 只要更換 `-config` 即可調整 listener 或 Redis 設定；範例 login 是 in-memory policy，不能
 當成正式 authentication。EnterRoom 與 Echo 的 protobuf 與 command IDs 位於
 `examples/metrics/internal/protocol`，只屬於本範例，不是 product 的 production API；正式服務應
