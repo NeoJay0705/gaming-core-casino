@@ -10,7 +10,54 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 )
 
-func TestSessionRegistryPresenceContractClaimsAndRenewsAuthenticatedSession(t *testing.T) {
+func newSessionRegistry(presence sessionPresence, leaseTTL time.Duration) (*SessionRegistry, error) {
+	if presence == nil {
+		return newSessionRegistryWithScheduler(nil, serversend.PresenceConfig{}, nil, nil)
+	}
+	scheduler := &sessionPresenceSchedulerFake{}
+	return newSessionRegistryWithScheduler(presence, serversend.PresenceConfig{LeaseTTL: leaseTTL}, nil, scheduler)
+}
+
+type sessionPresenceSchedulerFake struct {
+	mu          sync.Mutex
+	scheduled   []serversend.Presence
+	removed     []serversend.Presence
+	scheduleErr error
+}
+
+func (s *sessionPresenceSchedulerFake) Start(context.Context) error { return nil }
+
+func (s *sessionPresenceSchedulerFake) Stop(context.Context) error { return nil }
+
+func (s *sessionPresenceSchedulerFake) Schedule(presence serversend.Presence) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.scheduleErr != nil {
+		return s.scheduleErr
+	}
+	s.scheduled = append(s.scheduled, presence)
+	return nil
+}
+
+func (s *sessionPresenceSchedulerFake) Remove(presence serversend.Presence) {
+	s.mu.Lock()
+	s.removed = append(s.removed, presence)
+	s.mu.Unlock()
+}
+
+func (s *sessionPresenceSchedulerFake) scheduledSnapshot() []serversend.Presence {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]serversend.Presence(nil), s.scheduled...)
+}
+
+func (s *sessionPresenceSchedulerFake) removedSnapshot() []serversend.Presence {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]serversend.Presence(nil), s.removed...)
+}
+
+func TestSessionRegistryPresenceContractClaimsAndSchedulesAuthenticatedSession(t *testing.T) {
 	presence := &sessionPresenceFake{gateID: "gate-a"}
 	registry, err := newSessionRegistry(presence, 30*time.Millisecond)
 	if err != nil {
@@ -24,16 +71,23 @@ func TestSessionRegistryPresenceContractClaimsAndRenewsAuthenticatedSession(t *t
 	if len(claimed) != 1 || claimed[0].LoginName != "alice" || claimed[0].ConnectionID != "connection-alice" || claimed[0].GateID != "gate-a" {
 		t.Fatalf("claims = %#v, want exact authenticated identity", claimed)
 	}
-	waitForSessionPresence(t, func() bool { return presence.renewCount() >= 2 })
+	scheduler := registry.presenceScheduler.(*sessionPresenceSchedulerFake)
+	if scheduled := scheduler.scheduledSnapshot(); len(scheduled) != 1 || scheduled[0] != claimed[0] {
+		t.Fatalf("scheduled leases = %#v, want one claimed lease", scheduled)
+	}
+	if err := registry.Register(session, "alice"); err != nil {
+		t.Fatalf("idempotent register: %v", err)
+	}
+	if scheduled := scheduler.scheduledSnapshot(); len(scheduled) != 1 {
+		t.Fatalf("idempotent register scheduled %d leases, want 1", len(scheduled))
+	}
 
 	registry.Remove(session)
 	if got := len(presence.releasedSnapshot()); got != 1 {
 		t.Fatalf("release count after disconnect = %d, want 1", got)
 	}
-	renewsAfterRemove := presence.renewCount()
-	time.Sleep(50 * time.Millisecond)
-	if got := presence.renewCount(); got != renewsAfterRemove {
-		t.Fatalf("renewal continued after disconnect: before=%d after=%d", renewsAfterRemove, got)
+	if removed := scheduler.removedSnapshot(); len(removed) != 1 || removed[0] != claimed[0] {
+		t.Fatalf("removed leases = %#v, want one claimed lease", removed)
 	}
 }
 
@@ -138,35 +192,25 @@ func TestSessionRegistryPresenceContractWithoutPresenceKeepsLocalBehavior(t *tes
 	registry.Remove(session)
 }
 
-func TestSessionRegistryPresenceContractCancelsBlockedRenewBeforeRemoveReturns(t *testing.T) {
-	presence := newLifecyclePresenceFake()
-	presence.blockRenew = true
-	registry, err := newSessionRegistry(presence, 30*time.Millisecond)
+func TestSessionRegistryPresenceContractScheduleFailureRollsBackClaim(t *testing.T) {
+	presence := &sessionPresenceFake{gateID: "gate-a"}
+	scheduleErr := errors.New("scheduler is stopped")
+	scheduler := &sessionPresenceSchedulerFake{scheduleErr: scheduleErr}
+	registry, err := newSessionRegistryWithScheduler(presence, serversend.PresenceConfig{LeaseTTL: 30 * time.Millisecond}, nil, scheduler)
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := &registrySession{id: "connection-renew"}
-	if err := registry.Register(session, "alice"); err != nil {
-		t.Fatal(err)
+	session := &registrySession{id: "connection-schedule-failure"}
+	if err := registry.Register(session, "alice"); !errors.Is(err, scheduleErr) {
+		t.Fatalf("register schedule failure = %v, want %v", err, scheduleErr)
 	}
-	select {
-	case <-presence.renewStarted:
-	case <-time.After(time.Second):
-		t.Fatal("renewal did not start")
+	if _, ok := registry.State(session.ID()); ok {
+		t.Fatal("schedule failure created local session")
 	}
-
-	removed := make(chan struct{})
-	go func() {
-		registry.Remove(session)
-		close(removed)
-	}()
-	select {
-	case <-removed:
-	case <-time.After(250 * time.Millisecond):
-		t.Fatal("Remove did not cancel the blocked renewal")
-	}
-	if got := len(presence.releasedSnapshot()); got != 1 {
-		t.Fatalf("release count after blocked renewal = %d, want 1", got)
+	claimed := presence.claimedSnapshot()
+	released := presence.releasedSnapshot()
+	if len(claimed) != 1 || len(released) != 1 || released[0] != claimed[0] {
+		t.Fatalf("schedule rollback leases = claimed:%#v released:%#v", claimed, released)
 	}
 }
 
@@ -291,27 +335,13 @@ func TestSessionRegistryPresenceContractReplacementDoesNotHoldTransitionLockDuri
 	}
 }
 
-func waitForSessionPresence(t *testing.T, condition func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if condition() {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatal("presence condition was not reached")
-}
-
 type sessionPresenceFake struct {
 	mu        sync.Mutex
 	gateID    serversend.GateID
 	nextEpoch uint64
 	claimed   []serversend.Presence
 	released  []serversend.Presence
-	renews    int
 	claimErr  error
-	renewErr  error
 }
 
 func (p *sessionPresenceFake) Claim(_ context.Context, loginName serversend.LoginName, connectionID serversend.ConnectionID) (serversend.Presence, error) {
@@ -324,13 +354,6 @@ func (p *sessionPresenceFake) Claim(_ context.Context, loginName serversend.Logi
 	presence := serversend.Presence{LoginName: loginName, GateID: p.gateID, ConnectionID: connectionID, Epoch: p.nextEpoch}
 	p.claimed = append(p.claimed, presence)
 	return presence, nil
-}
-
-func (p *sessionPresenceFake) Renew(context.Context, serversend.Presence) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.renews++
-	return p.renewErr
 }
 
 func (p *sessionPresenceFake) Release(_ context.Context, presence serversend.Presence) error {
@@ -350,12 +373,6 @@ func (p *sessionPresenceFake) releasedSnapshot() []serversend.Presence {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]serversend.Presence(nil), p.released...)
-}
-
-func (p *sessionPresenceFake) renewCount() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.renews
 }
 
 type lifecycleEventLog struct {
@@ -433,17 +450,12 @@ type lifecyclePresenceFake struct {
 	releaseOnce     sync.Once
 	releaseContinue chan struct{}
 	releaseErr      error
-
-	renewStarted chan struct{}
-	renewOnce    sync.Once
-	blockRenew   bool
 }
 
 func newLifecyclePresenceFake() *lifecyclePresenceFake {
 	return &lifecyclePresenceFake{
 		gateID:         "gate-a",
 		releaseStarted: make(chan struct{}),
-		renewStarted:   make(chan struct{}),
 	}
 }
 
@@ -452,18 +464,6 @@ func (p *lifecyclePresenceFake) Claim(_ context.Context, loginName serversend.Lo
 	defer p.mu.Unlock()
 	p.nextEpoch++
 	return serversend.Presence{LoginName: loginName, GateID: p.gateID, ConnectionID: connectionID, Epoch: p.nextEpoch}, nil
-}
-
-func (p *lifecyclePresenceFake) Renew(ctx context.Context, _ serversend.Presence) error {
-	p.renewOnce.Do(func() { close(p.renewStarted) })
-	p.mu.Lock()
-	block := p.blockRenew
-	p.mu.Unlock()
-	if block {
-		<-ctx.Done()
-		return ctx.Err()
-	}
-	return nil
 }
 
 func (p *lifecyclePresenceFake) Release(ctx context.Context, presence serversend.Presence) error {

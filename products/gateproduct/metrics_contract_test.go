@@ -46,6 +46,11 @@ func TestGateMetricsContractUsesBoundedLabels(t *testing.T) {
 	metrics.observeGameGRPC("OK", time.Millisecond)
 	metrics.observeServerSendRequest("connection", "queued")
 	metrics.observeServerSendDelivery("connection", "success", time.Millisecond)
+	metrics.SetSessionOwnershipActiveLeases(1)
+	metrics.ObserveSessionOwnershipRenewal("success")
+	metrics.ObserveSessionOwnershipBatch(time.Millisecond, 1)
+	metrics.ObserveSessionOwnershipSchedulerLag(time.Millisecond)
+	metrics.SetSessionOwnershipOverdueLeases(1)
 	families, err := registry.Gather()
 	if err != nil {
 		t.Fatalf("Gather() error = %v", err)
@@ -58,6 +63,12 @@ func TestGateMetricsContractUsesBoundedLabels(t *testing.T) {
 		"gaming_core_gate_websocket_commands_total",
 		"gaming_core_gate_game_grpc_requests_total",
 		"gaming_core_gate_server_send_requests_total",
+		"gaming_core_gate_session_ownership_active_leases",
+		"gaming_core_gate_session_ownership_renewals_total",
+		"gaming_core_gate_session_ownership_renewal_batch_duration_seconds",
+		"gaming_core_gate_session_ownership_renewal_batch_size",
+		"gaming_core_gate_session_ownership_scheduler_lag_seconds",
+		"gaming_core_gate_session_ownership_overdue_leases",
 	} {
 		if !seen[name] {
 			t.Fatalf("metric family %q was not gathered", name)

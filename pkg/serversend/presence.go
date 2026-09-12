@@ -57,14 +57,50 @@ type Presence struct {
 // PresenceConfig controls the Redis lease duration for one online player.
 // It is a Gate-owned setting; Game only needs PresenceResolver.
 type PresenceConfig struct {
-	LeaseTTL time.Duration `config:"lease_ttl" yaml:"lease_ttl"`
+	LeaseTTL time.Duration         `config:"lease_ttl" yaml:"lease_ttl"`
+	Renewal  PresenceRenewalConfig `config:"renewal" yaml:"renewal"`
 }
+
+// PresenceRenewalConfig 控制 Gate 端 lease 排程。Interval 是正常成功續租的
+// 間隔；retry backoff 刻意不放入此設定，避免暫時性 Redis 錯誤縮短正常週期。
+type PresenceRenewalConfig struct {
+	Interval time.Duration `config:"interval" yaml:"interval"`
+	Buckets  int           `config:"buckets" yaml:"buckets"`
+}
+
+const defaultPresenceRenewalBuckets = 100
 
 func (c PresenceConfig) normalized() (PresenceConfig, error) {
 	if c.LeaseTTL <= 0 {
 		return PresenceConfig{}, fmt.Errorf("%w: presence lease ttl must be positive", ErrDestinationInvalid)
 	}
+	if c.Renewal.Interval < 0 {
+		return PresenceConfig{}, fmt.Errorf("%w: presence renewal interval must not be negative", ErrDestinationInvalid)
+	}
+	if c.Renewal.Interval == 0 {
+		c.Renewal.Interval = c.LeaseTTL / 3
+	}
+	if c.Renewal.Interval <= 0 || c.Renewal.Interval > c.LeaseTTL/2 {
+		return PresenceConfig{}, fmt.Errorf("%w: presence renewal interval must be positive and no greater than lease ttl / 2", ErrDestinationInvalid)
+	}
+	if c.Renewal.Buckets < 0 {
+		return PresenceConfig{}, fmt.Errorf("%w: presence renewal buckets must not be negative", ErrDestinationInvalid)
+	}
+	if c.Renewal.Buckets == 0 {
+		c.Renewal.Buckets = defaultPresenceRenewalBuckets
+	}
+	if c.Renewal.Interval/time.Duration(c.Renewal.Buckets) <= 0 {
+		return PresenceConfig{}, fmt.Errorf("%w: presence renewal interval divided by buckets must be positive", ErrDestinationInvalid)
+	}
 	return c, nil
+}
+
+// NormalizePresenceConfig applies the ownership renewal defaults and validates
+// the complete Gate-owned configuration. Gate lifecycle wiring uses this same
+// normalization as PresenceRegistry so scheduler and Redis operations cannot
+// observe different intervals or bucket counts.
+func NormalizePresenceConfig(c PresenceConfig) (PresenceConfig, error) {
+	return c.normalized()
 }
 
 // PresenceResolver is the read-only presence dependency needed by Game.
@@ -99,6 +135,17 @@ type PresenceRegistry struct {
 	store    PresenceStore
 	keys     Keyspace
 	leaseTTL time.Duration
+}
+
+// PresenceRenewResult 是單一輸入 lease 的結果。使用結果 slice 而非單一 aggregate
+// error，因為 Redis Cluster pipeline 的 command 可能在不同節點獨立完成。
+type PresenceRenewResult struct {
+	Presence Presence
+	Err      error
+}
+
+type presencePipelinedStore interface {
+	Pipelined(context.Context, func(redis.Pipeliner) error) ([]redis.Cmder, error)
 }
 
 // NewPresenceRegistry builds a distributed presence registry over Redis.
@@ -194,10 +241,102 @@ func (r *PresenceRegistry) Renew(ctx context.Context, presence Presence) error {
 	if err != nil {
 		return routeStoreError("renew player presence", err)
 	}
-	if updated != 1 {
-		return fmt.Errorf("%w: %q", ErrPresenceNotOwner, presence.LoginName)
+	return presenceRenewResultError(presence.LoginName, updated)
+}
+
+func presenceRenewResultError(loginName LoginName, updated int64) error {
+	switch updated {
+	case 1:
+		return nil
+	case 0:
+		return fmt.Errorf("%w: %q", ErrPresenceNotOwner, loginName)
+	default:
+		return fmt.Errorf("%w: renew player presence %q returned unexpected result %d", ErrRouteStoreUnavailable, loginName, updated)
 	}
-	return nil
+}
+
+// RenewMany 以 non-transactional pipeline 為每個合法 presence 執行一個 fenced、
+// single-key EVAL。結果順序與輸入相同，讓 scheduler 能逐筆觀測 malformed entry
+// 與 Redis command error。
+func (r *PresenceRegistry) RenewMany(ctx context.Context, presences []Presence) []PresenceRenewResult {
+	results := make([]PresenceRenewResult, len(presences))
+	if len(presences) == 0 {
+		return results
+	}
+	validCount := 0
+	for index, presence := range presences {
+		results[index].Presence = presence
+		if err := validatePresenceLease(presence); err != nil {
+			results[index].Err = err
+			continue
+		}
+		validCount++
+	}
+	if validCount == 0 {
+		return results
+	}
+	if r == nil || r.store == nil {
+		err := fmt.Errorf("%w: presence registry is not configured", ErrRouteStoreUnavailable)
+		for index := range results {
+			if results[index].Err == nil {
+				results[index].Err = err
+			}
+		}
+		return results
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		for index := range results {
+			if results[index].Err == nil {
+				results[index].Err = err
+			}
+		}
+		return results
+	}
+	store, ok := r.store.(presencePipelinedStore)
+	if !ok {
+		err := fmt.Errorf("%w: presence store does not support pipelining", ErrRouteStoreUnavailable)
+		for index := range results {
+			if results[index].Err == nil {
+				results[index].Err = err
+			}
+		}
+		return results
+	}
+
+	commands := make([]*redis.Cmd, len(presences))
+	_, execErr := store.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		for index, presence := range presences {
+			if results[index].Err != nil {
+				continue
+			}
+			commands[index] = pipe.Eval(ctx, renewPresenceScript, []string{r.keys.presence(presence.LoginName)},
+				string(presence.GateID), string(presence.ConnectionID), strconv.FormatUint(presence.Epoch, 10), r.leaseTTL.Milliseconds())
+		}
+		return nil
+	})
+	for index, command := range commands {
+		if results[index].Err != nil {
+			continue
+		}
+		if command == nil {
+			if execErr != nil {
+				results[index].Err = routeStoreError("renew player presence batch", execErr)
+			} else {
+				results[index].Err = fmt.Errorf("%w: renewal command was not queued", ErrRouteStoreUnavailable)
+			}
+			continue
+		}
+		updated, err := command.Int64()
+		if err != nil {
+			results[index].Err = routeStoreError(fmt.Sprintf("renew player presence %q", presences[index].LoginName), err)
+			continue
+		}
+		results[index].Err = presenceRenewResultError(presences[index].LoginName, updated)
+	}
+	return results
 }
 
 // Release removes a lease only when the exact claimed owner and epoch still

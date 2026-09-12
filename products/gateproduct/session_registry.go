@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand"
 	"sync"
 	"time"
 
@@ -57,15 +56,12 @@ type roomTarget struct {
 // session registry. Authentication remains outside this type.
 type sessionPresence interface {
 	Claim(context.Context, serversend.LoginName, serversend.ConnectionID) (serversend.Presence, error)
-	Renew(context.Context, serversend.Presence) error
 	Release(context.Context, serversend.Presence) error
 }
 
 type sessionPresenceLease struct {
 	presence serversend.Presence
 	owner    sessionPresence
-	cancel   context.CancelFunc
-	done     chan struct{}
 }
 
 type detachedSession struct {
@@ -86,6 +82,7 @@ type SessionRegistry struct {
 	registrationMu     sync.Mutex
 	presence           sessionPresence
 	presenceTTL        time.Duration
+	presenceScheduler  sessionPresenceScheduler
 	leasesByConnection map[WebSocketConnectionID]*sessionPresenceLease
 	logger             *logging.Logger
 }
@@ -119,26 +116,24 @@ func newLocalSessionRegistry() *SessionRegistry {
 	}
 }
 
-// newSessionRegistry builds the registry used by direct unit tests and by the
-// distributed Gate constructor. Production Gate composition always supplies
-// a presence owner and a positive lease duration.
-func newSessionRegistry(presence sessionPresence, leaseTTL time.Duration) (*SessionRegistry, error) {
-	return newSessionRegistryWithLogger(presence, leaseTTL, nil)
-}
-
-func newSessionRegistryWithLogger(presence sessionPresence, leaseTTL time.Duration, logger *logging.Logger) (*SessionRegistry, error) {
+func newSessionRegistryWithScheduler(presence sessionPresence, cfg serversend.PresenceConfig, logger *logging.Logger, scheduler sessionPresenceScheduler) (*SessionRegistry, error) {
 	if presence == nil {
-		if leaseTTL > 0 {
+		if cfg.LeaseTTL > 0 {
 			return nil, fmt.Errorf("gate session: presence owner is required when lease ttl is configured")
 		}
 		return newLocalSessionRegistry(), nil
 	}
-	if leaseTTL <= 0 {
-		return nil, fmt.Errorf("gate session: presence lease ttl must be positive")
+	normalized, err := serversend.NormalizePresenceConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if scheduler == nil {
+		return nil, fmt.Errorf("gate session: presence renewal scheduler is required")
 	}
 	registry := newLocalSessionRegistry()
 	registry.presence = presence
-	registry.presenceTTL = leaseTTL
+	registry.presenceTTL = normalized.LeaseTTL
+	registry.presenceScheduler = scheduler
 	registry.logger = logger
 	return registry, nil
 }
@@ -180,6 +175,16 @@ func (r *SessionRegistry) Register(session ClosableWebSocketSession, loginName L
 			r.registrationMu.Unlock()
 			return err
 		}
+		if r.presenceScheduler == nil {
+			r.registrationMu.Unlock()
+			_ = r.releasePresence(context.Background(), claimed)
+			return errors.New("gate session: presence renewal scheduler is not configured")
+		}
+		if err := r.presenceScheduler.Schedule(claimed); err != nil {
+			r.registrationMu.Unlock()
+			_ = r.releasePresence(context.Background(), claimed)
+			return err
+		}
 	}
 
 	r.mu.Lock()
@@ -189,6 +194,7 @@ func (r *SessionRegistry) Register(session ClosableWebSocketSession, loginName L
 		r.mu.Unlock()
 		r.registrationMu.Unlock()
 		if r.presence != nil {
+			r.presenceScheduler.Remove(claimed)
 			_ = r.releasePresence(context.Background(), claimed)
 		}
 		if existingLoginName == loginName {
@@ -200,7 +206,7 @@ func (r *SessionRegistry) Register(session ClosableWebSocketSession, loginName L
 	r.byLoginName[loginName] = registeredLoginSession{connectionID: connectionID, session: session}
 	r.byConnection[connectionID] = loginName
 	if r.presence != nil {
-		lease := startSessionPresenceLease(r.presence, claimed, r.presenceTTL, r.logger)
+		lease := &sessionPresenceLease{presence: claimed, owner: r.presence}
 		r.leasesByConnection[connectionID] = lease
 	}
 	r.mu.Unlock()
@@ -405,9 +411,9 @@ func (r *SessionRegistry) cleanupDetached(ctx context.Context, detached detached
 }
 
 // cleanupDetachedBatch applies the fixed detach cleanup ordering to all room
-// members: cancel and wait for renewals, close every socket, then release every
-// presence lease under one shared deadline. A failure for one member never
-// prevents cleanup of the remaining members.
+// members: remove leases from the scheduler, close every socket, then release
+// every presence lease under one shared deadline. A failure for one member
+// never prevents cleanup of the remaining members.
 func (r *SessionRegistry) cleanupDetachedBatch(ctx context.Context, detached []detachedSession, closeSession bool, wrap func(int, error) error) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -417,21 +423,8 @@ func (r *SessionRegistry) cleanupDetachedBatch(ctx context.Context, detached []d
 		if item.lease == nil {
 			continue
 		}
-		item.lease.cancel()
-	}
-	for index, item := range detached {
-		if item.lease == nil {
-			continue
-		}
-		select {
-		case <-item.lease.done:
-		case <-ctx.Done():
-			err := ctx.Err()
-			if wrap != nil {
-				errs = append(errs, wrap(index, err))
-			} else {
-				errs = append(errs, err)
-			}
+		if r.presenceScheduler != nil {
+			r.presenceScheduler.Remove(item.lease.presence)
 		}
 	}
 	for index, item := range detached {
@@ -475,49 +468,6 @@ func (r *SessionRegistry) releasePresence(ctx context.Context, presence serverse
 	return err
 }
 
-func startSessionPresenceLease(owner sessionPresence, presence serversend.Presence, leaseTTL time.Duration, logger *logging.Logger) *sessionPresenceLease {
-	ctx, cancel := context.WithCancel(context.Background())
-	lease := &sessionPresenceLease{presence: presence, owner: owner, cancel: cancel, done: make(chan struct{})}
-	go renewSessionPresence(ctx, lease.done, owner, presence, leaseTTL, logger)
-	return lease
-}
-
-func renewSessionPresence(ctx context.Context, done chan struct{}, owner sessionPresence, presence serversend.Presence, leaseTTL time.Duration, logger *logging.Logger) {
-	defer close(done)
-	baseDelay := presenceRenewInterval(leaseTTL)
-	maxDelay := presenceRetryMax(leaseTTL)
-	delay := jitterPresenceDelay(baseDelay, maxDelay)
-	attempt := 0
-	for {
-		if !waitPresence(ctx, delay) {
-			return
-		}
-		operationCtx, cancel := presenceOperationContext(ctx, leaseTTL)
-		err := owner.Renew(operationCtx, presence)
-		cancel()
-		if err == nil {
-			attempt = 0
-			delay = jitterPresenceDelay(baseDelay, maxDelay)
-			continue
-		}
-		if errors.Is(err, serversend.ErrPresenceNotOwner) {
-			if logger != nil {
-				logger.Warn(ctx, "presence_renew", "presence ownership lost",
-					slog.String("login_name", string(presence.LoginName)),
-					slog.String("gate_id", string(presence.GateID)))
-			}
-			return
-		}
-		attempt++
-		delay = presenceBackoff(attempt, baseDelay, maxDelay)
-		if logger != nil {
-			logger.Error(ctx, "presence_renew", "presence renewal failed", err,
-				slog.String("login_name", string(presence.LoginName)),
-				slog.String("gate_id", string(presence.GateID)))
-		}
-	}
-}
-
 func presenceOperationContext(parent context.Context, leaseTTL time.Duration) (context.Context, context.CancelFunc) {
 	if parent == nil {
 		parent = context.Background()
@@ -540,64 +490,6 @@ func presenceReleaseContext(parent context.Context, leaseTTL time.Duration) (con
 		parent = context.WithoutCancel(parent)
 	}
 	return presenceOperationContext(parent, leaseTTL)
-}
-
-func presenceRenewInterval(leaseTTL time.Duration) time.Duration {
-	interval := leaseTTL / 3
-	if interval <= 0 {
-		return time.Millisecond
-	}
-	return interval
-}
-
-func presenceRetryMax(leaseTTL time.Duration) time.Duration {
-	maxDelay := leaseTTL / 2
-	if maxDelay <= 0 {
-		return time.Millisecond
-	}
-	if maxDelay > 5*time.Second {
-		return 5 * time.Second
-	}
-	return maxDelay
-}
-
-func presenceBackoff(attempt int, base, maxDelay time.Duration) time.Duration {
-	if attempt < 1 {
-		attempt = 1
-	}
-	delay := base
-	for i := 1; i < attempt && delay < maxDelay/2; i++ {
-		delay *= 2
-	}
-	if delay > maxDelay {
-		delay = maxDelay
-	}
-	return jitterPresenceDelay(delay, maxDelay)
-}
-
-func jitterPresenceDelay(base, maxDelay time.Duration) time.Duration {
-	if base <= 0 {
-		return time.Millisecond
-	}
-	delay := time.Duration(float64(base) * (0.8 + rand.Float64()*0.4))
-	if delay <= 0 {
-		delay = time.Nanosecond
-	}
-	if maxDelay > 0 && delay > maxDelay {
-		return maxDelay
-	}
-	return delay
-}
-
-func waitPresence(ctx context.Context, delay time.Duration) bool {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		return true
-	case <-ctx.Done():
-		return false
-	}
 }
 
 func (r *SessionRegistry) addToRoomLocked(loginName LoginName, roomID RoomID) {

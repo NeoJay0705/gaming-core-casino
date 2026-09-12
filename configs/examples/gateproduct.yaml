@@ -51,6 +51,11 @@ grpc:
 session_ownership:
   # 必填：玩家 ownership lease TTL。
   lease_ttl: "5m"
+  # renewal:
+  #   # 非必要：正常續租間隔；預設 lease_ttl / 3，且不得大於 lease_ttl / 2。
+  #   interval: "100s"
+  #   # 非必要：一個 interval 內的 buckets；預設 100，且 derived tick（interval / buckets）不得大於 5s。
+  #   buckets: 100
 
 server_send:
   broadcast:

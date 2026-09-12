@@ -114,6 +114,9 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 		if err := r.Provide(newGatePresenceRegistry); err != nil {
 			return err
 		}
+		if err := r.ProvideManaged("gate-session-ownership-renewal", framework.PhaseService, newGateSessionPresenceRenewalScheduler); err != nil {
+			return err
+		}
 		if err := r.Provide(newGateSessionRegistry); err != nil {
 			return err
 		}

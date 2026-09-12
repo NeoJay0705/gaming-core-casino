@@ -82,6 +82,13 @@ type gateMetrics struct {
 
 	serverSendRequests         *prometheus.CounterVec
 	serverSendDeliveryDuration *prometheus.HistogramVec
+
+	sessionOwnershipActiveLeases  prometheus.Gauge
+	sessionOwnershipRenewals      *prometheus.CounterVec
+	sessionOwnershipBatchDuration prometheus.Histogram
+	sessionOwnershipBatchSize     prometheus.Histogram
+	sessionOwnershipSchedulerLag  prometheus.Histogram
+	sessionOwnershipOverdueLeases prometheus.Gauge
 }
 
 func newGateMetrics(registerer prometheus.Registerer) (*gateMetrics, error) {
@@ -161,6 +168,33 @@ func newGateMetrics(registerer prometheus.Registerer) (*gateMetrics, error) {
 			Help:    "Gate server-send receive-to-write terminal duration in seconds.",
 			Buckets: fineDurationBuckets,
 		}, []string{"target", "result"}),
+		sessionOwnershipActiveLeases: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "gaming_core_gate_session_ownership_active_leases",
+			Help: "Current number of active Gate session ownership leases.",
+		}),
+		sessionOwnershipRenewals: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gaming_core_gate_session_ownership_renewals_total",
+			Help: "Total Gate session ownership renewal outcomes by bounded result.",
+		}, []string{"result"}),
+		sessionOwnershipBatchDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "gaming_core_gate_session_ownership_renewal_batch_duration_seconds",
+			Help:    "Gate session ownership renewal Redis pipeline batch duration in seconds.",
+			Buckets: requestDurationBuckets,
+		}),
+		sessionOwnershipBatchSize: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "gaming_core_gate_session_ownership_renewal_batch_size",
+			Help:    "Number of leases included in each Gate session ownership renewal batch.",
+			Buckets: []float64{1, 4, 16, 32, 64, 128, 256},
+		}),
+		sessionOwnershipSchedulerLag: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "gaming_core_gate_session_ownership_scheduler_lag_seconds",
+			Help:    "Delay between a Gate session ownership lease due time and its renewal scheduling.",
+			Buckets: fineDurationBuckets,
+		}),
+		sessionOwnershipOverdueLeases: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "gaming_core_gate_session_ownership_overdue_leases",
+			Help: "Current number of Gate session ownership leases awaiting renewal after their due time.",
+		}),
 	}
 	collectors := []prometheus.Collector{
 		m.websocketConnections,
@@ -180,6 +214,12 @@ func newGateMetrics(registerer prometheus.Registerer) (*gateMetrics, error) {
 		m.writeQueueFull,
 		m.serverSendRequests,
 		m.serverSendDeliveryDuration,
+		m.sessionOwnershipActiveLeases,
+		m.sessionOwnershipRenewals,
+		m.sessionOwnershipBatchDuration,
+		m.sessionOwnershipBatchSize,
+		m.sessionOwnershipSchedulerLag,
+		m.sessionOwnershipOverdueLeases,
 	}
 	for _, collector := range collectors {
 		if err := registerer.Register(collector); err != nil {
@@ -214,5 +254,36 @@ func (m *gateMetrics) observeServerSendRequest(target, result string) {
 func (m *gateMetrics) observeServerSendDelivery(target, result string, elapsed time.Duration) {
 	if m != nil {
 		m.serverSendDeliveryDuration.WithLabelValues(target, result).Observe(elapsed.Seconds())
+	}
+}
+
+func (m *gateMetrics) SetSessionOwnershipActiveLeases(value float64) {
+	if m != nil {
+		m.sessionOwnershipActiveLeases.Set(value)
+	}
+}
+
+func (m *gateMetrics) ObserveSessionOwnershipRenewal(result string) {
+	if m != nil {
+		m.sessionOwnershipRenewals.WithLabelValues(result).Inc()
+	}
+}
+
+func (m *gateMetrics) ObserveSessionOwnershipBatch(elapsed time.Duration, size int) {
+	if m != nil {
+		m.sessionOwnershipBatchDuration.Observe(elapsed.Seconds())
+		m.sessionOwnershipBatchSize.Observe(float64(size))
+	}
+}
+
+func (m *gateMetrics) ObserveSessionOwnershipSchedulerLag(elapsed time.Duration) {
+	if m != nil {
+		m.sessionOwnershipSchedulerLag.Observe(elapsed.Seconds())
+	}
+}
+
+func (m *gateMetrics) SetSessionOwnershipOverdueLeases(value float64) {
+	if m != nil {
+		m.sessionOwnershipOverdueLeases.Set(value)
 	}
 }

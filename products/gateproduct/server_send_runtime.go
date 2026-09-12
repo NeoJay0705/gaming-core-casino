@@ -46,10 +46,11 @@ func gateSessionOwnershipConfig(snapshot config.SourceSnapshot) (serversend.Pres
 	if err := snapshot.Bind("session_ownership", &cfg, config.Strict()); err != nil {
 		return serversend.PresenceConfig{}, fmt.Errorf("gate ownership: bind session_ownership: %w", err)
 	}
-	if cfg.LeaseTTL <= 0 {
-		return serversend.PresenceConfig{}, fmt.Errorf("gate ownership: lease_ttl must be positive")
+	normalized, err := serversend.NormalizePresenceConfig(cfg)
+	if err != nil {
+		return serversend.PresenceConfig{}, fmt.Errorf("gate ownership: %w", err)
 	}
-	return cfg, nil
+	return normalized, nil
 }
 
 func gateServerSendBroadcast(snapshot config.SourceSnapshot) (gateServerSendBroadcastConfig, bool, error) {
@@ -92,12 +93,20 @@ func newGatePresenceRegistry(identity gateIdentity, cfg serversend.PresenceConfi
 	return serversend.NewGatePresenceRegistry(presence, identity.GateID)
 }
 
-func newGateSessionRegistry(presence *serversend.GatePresenceRegistry, cfg serversend.PresenceConfig, factory *logging.Factory) (*SessionRegistry, error) {
+func newGateSessionPresenceRenewalScheduler(presence *serversend.GatePresenceRegistry, cfg serversend.PresenceConfig, metrics *gateMetrics, factory *logging.Factory) (*sessionPresenceRenewalScheduler, error) {
+	logger, err := factory.Component("session_ownership")
+	if err != nil {
+		return nil, err
+	}
+	return newSessionPresenceRenewalScheduler(presence, cfg, logger, metrics)
+}
+
+func newGateSessionRegistry(presence *serversend.GatePresenceRegistry, cfg serversend.PresenceConfig, factory *logging.Factory, scheduler *sessionPresenceRenewalScheduler) (*SessionRegistry, error) {
 	logger, err := factory.Component("session")
 	if err != nil {
 		return nil, err
 	}
-	return newSessionRegistryWithLogger(presence, cfg.LeaseTTL, logger)
+	return newSessionRegistryWithScheduler(presence, cfg, logger, scheduler)
 }
 
 func newServerSendKeyspace(prefix redis.KeyPrefix) (serversend.Keyspace, error) {
