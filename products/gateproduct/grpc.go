@@ -19,8 +19,10 @@ import (
 const WebSocketChannel dispatcher.Channel = "gate-websocket"
 
 type gateGRPCClientConfig struct {
-	Target  string        `config:"target" yaml:"target"`
-	Timeout time.Duration `config:"timeout" yaml:"timeout"`
+	Target             string        `config:"target" yaml:"target"`
+	Timeout            time.Duration `config:"timeout" yaml:"timeout"`
+	DNSRefreshInterval time.Duration `config:"dns_refresh_interval" yaml:"dns_refresh_interval"`
+	ConnectionsPerHost int           `config:"connections_per_host" yaml:"connections_per_host"`
 }
 
 // gateDeliveryGRPCClientConfig describes Gate-to-Gate fan-out topology. The
@@ -40,8 +42,16 @@ type gateEndpointRegistrationConfig struct {
 	Refresh time.Duration `config:"refresh" yaml:"refresh"`
 }
 
-func newGateGameGRPCClient(cfg gatelink.ClientConfig) (*gatelink.Client, error) {
-	return gatelink.NewClient(cfg)
+func newGateGameGRPCClient(cfg gatelink.ClientConfig, factory *logging.Factory) (*gatelink.Client, error) {
+	logger, err := factory.Component("grpc.client.game")
+	if err != nil {
+		return nil, err
+	}
+	client, err := gatelink.NewClientWithLogger(cfg, logger)
+	if err != nil {
+		return nil, fmt.Errorf("gate gRPC: validate grpc.clients.game: %w", err)
+	}
+	return client, nil
 }
 
 // newGateGRPCServer creates the single product-level Gate listener. Services
@@ -129,7 +139,21 @@ func gateGameGRPCConfig(snapshot config.SourceSnapshot) (gatelink.ClientConfig, 
 	if cfg.Target == "" {
 		return gatelink.ClientConfig{}, fmt.Errorf("gate gRPC: grpc.clients.game.target is required")
 	}
-	return gatelink.ClientConfig{Target: cfg.Target, Timeout: cfg.Timeout}, nil
+	if cfg.Timeout < 0 {
+		return gatelink.ClientConfig{}, fmt.Errorf("gate gRPC: grpc.clients.game.timeout must not be negative")
+	}
+	if cfg.DNSRefreshInterval < 0 {
+		return gatelink.ClientConfig{}, fmt.Errorf("gate gRPC: grpc.clients.game.dns_refresh_interval must not be negative")
+	}
+	if cfg.ConnectionsPerHost < 0 {
+		return gatelink.ClientConfig{}, fmt.Errorf("gate gRPC: grpc.clients.game.connections_per_host must not be negative")
+	}
+	return gatelink.ClientConfig{
+		Target:             cfg.Target,
+		Timeout:            cfg.Timeout,
+		DNSRefreshInterval: cfg.DNSRefreshInterval,
+		ConnectionsPerHost: cfg.ConnectionsPerHost,
+	}, nil
 }
 
 func gateGRPCServerEndpointRegistration(snapshot config.SourceSnapshot) (serversend.EndpointRegistrarConfig, error) {

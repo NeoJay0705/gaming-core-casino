@@ -133,10 +133,15 @@ func TestStartHonorsCanceledContextAndStopDeadline(t *testing.T) {
 		t.Fatalf("new blocking client: %v", err)
 	}
 	defer client.Stop(context.Background())
+	if err := client.Start(context.Background()); err != nil {
+		t.Fatalf("start blocking client: %v", err)
+	}
 	callDone := make(chan error, 1)
 	go func() {
 		callDone <- func() error {
-			_, err := client.Forward(gatelink.WithGateRequestContext(context.Background(), gatelink.GateRequestContext{Source: gatelink.RequestSource{ConnectionID: "blocking"}}), gatelink.Request{CommandID: 1})
+			requestContext := gatelink.WithGateRequestContext(context.Background(), gatelink.GateRequestContext{Source: gatelink.RequestSource{ConnectionID: "blocking"}})
+			requestContext = gatelink.WithAffinityKey(requestContext, "blocking")
+			_, err := client.Forward(requestContext, gatelink.Request{CommandID: 1})
 			return err
 		}()
 	}()

@@ -68,6 +68,13 @@ type ClosableWebSocketSession interface {
 	Close() error
 }
 
+// gameForwarder 是 WebSocket transport 使用的最小 Gate→Game boundary。保留
+// package-private interface 讓 state contract test 能驗證 request-local affinity
+// key，而 production composition 仍注入具體的 *gatelink.Client。
+type gameForwarder interface {
+	Forward(context.Context, gatelink.Request) (*gatelink.Reply, error)
+}
+
 type webSocketServerInputs struct {
 	dig.In
 
@@ -86,7 +93,7 @@ type WebSocketServer struct {
 	cfg        WebSocketConfig
 	enabled    bool
 	dispatcher *dispatcher.Dispatcher
-	gameClient *gatelink.Client
+	gameClient gameForwarder
 	registry   *SessionRegistry
 	gateID     string
 	metrics    *gateMetrics
@@ -101,6 +108,9 @@ type WebSocketServer struct {
 }
 
 func newGateWebSocketServer(inputs webSocketServerInputs) (*WebSocketServer, error) {
+	if inputs.GameClient == nil {
+		return nil, errors.New("gate websocket: Game client is nil")
+	}
 	server := &WebSocketServer{
 		sessions:   make(map[WebSocketConnectionID]*webSocketConnection),
 		dispatcher: inputs.Dispatcher,
@@ -118,9 +128,6 @@ func newGateWebSocketServer(inputs webSocketServerInputs) (*WebSocketServer, err
 	}
 	if server.dispatcher == nil {
 		return nil, errors.New("gate websocket: dispatcher is nil")
-	}
-	if server.gameClient == nil {
-		return nil, errors.New("gate websocket: Game client is nil")
 	}
 	if server.registry == nil {
 		return nil, errors.New("gate websocket: session registry is nil")
@@ -407,6 +414,9 @@ func (s *WebSocketServer) dispatchPacket(ctx context.Context, session *webSocket
 		_ = session.closeWithReason(closeReasonRoomRequired)
 		return false
 	}
+	// login name is already authenticated by SessionRegistry; it is used only
+	// by the local GateLink picker and is not sent as gRPC metadata or payload.
+	ctx = gatelink.WithAffinityKey(ctx, string(state.LoginName))
 	grpcStart := time.Now()
 	if s.metrics != nil {
 		s.metrics.gameGRPCInFlight.Inc()

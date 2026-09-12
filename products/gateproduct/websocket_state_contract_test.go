@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 )
 
 func TestWebSocketForwardStateContractClosesBeforeGameCall(t *testing.T) {
@@ -46,4 +47,47 @@ func TestWebSocketLocalStateErrorUsesLoginReason(t *testing.T) {
 	if got := session.currentCloseReason(); got != closeReasonLoginRequired {
 		t.Fatalf("local state error close reason = %q, want %q", got, closeReasonLoginRequired)
 	}
+}
+
+func TestWebSocketForwardUsesAuthenticatedLoginNameAffinity(t *testing.T) {
+	registry := NewSessionRegistry()
+	session := newWebSocketConnection(nil, 1, time.Second)
+	if err := registry.Register(session, LoginName("alice")); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if err := registry.EnterRoom(LoginName("alice"), RoomID("room-1")); err != nil {
+		t.Fatalf("EnterRoom() error = %v", err)
+	}
+
+	forwarder := &recordingGameForwarder{}
+	server := &WebSocketServer{
+		dispatcher: dispatcher.New(),
+		gameClient: forwarder,
+		registry:   registry,
+	}
+	packet := WebSocketPacket{CommandID: 99, Payload: []byte("opaque")}
+	if !server.dispatchPacket(context.Background(), session, packet) {
+		t.Fatal("forwarded packet was not handled")
+	}
+	if forwarder.affinityKey != "alice" {
+		t.Fatalf("affinity key = %q, want authenticated login name %q", forwarder.affinityKey, "alice")
+	}
+	if forwarder.request.CommandID != packet.CommandID || string(forwarder.request.Payload) != string(packet.Payload) {
+		t.Fatalf("forwarded request = %#v, want command %d and opaque payload", forwarder.request, packet.CommandID)
+	}
+}
+
+type recordingGameForwarder struct {
+	affinityKey string
+	request     gatelink.Request
+}
+
+func (f *recordingGameForwarder) Forward(ctx context.Context, request gatelink.Request) (*gatelink.Reply, error) {
+	key, ok := gatelink.AffinityKeyFromContext(ctx)
+	if !ok {
+		return nil, context.Canceled
+	}
+	f.affinityKey = key
+	f.request = request
+	return nil, nil
 }

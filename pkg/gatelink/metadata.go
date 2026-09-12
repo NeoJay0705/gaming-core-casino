@@ -12,16 +12,20 @@ import (
 
 type requestContextCarrierKey struct{}
 
-// GateRequestContext contains cross-cutting request data. It is intentionally a
-// single context value so adding a transport field does not change every
-// handler signature.
+// affinityKeyContextKey 標記 Gate client picker 使用的 request-local key。
+// 它刻意不屬於 gRPC metadata contract，Game server 不需要知道 endpoint 的
+// 選擇依據。
+type affinityKeyContextKey struct{}
+
+// GateRequestContext 包含跨 transport 的 request data。刻意使用單一 context
+// value，新增 transport 欄位時不必修改所有 handler signature。
 type GateRequestContext struct {
 	Source RequestSource
 }
 
-// RequestContextCarrier exposes the transport-neutral portion of an inbound
-// Gate request context. A product may carry additional transport data in its
-// own carrier without making gatelink depend on that transport.
+// RequestContextCarrier 暴露 inbound Gate request context 中與 transport 無關的
+// 部分。product 可以在自己的 carrier 附加 transport data，而不讓 gatelink
+// 依賴該 transport。
 type RequestContextCarrier interface {
 	GateRequestContext() GateRequestContext
 }
@@ -87,6 +91,26 @@ func GateRequestContextFrom(ctx context.Context) (GateRequestContext, bool) {
 		return GateRequestContext{}, false
 	}
 	return carrier.GateRequestContext(), true
+}
+
+// WithAffinityKey 將 local routing key 附加到 ctx。Gate 在轉送 request 前使用
+// 已驗證的 login name；此值保持 opaque，不會被 normalization 或 serialize
+// 到 gRPC。
+func WithAffinityKey(ctx context.Context, key string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, affinityKeyContextKey{}, key)
+}
+
+// AffinityKeyFromContext 取出 ctx 中非空的 local routing key。空 key 視為缺少，
+// 避免 caller 意外 fallback 到 connection ID 等不相干的 identity。
+func AffinityKeyFromContext(ctx context.Context) (string, bool) {
+	if ctx == nil {
+		return "", false
+	}
+	key, ok := ctx.Value(affinityKeyContextKey{}).(string)
+	return key, ok && key != ""
 }
 
 func outgoingRequestContextInterceptor(

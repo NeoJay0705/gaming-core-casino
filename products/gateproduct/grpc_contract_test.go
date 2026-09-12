@@ -1,6 +1,7 @@
 package gateproduct
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -111,6 +112,57 @@ func TestGateProductRejectsUnknownServerSendFields(t *testing.T) {
 	}
 }
 
+func TestGateGameGRPCConfigMapsAffinityTopologyOptions(t *testing.T) {
+	want := gateGRPCClientConfig{
+		Target:             "dns:///game-headless:9090",
+		Timeout:            2 * time.Second,
+		DNSRefreshInterval: 7 * time.Second,
+		ConnectionsPerHost: 3,
+	}
+	got, err := gateGameGRPCConfig(gateGameClientSnapshot{config: want})
+	if err != nil {
+		t.Fatalf("gateGameGRPCConfig() error = %v", err)
+	}
+	if got.Target != want.Target || got.Timeout != want.Timeout || got.DNSRefreshInterval != want.DNSRefreshInterval || got.ConnectionsPerHost != want.ConnectionsPerHost {
+		t.Fatalf("mapped config = %#v, want target=%q timeout=%s refresh=%s connections=%d", got, want.Target, want.Timeout, want.DNSRefreshInterval, want.ConnectionsPerHost)
+	}
+}
+
+func TestGateGameGRPCConfigRejectsNegativeTopologyOptions(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		cfg  gateGRPCClientConfig
+		want string
+	}{
+		{name: "refresh", cfg: gateGRPCClientConfig{Target: "127.0.0.1:9090", DNSRefreshInterval: -time.Second}, want: "dns_refresh_interval"},
+		{name: "connections", cfg: gateGRPCClientConfig{Target: "127.0.0.1:9090", ConnectionsPerHost: -1}, want: "connections_per_host"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := gateGameGRPCConfig(gateGameClientSnapshot{config: test.cfg}); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("gateGameGRPCConfig() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestGateGameGRPCClientConfigErrorIncludesConfigPath(t *testing.T) {
+	path, miniRedis := writeGateGRPCConfig(t, "server_send:\n  broadcast:\n    primary: grpc\n")
+	_ = miniRedis
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	contents = bytes.Replace(contents, []byte("target: dns:///gameproduct:9090"), []byte("target: gatelink:///game"), 1)
+	if err := os.WriteFile(path, contents, 0o600); err != nil {
+		t.Fatalf("write invalid target config: %v", err)
+	}
+
+	_, err = NewApp(context.Background(), AppOptions{Config: config.ConfigInputs{MergedPaths: []string{path}}, EnvPrefix: "CORE_CASINO_GATE_GRPC_INVALID_TARGET_TEST__"})
+	if err == nil || !strings.Contains(err.Error(), "grpc.clients.game") || !strings.Contains(err.Error(), "unsupported target scheme") {
+		t.Fatalf("invalid Game target error = %v, want config path and target cause", err)
+	}
+}
+
 func TestGateEndpointRegistrationConfigValidatesLeaseWindow(t *testing.T) {
 	for _, test := range []struct {
 		name string
@@ -144,6 +196,21 @@ func writeGateGRPCConfig(t *testing.T, extra string) (string, *miniredis.Minired
 type endpointRegistrationSnapshot struct {
 	config gateEndpointRegistrationConfig
 }
+
+type gateGameClientSnapshot struct {
+	config gateGRPCClientConfig
+}
+
+func (s gateGameClientSnapshot) Bind(path string, target any, _ ...config.BindOption) error {
+	if path == "grpc.clients.game" {
+		*target.(*gateGRPCClientConfig) = s.config
+	}
+	return nil
+}
+
+func (gateGameClientSnapshot) Has(path string) bool                                       { return path == "grpc.clients.game" }
+func (gateGameClientSnapshot) HasSource(string) bool                                      { return false }
+func (gateGameClientSnapshot) BindSource(string, string, any, ...config.BindOption) error { return nil }
 
 func (s endpointRegistrationSnapshot) Bind(path string, target any, _ ...config.BindOption) error {
 	if path == "grpc.endpoint_registration" {

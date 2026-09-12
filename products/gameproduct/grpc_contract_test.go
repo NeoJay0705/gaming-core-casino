@@ -55,7 +55,10 @@ func TestGameProductRegistersGateRequestOnProductGRPCServer(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Stop(context.Background()) })
-	ctx := gatelink.WithGateRequestContext(context.Background(), gatelink.GateRequestContext{Source: gatelink.RequestSource{ConnectionID: "player-7"}})
+	if err := client.Start(context.Background()); err != nil {
+		t.Fatalf("start client: %v", err)
+	}
+	ctx := gatelink.WithAffinityKey(gatelink.WithGateRequestContext(context.Background(), gatelink.GateRequestContext{Source: gatelink.RequestSource{ConnectionID: "player-7"}}), "player-7")
 	if _, err := client.Forward(ctx, gatelink.Request{CommandID: 7, Payload: []byte("opaque")}); err != nil {
 		t.Fatalf("forward: %v", err)
 	}
@@ -90,7 +93,10 @@ func TestGameProductAllowsMissingHandlerUntilDispatcherIsInstalled(t *testing.T)
 		t.Fatalf("new client: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Stop(context.Background()) })
-	ctx := gatelink.WithGateRequestContext(context.Background(), gatelink.GateRequestContext{Source: gatelink.RequestSource{ConnectionID: "player-empty"}})
+	if err := client.Start(context.Background()); err != nil {
+		t.Fatalf("start client: %v", err)
+	}
+	ctx := gatelink.WithAffinityKey(gatelink.WithGateRequestContext(context.Background(), gatelink.GateRequestContext{Source: gatelink.RequestSource{ConnectionID: "player-empty"}}), "player-empty")
 	if _, err := client.Forward(ctx, gatelink.Request{CommandID: 99}); status.Code(err) != codes.Unimplemented {
 		t.Fatalf("empty dispatcher status = %s, want %s", status.Code(err), codes.Unimplemented)
 	}

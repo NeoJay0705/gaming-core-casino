@@ -328,6 +328,9 @@ func grpcEchoRoundTrip(ctx context.Context, client *gatelink.Client, requestPayl
 	requestContext := gatelink.WithGateRequestContext(ctx, gatelink.GateRequestContext{
 		Source: gatelink.RequestSource{ConnectionID: connectionID},
 	})
+	// direct load 沒有真實登入流程，沿用每個 worker 的穩定 identity
+	// 作為 affinity key；正式 Gate request 則注入 authenticated login name。
+	requestContext = gatelink.WithAffinityKey(requestContext, connectionID)
 	reply, err := client.Forward(requestContext, gatelink.Request{
 		CommandID: protocol.EchoRequestCommandID,
 		Payload:   requestPayload,

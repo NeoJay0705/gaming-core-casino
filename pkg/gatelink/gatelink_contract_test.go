@@ -3,7 +3,6 @@ package gatelink
 import (
 	"context"
 	"errors"
-	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,8 +12,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/resolver"
-	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/grpc/status"
 )
 
@@ -43,7 +40,10 @@ func TestContractForwardsOpaquePayloadAndRequestContext(t *testing.T) {
 		CommandID: 0xE10003,
 		Payload:   payload,
 	}
-	ctx := WithGateRequestContext(context.Background(), GateRequestContext{Source: RequestSource{GateID: "gate-a", ConnectionID: "connection-42"}})
+	ctx := WithAffinityKey(
+		WithGateRequestContext(context.Background(), GateRequestContext{Source: RequestSource{GateID: "gate-a", ConnectionID: "connection-42"}}),
+		"connection-42",
+	)
 	if _, err := client.Forward(ctx, request); err != nil {
 		t.Fatalf("forward: %v", err)
 	}
@@ -90,7 +90,10 @@ func TestContractForwardReplyRoundTripCopiesPayload(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Stop(context.Background()) })
-	ctx := WithGateRequestContext(context.Background(), GateRequestContext{Source: RequestSource{ConnectionID: "connection-1"}})
+	if err := client.Start(context.Background()); err != nil {
+		t.Fatalf("start client: %v", err)
+	}
+	ctx := testClientContext("connection-1")
 	reply, err := client.Forward(ctx, Request{CommandID: 1})
 	if err != nil {
 		t.Fatalf("forward: %v", err)
@@ -120,7 +123,10 @@ func TestContractForwardReplyAllowsNoReply(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Stop(context.Background()) })
-	ctx := WithGateRequestContext(context.Background(), GateRequestContext{Source: RequestSource{ConnectionID: "connection-1"}})
+	if err := client.Start(context.Background()); err != nil {
+		t.Fatalf("start client: %v", err)
+	}
+	ctx := testClientContext("connection-1")
 	reply, err := client.Forward(ctx, Request{CommandID: 1})
 	if err != nil || reply != nil {
 		t.Fatalf("no-reply forward = reply:%#v error:%v, want nil/nil", reply, err)
@@ -208,10 +214,9 @@ func TestContractRejectsMalformedForwardReplies(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			client := &Client{
-				cfg:    ClientConfig{Timeout: time.Second},
-				client: forwardClientStub{response: tc.response},
+				cfg: ClientConfig{Timeout: time.Second},
 			}
-			reply, err := client.Forward(context.Background(), Request{CommandID: 1})
+			reply, err := client.forwardWithClient(context.Background(), forwardClientStub{response: tc.response}, client.cfg, Request{CommandID: 1})
 			if reply != nil || status.Code(err) != codes.Internal {
 				t.Fatalf("malformed forward = reply:%#v error:%v, want nil/Internal", reply, err)
 			}
@@ -222,11 +227,11 @@ func TestContractRejectsMalformedForwardReplies(t *testing.T) {
 func TestContractClientCopiesForwardReplyPayload(t *testing.T) {
 	payload := []byte("reply")
 	client := &Client{
-		client: forwardClientStub{response: &ForwardResponse{
-			Reply: &ForwardReply{CommandId: 2, Payload: payload},
-		}},
+		cfg: ClientConfig{Timeout: time.Second},
 	}
-	reply, err := client.Forward(context.Background(), Request{CommandID: 1})
+	reply, err := client.forwardWithClient(context.Background(), forwardClientStub{response: &ForwardResponse{
+		Reply: &ForwardReply{CommandId: 2, Payload: payload},
+	}}, client.cfg, Request{CommandID: 1})
 	if err != nil {
 		t.Fatalf("forward: %v", err)
 	}
@@ -247,29 +252,6 @@ func TestContractRejectsDuplicateGateIDMetadata(t *testing.T) {
 	}
 }
 
-func TestContractUsesRoundRobinAcrossResolvedBackends(t *testing.T) {
-	backendA, addressA := startCountingServer(t)
-	backendB, addressB := startCountingServer(t)
-	resolverBuilder := manual.NewBuilderWithScheme("gatelinkcontract")
-	resolverBuilder.InitialState(resolver.State{Addresses: []resolver.Address{{Addr: addressA}, {Addr: addressB}}})
-	resolver.Register(resolverBuilder)
-
-	client, err := NewClient(ClientConfig{Target: "gatelinkcontract:///game", Timeout: time.Second})
-	if err != nil {
-		t.Fatalf("new client: %v", err)
-	}
-	t.Cleanup(func() { _ = client.Stop(context.Background()) })
-	for i := 1; i <= 20; i++ {
-		ctx := WithGateRequestContext(context.Background(), GateRequestContext{Source: RequestSource{ConnectionID: "connection-test"}})
-		if _, err := client.Forward(ctx, testRequest(uint32(i))); err != nil {
-			t.Fatalf("forward(%d): %v", i, err)
-		}
-	}
-	if backendA.calls.Load() == 0 || backendB.calls.Load() == 0 {
-		t.Fatalf("round robin calls = A:%d B:%d, want both backends used", backendA.calls.Load(), backendB.calls.Load())
-	}
-}
-
 func TestContractRequiresClientTarget(t *testing.T) {
 	_, err := NewClient(ClientConfig{})
 	if err == nil || !strings.Contains(err.Error(), "target is required") {
@@ -283,6 +265,9 @@ func TestContractDefaultsForwardTimeout(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Stop(context.Background()) })
+	if err := client.Start(context.Background()); err != nil {
+		t.Fatalf("start client: %v", err)
+	}
 	if client.cfg.Timeout != DefaultTimeout {
 		t.Fatalf("client timeout = %s, want %s", client.cfg.Timeout, DefaultTimeout)
 	}
@@ -353,12 +338,13 @@ func TestContractMaxConcurrentStreamsLimitsHandlerAdmission(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Stop(context.Background()) })
+	if err := client.Start(context.Background()); err != nil {
+		t.Fatalf("start client: %v", err)
+	}
 
 	done := make(chan error, 2)
 	forward := func() {
-		ctx := WithGateRequestContext(context.Background(), GateRequestContext{
-			Source: RequestSource{ConnectionID: "stream-limit-test"},
-		})
+		ctx := testClientContext("stream-limit-test")
 		_, err := client.Forward(ctx, Request{CommandID: 1})
 		done <- err
 	}
@@ -415,12 +401,9 @@ func TestContractRejectsCommandIDZeroBeforeCallingHandler(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Stop(context.Background()) })
-	ctx := WithGateRequestContext(context.Background(), GateRequestContext{Source: RequestSource{ConnectionID: "connection-1"}})
+	ctx := testClientContext("connection-1")
 	if _, err := client.Forward(ctx, Request{}); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("Client.Forward command 0 status = %s, want %s", status.Code(err), codes.InvalidArgument)
-	}
-	if _, err := client.client.Forward(ctx, &GateRequest{}); status.Code(err) != codes.InvalidArgument {
-		t.Fatalf("gRPC Forward command 0 status = %s, want %s", status.Code(err), codes.InvalidArgument)
 	}
 	if calls.Load() != 0 {
 		t.Fatalf("handler calls after command 0 = %d, want 0", calls.Load())
@@ -450,7 +433,10 @@ func TestContractRecoversHandlerPanicAndKeepsServerAvailable(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Stop(context.Background()) })
-	ctx := WithGateRequestContext(context.Background(), GateRequestContext{Source: RequestSource{ConnectionID: "connection-1"}})
+	if err := client.Start(context.Background()); err != nil {
+		t.Fatalf("start client: %v", err)
+	}
+	ctx := testClientContext("connection-1")
 	if reply, err := client.Forward(ctx, Request{CommandID: 1}); reply != nil || status.Code(err) != codes.Internal {
 		t.Fatalf("panic response = reply:%#v status:%s, want nil/Internal", reply, status.Code(err))
 	}
@@ -489,7 +475,10 @@ func TestContractRejectsRequestWithoutSourceConnectionID(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Stop(context.Background()) })
-	if _, err := client.Forward(context.Background(), Request{CommandID: 1}); err == nil || !strings.Contains(err.Error(), "connection_id is required") {
+	if err := client.Start(context.Background()); err != nil {
+		t.Fatalf("start client: %v", err)
+	}
+	if _, err := client.Forward(WithAffinityKey(context.Background(), "alice"), Request{CommandID: 1}); err == nil || !strings.Contains(err.Error(), "connection_id is required") {
 		t.Fatalf("forward without source error = %v, want missing connection_id", err)
 	}
 }
@@ -508,15 +497,6 @@ func (h *recordingHandler) HandleGateRequest(ctx context.Context, request Reques
 	return nil
 }
 
-func testRequest(commandID uint32) Request {
-	return Request{CommandID: commandID, Payload: []byte{byte(commandID)}}
-}
-
-type countingServer struct {
-	UnimplementedGateRequestServiceServer
-	calls atomic.Int32
-}
-
 type forwardClientStub struct {
 	response *ForwardResponse
 }
@@ -525,24 +505,9 @@ func (s forwardClientStub) Forward(context.Context, *GateRequest, ...grpc.CallOp
 	return s.response, nil
 }
 
-func (s *countingServer) Forward(context.Context, *GateRequest) (*ForwardResponse, error) {
-	s.calls.Add(1)
-	return &ForwardResponse{}, nil
-}
-
-func startCountingServer(t *testing.T) (*countingServer, string) {
-	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen backend: %v", err)
-	}
-	grpcServer := grpc.NewServer()
-	backend := &countingServer{}
-	RegisterGateRequestServiceServer(grpcServer, backend)
-	go func() { _ = grpcServer.Serve(listener) }()
-	t.Cleanup(func() {
-		grpcServer.Stop()
-		_ = listener.Close()
-	})
-	return backend, listener.Addr().String()
+func testClientContext(connectionID string) context.Context {
+	return WithAffinityKey(
+		WithGateRequestContext(context.Background(), GateRequestContext{Source: RequestSource{ConnectionID: connectionID}}),
+		connectionID,
+	)
 }
