@@ -99,7 +99,7 @@ type workflowSession struct {
 
 func (s *workflowSession) ID() gateproduct.WebSocketConnectionID { return s.id }
 
-func (s *workflowSession) SendBinary(data []byte) error {
+func (s *workflowSession) SendBinary(_ context.Context, data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.messages = append(s.messages, append([]byte(nil), data...))

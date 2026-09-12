@@ -28,9 +28,8 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// GateDelivery is registered on the product-level Gate gRPC server. It is the
-// generic remote-command ingress on the existing listener; it owns neither a
-// listener nor a Gate endpoint lease.
+// GateDelivery 註冊於 product-level Gate gRPC server，是既有 listener 上的
+// generic remote-command ingress；不擁有 listener 或 Gate endpoint lease。
 type GateDeliveryClient interface {
 	Forward(ctx context.Context, in *gatelink.GateRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 }
@@ -57,9 +56,8 @@ func (c *gateDeliveryClient) Forward(ctx context.Context, in *gatelink.GateReque
 // All implementations must embed UnimplementedGateDeliveryServer
 // for forward compatibility.
 //
-// GateDelivery is registered on the product-level Gate gRPC server. It is the
-// generic remote-command ingress on the existing listener; it owns neither a
-// listener nor a Gate endpoint lease.
+// GateDelivery 註冊於 product-level Gate gRPC server，是既有 listener 上的
+// generic remote-command ingress；不擁有 listener 或 Gate endpoint lease。
 type GateDeliveryServer interface {
 	Forward(context.Context, *gatelink.GateRequest) (*emptypb.Empty, error)
 	mustEmbedUnimplementedGateDeliveryServer()

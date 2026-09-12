@@ -47,7 +47,7 @@ func TestGateWebSocketContractDispatchesReadsWritesAndStops(t *testing.T) {
 				return errors.New("missing WebSocket packet header context")
 			}
 			packets <- append([]byte(nil), payload...)
-			return webSocketContext.Session.SendBinary(testWebSocketPacket(0xE10004, []byte("response")))
+			return webSocketContext.Session.SendBinary(ctx, testWebSocketPacket(0xE10004, []byte("response")))
 		},
 	})
 	t.Cleanup(func() { _ = app.frameworkApp.Stop(context.Background()) })
@@ -369,7 +369,7 @@ func TestGateWebSocketContractBroadcastsAndKicksRegisteredSessions(t *testing.T)
 		}
 	}
 	packet := encodeWebSocketPacket(WebSocketPacket{CommandID: 0xE10006, Payload: []byte("room-broadcast")})
-	if delivered, err := sessions.BroadcastRoom("room-a", packet); err != nil || delivered != 2 {
+	if delivered, err := sessions.BroadcastRoom(context.Background(), "room-a", packet); err != nil || delivered != 2 {
 		t.Fatalf("broadcast room = delivered:%d error:%v, want 2/nil", delivered, err)
 	}
 	assertWebSocketPacket(t, alice, packet)
@@ -379,7 +379,7 @@ func TestGateWebSocketContractBroadcastsAndKicksRegisteredSessions(t *testing.T)
 	}
 	assertWebSocketClosed(t, alice)
 	packet = encodeWebSocketPacket(WebSocketPacket{CommandID: 0xE10006, Payload: []byte("bob-only")})
-	if delivered, err := sessions.BroadcastRoom("room-a", packet); err != nil || delivered != 1 {
+	if delivered, err := sessions.BroadcastRoom(context.Background(), "room-a", packet); err != nil || delivered != 1 {
 		t.Fatalf("broadcast after alice kick = delivered:%d error:%v, want 1/nil", delivered, err)
 	}
 	assertWebSocketPacket(t, bob, packet)

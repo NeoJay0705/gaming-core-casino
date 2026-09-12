@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -294,6 +295,9 @@ func TestFallbackBroadcastSenderContractUsesGRPCAfterRedisFailure(t *testing.T) 
 	if primary.calls != 1 || fallback.calls != 1 {
 		t.Fatalf("fallback broadcast calls = primary:%d fallback:%d, want 1/1", primary.calls, fallback.calls)
 	}
+	if len(primary.traceparents) != 1 || len(fallback.traceparents) != 1 || primary.traceparents[0] == "" || primary.traceparents[0] != fallback.traceparents[0] {
+		t.Fatalf("fallback traceparents = primary:%q fallback:%q, want one shared trace", primary.traceparents, fallback.traceparents)
+	}
 }
 
 func TestFallbackBroadcastSenderContractUsesGRPCAfterZeroRedisSubscribers(t *testing.T) {
@@ -379,12 +383,15 @@ func (d *staticTestDirectory) List(context.Context) ([]GateEndpoint, error) {
 }
 
 type recordingBroadcastSender struct {
-	calls   int
-	receipt Receipt
-	err     error
+	calls        int
+	receipt      Receipt
+	err          error
+	traceparents []string
 }
 
-func (s *recordingBroadcastSender) Broadcast(context.Context, Message) (Receipt, error) {
+func (s *recordingBroadcastSender) Broadcast(ctx context.Context, _ Message) (Receipt, error) {
 	s.calls++
+	traceparent, _ := logging.TraceParentFromContext(ctx)
+	s.traceparents = append(s.traceparents, traceparent)
 	return s.receipt, s.err
 }

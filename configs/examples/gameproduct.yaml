@@ -1,3 +1,9 @@
+# Production structured log 以 JSON 輸出至 stdout，再由 collector 送往指定的
+# log backend。
+logging:
+  # 非必要：debug、info、warn、error；預設 info。
+  level: info
+
 # Game product 的單一 product-level gRPC server。
 grpc:
   server:

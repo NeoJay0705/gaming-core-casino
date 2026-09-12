@@ -43,7 +43,7 @@ func GateModule() framework.Module {
 	}
 }
 
-func broadcastRoomHandler(registry *gateproduct.SessionRegistry, _ context.Context, payload []byte) error {
+func broadcastRoomHandler(registry *gateproduct.SessionRegistry, ctx context.Context, payload []byte) error {
 	command := new(protocol.BroadcastRoomCommand)
 	if err := proto.Unmarshal(payload, command); err != nil {
 		return fmt.Errorf("decode broadcast room command: %w", err)
@@ -62,7 +62,7 @@ func broadcastRoomHandler(registry *gateproduct.SessionRegistry, _ context.Conte
 		CommandID: command.GetClientCommandId(),
 		Payload:   append([]byte(nil), command.GetClientPayload()...),
 	})
-	_, err := registry.BroadcastRoom(gateproduct.RoomID(roomID), packet)
+	_, err := registry.BroadcastRoom(ctx, gateproduct.RoomID(roomID), packet)
 	if err != nil {
 		return fmt.Errorf("broadcast room %q: %w", roomID, err)
 	}
@@ -95,7 +95,7 @@ func loginHandler(registry *gateproduct.SessionRegistry, ctx context.Context, pa
 		return err
 	}
 	response := &gateproto.LoginResponse{ServerTime: uint64(time.Now().Unix())}
-	return sendResponse(requestContext, gateproto.LoginResponseCommandID, response)
+	return sendResponse(ctx, requestContext, gateproto.LoginResponseCommandID, response)
 }
 
 func enterRoomHandler(registry *gateproduct.SessionRegistry, ctx context.Context, payload []byte) error {
@@ -124,7 +124,7 @@ func enterRoomHandler(registry *gateproduct.SessionRegistry, ctx context.Context
 		}
 		return err
 	}
-	return sendResponse(requestContext, protocol.EnterRoomResponseCommandID, &protocol.EnterRoomResponse{})
+	return sendResponse(ctx, requestContext, protocol.EnterRoomResponseCommandID, &protocol.EnterRoomResponse{})
 }
 
 func localEchoHandler(registry *gateproduct.SessionRegistry, ctx context.Context, payload []byte) error {
@@ -147,15 +147,15 @@ func localEchoHandler(registry *gateproduct.SessionRegistry, ctx context.Context
 		return gateproduct.ErrRoomRequired
 	}
 	response := &protocol.EchoResponse{Payload: append([]byte(nil), request.GetPayload()...)}
-	return sendResponse(requestContext, protocol.LocalEchoResponseCommandID, response)
+	return sendResponse(ctx, requestContext, protocol.LocalEchoResponseCommandID, response)
 }
 
-func sendResponse(request gateproduct.WebSocketRequestContext, commandID uint32, message proto.Message) error {
+func sendResponse(ctx context.Context, request gateproduct.WebSocketRequestContext, commandID uint32, message proto.Message) error {
 	payload, err := proto.Marshal(message)
 	if err != nil {
 		return err
 	}
-	return request.Session.SendBinary(gateproduct.EncodeWebSocketPacket(gateproduct.WebSocketPacket{
+	return request.Session.SendBinary(ctx, gateproduct.EncodeWebSocketPacket(gateproduct.WebSocketPacket{
 		CommandID: commandID,
 		Sequence:  request.Packet.Sequence,
 		Session:   request.Packet.Session,

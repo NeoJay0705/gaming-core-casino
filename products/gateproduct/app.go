@@ -12,6 +12,7 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/grpcserver"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/infra"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/observability"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 )
@@ -54,6 +55,9 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 			return err
 		}
 		if err := r.Provide(func(source config.SourceSnapshot) config.Snapshot { return source }); err != nil {
+			return err
+		}
+		if err := logging.Module(r, "gate"); err != nil {
 			return err
 		}
 		if err := observability.Module(r); err != nil {
@@ -165,7 +169,7 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 				return err
 			}
 			if broadcastConfig.Primary == "redis" {
-				if err := r.ProvideManaged("gate-server-send-broadcast", framework.PhaseIngress, newGateServerSendBroadcastRuntime); err != nil {
+				if err := r.ProvideManaged("gate-server-send-broadcast", framework.PhaseIngress, newGateServerSendBroadcastRuntimeWithLogger); err != nil {
 					return err
 				}
 				if err := r.Configure(func(*gateServerSendBroadcastRuntime) error { return nil }); err != nil {

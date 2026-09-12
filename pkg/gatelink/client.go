@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 	"google.golang.org/grpc"
 	_ "google.golang.org/grpc/balancer/roundrobin"
 	"google.golang.org/grpc/codes"
@@ -55,7 +56,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	conn, err := grpc.NewClient(cfg.Target,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultServiceConfig(defaultServiceConfig),
-		grpc.WithChainUnaryInterceptor(outgoingRequestContextInterceptor),
+		grpc.WithChainUnaryInterceptor(logging.UnaryClientInterceptor(), outgoingRequestContextInterceptor),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("gatelink: create client for %q: %w", cfg.Target, err)

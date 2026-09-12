@@ -13,6 +13,13 @@ service GateDelivery {
   rpc Forward(gatelink.v1.GateRequest) returns (google.protobuf.Empty);
 }
 
+// RedisBroadcastEnvelope 在不改變 generic command 的前提下攜帶 W3C trace
+// metadata；inner GateRequest payload 對 transport 保持 opaque。
+message RedisBroadcastEnvelope {
+  string traceparent = 1;
+  gatelink.v1.GateRequest command = 2;
+}
+
 // SendPlayersCommand 是 framework 擁有的 batch player delivery routing envelope。
 // client_payload 對本 package transport 保持 opaque，只由最終 client-facing
 // product code 解碼。

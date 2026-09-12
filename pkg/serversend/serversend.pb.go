@@ -23,9 +23,63 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// SendPlayersCommand is the framework-owned routing envelope for a batch
-// player delivery command. client_payload remains opaque to this package's
-// transport and is decoded only by the eventual client-facing product code.
+// RedisBroadcastEnvelope 在不改變 generic command 的前提下攜帶 W3C trace
+// metadata；inner GateRequest payload 對 transport 保持 opaque。
+type RedisBroadcastEnvelope struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Traceparent   string                 `protobuf:"bytes,1,opt,name=traceparent,proto3" json:"traceparent,omitempty"`
+	Command       *gatelink.GateRequest  `protobuf:"bytes,2,opt,name=command,proto3" json:"command,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RedisBroadcastEnvelope) Reset() {
+	*x = RedisBroadcastEnvelope{}
+	mi := &file_pkg_serversend_serversend_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RedisBroadcastEnvelope) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RedisBroadcastEnvelope) ProtoMessage() {}
+
+func (x *RedisBroadcastEnvelope) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_serversend_serversend_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RedisBroadcastEnvelope.ProtoReflect.Descriptor instead.
+func (*RedisBroadcastEnvelope) Descriptor() ([]byte, []int) {
+	return file_pkg_serversend_serversend_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *RedisBroadcastEnvelope) GetTraceparent() string {
+	if x != nil {
+		return x.Traceparent
+	}
+	return ""
+}
+
+func (x *RedisBroadcastEnvelope) GetCommand() *gatelink.GateRequest {
+	if x != nil {
+		return x.Command
+	}
+	return nil
+}
+
+// SendPlayersCommand 是 framework 擁有的 batch player delivery routing envelope。
+// client_payload 對本 package transport 保持 opaque，只由最終 client-facing
+// product code 解碼。
 type SendPlayersCommand struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Messages      []*PlayerDelivery      `protobuf:"bytes,1,rep,name=messages,proto3" json:"messages,omitempty"`
@@ -35,7 +89,7 @@ type SendPlayersCommand struct {
 
 func (x *SendPlayersCommand) Reset() {
 	*x = SendPlayersCommand{}
-	mi := &file_pkg_serversend_serversend_proto_msgTypes[0]
+	mi := &file_pkg_serversend_serversend_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -47,7 +101,7 @@ func (x *SendPlayersCommand) String() string {
 func (*SendPlayersCommand) ProtoMessage() {}
 
 func (x *SendPlayersCommand) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_serversend_serversend_proto_msgTypes[0]
+	mi := &file_pkg_serversend_serversend_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -60,7 +114,7 @@ func (x *SendPlayersCommand) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SendPlayersCommand.ProtoReflect.Descriptor instead.
 func (*SendPlayersCommand) Descriptor() ([]byte, []int) {
-	return file_pkg_serversend_serversend_proto_rawDescGZIP(), []int{0}
+	return file_pkg_serversend_serversend_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *SendPlayersCommand) GetMessages() []*PlayerDelivery {
@@ -81,7 +135,7 @@ type PlayerDelivery struct {
 
 func (x *PlayerDelivery) Reset() {
 	*x = PlayerDelivery{}
-	mi := &file_pkg_serversend_serversend_proto_msgTypes[1]
+	mi := &file_pkg_serversend_serversend_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -93,7 +147,7 @@ func (x *PlayerDelivery) String() string {
 func (*PlayerDelivery) ProtoMessage() {}
 
 func (x *PlayerDelivery) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_serversend_serversend_proto_msgTypes[1]
+	mi := &file_pkg_serversend_serversend_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -106,7 +160,7 @@ func (x *PlayerDelivery) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlayerDelivery.ProtoReflect.Descriptor instead.
 func (*PlayerDelivery) Descriptor() ([]byte, []int) {
-	return file_pkg_serversend_serversend_proto_rawDescGZIP(), []int{1}
+	return file_pkg_serversend_serversend_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *PlayerDelivery) GetLoginName() string {
@@ -134,7 +188,10 @@ var File_pkg_serversend_serversend_proto protoreflect.FileDescriptor
 
 const file_pkg_serversend_serversend_proto_rawDesc = "" +
 	"\n" +
-	"\x1fpkg/serversend/serversend.proto\x12\rserversend.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1bpkg/gatelink/gatelink.proto\"O\n" +
+	"\x1fpkg/serversend/serversend.proto\x12\rserversend.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1bpkg/gatelink/gatelink.proto\"n\n" +
+	"\x16RedisBroadcastEnvelope\x12 \n" +
+	"\vtraceparent\x18\x01 \x01(\tR\vtraceparent\x122\n" +
+	"\acommand\x18\x02 \x01(\v2\x18.gatelink.v1.GateRequestR\acommand\"O\n" +
 	"\x12SendPlayersCommand\x129\n" +
 	"\bmessages\x18\x01 \x03(\v2\x1d.serversend.v1.PlayerDeliveryR\bmessages\"\x82\x01\n" +
 	"\x0ePlayerDelivery\x12\x1d\n" +
@@ -157,22 +214,24 @@ func file_pkg_serversend_serversend_proto_rawDescGZIP() []byte {
 	return file_pkg_serversend_serversend_proto_rawDescData
 }
 
-var file_pkg_serversend_serversend_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_pkg_serversend_serversend_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
 var file_pkg_serversend_serversend_proto_goTypes = []any{
-	(*SendPlayersCommand)(nil),   // 0: serversend.v1.SendPlayersCommand
-	(*PlayerDelivery)(nil),       // 1: serversend.v1.PlayerDelivery
-	(*gatelink.GateRequest)(nil), // 2: gatelink.v1.GateRequest
-	(*emptypb.Empty)(nil),        // 3: google.protobuf.Empty
+	(*RedisBroadcastEnvelope)(nil), // 0: serversend.v1.RedisBroadcastEnvelope
+	(*SendPlayersCommand)(nil),     // 1: serversend.v1.SendPlayersCommand
+	(*PlayerDelivery)(nil),         // 2: serversend.v1.PlayerDelivery
+	(*gatelink.GateRequest)(nil),   // 3: gatelink.v1.GateRequest
+	(*emptypb.Empty)(nil),          // 4: google.protobuf.Empty
 }
 var file_pkg_serversend_serversend_proto_depIdxs = []int32{
-	1, // 0: serversend.v1.SendPlayersCommand.messages:type_name -> serversend.v1.PlayerDelivery
-	2, // 1: serversend.v1.GateDelivery.Forward:input_type -> gatelink.v1.GateRequest
-	3, // 2: serversend.v1.GateDelivery.Forward:output_type -> google.protobuf.Empty
-	2, // [2:3] is the sub-list for method output_type
-	1, // [1:2] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	3, // 0: serversend.v1.RedisBroadcastEnvelope.command:type_name -> gatelink.v1.GateRequest
+	2, // 1: serversend.v1.SendPlayersCommand.messages:type_name -> serversend.v1.PlayerDelivery
+	3, // 2: serversend.v1.GateDelivery.Forward:input_type -> gatelink.v1.GateRequest
+	4, // 3: serversend.v1.GateDelivery.Forward:output_type -> google.protobuf.Empty
+	3, // [3:4] is the sub-list for method output_type
+	2, // [2:3] is the sub-list for method input_type
+	2, // [2:2] is the sub-list for extension type_name
+	2, // [2:2] is the sub-list for extension extendee
+	0, // [0:2] is the sub-list for field type_name
 }
 
 func init() { file_pkg_serversend_serversend_proto_init() }
@@ -186,7 +245,7 @@ func file_pkg_serversend_serversend_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pkg_serversend_serversend_proto_rawDesc), len(file_pkg_serversend_serversend_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   2,
+			NumMessages:   3,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

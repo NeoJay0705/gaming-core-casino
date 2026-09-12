@@ -16,8 +16,7 @@ type requestContextCarrierKey struct{}
 // single context value so adding a transport field does not change every
 // handler signature.
 type GateRequestContext struct {
-	TraceID string
-	Source  RequestSource
+	Source RequestSource
 }
 
 // RequestContextCarrier exposes the transport-neutral portion of an inbound
@@ -48,7 +47,6 @@ type RequestSource struct {
 }
 
 const (
-	traceIDMetadataKey      = "x-gate-request-trace-id"
 	gateIDMetadataKey       = "x-gate-request-gate-id"
 	connectionIDMetadataKey = "x-gate-request-connection-id"
 )
@@ -117,9 +115,6 @@ func withOutgoingRequestMetadata(ctx context.Context) (context.Context, error) {
 	metadataValues, _ := metadata.FromOutgoingContext(ctx)
 	metadataValues = metadataValues.Copy()
 	metadataValues.Set(connectionIDMetadataKey, strings.TrimSpace(requestContext.Source.ConnectionID))
-	if traceID := strings.TrimSpace(requestContext.TraceID); traceID != "" {
-		metadataValues.Set(traceIDMetadataKey, traceID)
-	}
 	if gateID := strings.TrimSpace(requestContext.Source.GateID); gateID != "" {
 		metadataValues.Set(gateIDMetadataKey, gateID)
 	}
@@ -138,17 +133,12 @@ func withIncomingRequestContext(ctx context.Context) (context.Context, error) {
 	if err != nil {
 		return nil, err
 	}
-	traceID, err := singleMetadataValue(metadataValues, traceIDMetadataKey, false)
-	if err != nil {
-		return nil, err
-	}
 	gateID, err := singleMetadataValue(metadataValues, gateIDMetadataKey, false)
 	if err != nil {
 		return nil, err
 	}
 	return WithGateRequestContext(ctx, GateRequestContext{
-		TraceID: traceID,
-		Source:  RequestSource{GateID: gateID, ConnectionID: connectionID},
+		Source: RequestSource{GateID: gateID, ConnectionID: connectionID},
 	}), nil
 }
 

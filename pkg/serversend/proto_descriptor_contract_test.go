@@ -41,9 +41,13 @@ func TestServerSendProtoDescriptorContractKeepsWireSchema(t *testing.T) {
 		"client_command_id": 2,
 		"client_payload":    3,
 	})
-	if file.Messages().ByName("BroadcastRoomRequest") != nil || file.Messages().ByName("RedisBroadcastEnvelope") != nil {
-		t.Fatal("room-specific broadcast messages must not be part of the transport schema")
+	if file.Messages().ByName("BroadcastRoomRequest") != nil {
+		t.Fatal("room-specific broadcast message must not be part of the transport schema")
 	}
+	assertDescriptorFieldNumbers(t, file.Messages().ByName("RedisBroadcastEnvelope"), map[protoreflect.Name]protoreflect.FieldNumber{
+		"traceparent": 1,
+		"command":     2,
+	})
 	for _, name := range []protoreflect.Name{"SendToPlayerRequest", "DeliveryResponse"} {
 		if file.Messages().ByName(name) != nil {
 			t.Fatalf("obsolete transport message %q is present", name)

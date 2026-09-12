@@ -9,6 +9,7 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/grpcserver"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 	"go.uber.org/dig"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -67,8 +68,12 @@ func dispatchGameGateRequestMeasured(ctx context.Context, commandDispatcher *dis
 // newGameGRPCServer creates the one Game product gRPC server. Service
 // registration is performed by the composition callback before lifecycle
 // hooks are resolved.
-func newGameGRPCServer(cfg grpcserver.Config) (*grpcserver.Server, error) {
-	return grpcserver.New(cfg)
+func newGameGRPCServer(cfg grpcserver.Config, factory *logging.Factory) (*grpcserver.Server, error) {
+	logger, err := factory.Component("grpc.server")
+	if err != nil {
+		return nil, err
+	}
+	return grpcserver.NewWithLogger(cfg, logger)
 }
 
 func registerGameGateRequestService(server *grpcserver.Server, service *gatelink.GateRequestService) error {

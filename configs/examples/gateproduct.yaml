@@ -1,3 +1,9 @@
+# Production structured log 以 JSON 輸出至 stdout，再由 collector 送往指定的
+# log backend。
+logging:
+  # 非必要：debug、info、warn、error；預設 info。
+  level: info
+
 # Gate 對玩家提供的 WebSocket listener。
 websocket:
   # 必填：Gate 玩家 WebSocket listener。

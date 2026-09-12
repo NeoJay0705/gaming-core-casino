@@ -3,17 +3,13 @@ package serversend
 import (
 	"context"
 	"errors"
-	"strings"
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
-
-const traceIDMetadataKey = "x-server-send-trace-id"
 
 // GateDeliveryService implements the generated GateDelivery contract. The
 // product-level grpcserver owns its listener and lifecycle; this service only
@@ -39,14 +35,10 @@ func (s *GateDeliveryService) Forward(ctx context.Context, request *gatelink.Gat
 	if request == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is required")
 	}
-	ctx, err := withIncomingRequestContext(ctx)
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
 	if s == nil || s.commandDispatcher == nil {
 		return nil, status.Error(codes.Unavailable, ErrDispatcherUnavailable.Error())
 	}
-	_, err = dispatchRemoteCommand(ctx, s.commandDispatcher, Message{
+	_, err := dispatchRemoteCommand(ctx, s.commandDispatcher, Message{
 		CommandID: request.GetCommandId(),
 		Payload:   append([]byte(nil), request.GetPayload()...),
 	})
@@ -76,35 +68,6 @@ func remoteCommandError(err error) error {
 		return status.Error(codes.DeadlineExceeded, err.Error())
 	}
 	return status.Error(codes.Internal, "gate delivery failed")
-}
-
-func outgoingRequestContext(ctx context.Context) context.Context {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	traceID := traceIDFromContext(ctx)
-	if strings.TrimSpace(traceID) == "" {
-		return ctx
-	}
-	values, _ := metadata.FromOutgoingContext(ctx)
-	values = values.Copy()
-	values.Set(traceIDMetadataKey, strings.TrimSpace(traceID))
-	return metadata.NewOutgoingContext(ctx, values)
-}
-
-func withIncomingRequestContext(ctx context.Context) (context.Context, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	values, _ := metadata.FromIncomingContext(ctx)
-	traceIDs := values.Get(traceIDMetadataKey)
-	if len(traceIDs) > 1 {
-		return nil, status.Error(codes.InvalidArgument, "gate delivery request contains duplicate trace id")
-	}
-	if len(traceIDs) == 1 {
-		ctx = WithRequestContext(ctx, RequestContext{TraceID: strings.TrimSpace(traceIDs[0])})
-	}
-	return ctx, nil
 }
 
 var _ GateDeliveryServer = (*GateDeliveryService)(nil)

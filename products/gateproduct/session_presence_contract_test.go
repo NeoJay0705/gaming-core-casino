@@ -399,7 +399,7 @@ func newBlockingCloseSession(id WebSocketConnectionID, events *lifecycleEventLog
 
 func (s *blockingCloseSession) ID() WebSocketConnectionID { return s.id }
 
-func (s *blockingCloseSession) SendBinary([]byte) error { return nil }
+func (s *blockingCloseSession) SendBinary(context.Context, []byte) error { return nil }
 
 func (s *blockingCloseSession) Close() error {
 	s.closeOnce.Do(func() {

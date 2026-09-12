@@ -1,4 +1,8 @@
 # 共用基礎設施設定；實際服務只會在其 DI graph 使用到資源時才連線。
+# 各 product 的 structured log 以 JSON 輸出至 stdout。
+logging:
+  # 非必要：debug、info、warn、error；預設 info。
+  level: info
 
 observability:
   # Health、Readiness 與 Prometheus Metrics 共用的 HTTP listener。

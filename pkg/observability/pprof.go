@@ -9,6 +9,7 @@ import (
 
 	"github.com/NeoJay0705/gaming-core-casino/internal/profilehttp"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 )
 
 // pprofServer 將共用 loopback pprof helper 接入 framework lifecycle；它不會
@@ -18,18 +19,31 @@ type pprofServer struct {
 
 	mu      sync.Mutex
 	server  *profilehttp.Server
+	logger  *logging.Logger
 	started bool
 	stopped bool
 }
 
 func newPprofServer(cfg Config) (*pprofServer, error) {
+	return newPprofServerWithLogger(cfg, nil)
+}
+
+func newPprofServerWithLogger(cfg Config, factory *logging.Factory) (*pprofServer, error) {
 	listenAddr := strings.TrimSpace(cfg.PprofListenAddr)
 	if listenAddr != "" {
 		if err := profilehttp.ValidateLoopbackAddress(listenAddr); err != nil {
 			return nil, fmt.Errorf("observability pprof: %w", err)
 		}
 	}
-	return &pprofServer{listenAddr: listenAddr}, nil
+	var logger *logging.Logger
+	if factory != nil {
+		var err error
+		logger, err = factory.Component("observability.pprof")
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &pprofServer{listenAddr: listenAddr, logger: logger}, nil
 }
 
 // Start 啟動 optional pprof listener；空 address 時保持 disabled。
@@ -56,7 +70,7 @@ func (s *pprofServer) Start(ctx context.Context) error {
 	s.started = true
 	listenAddr := s.listenAddr
 
-	server, err := profilehttp.Start(listenAddr)
+	server, err := profilehttp.Start(listenAddr, s.logger)
 	if err != nil {
 		s.started = false
 		s.stopped = true

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -159,9 +160,7 @@ func (t *GRPCTransport) connection(address string) (*grpc.ClientConn, error) {
 	}
 	conn, err := grpc.NewClient(address,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithChainUnaryInterceptor(func(ctx context.Context, method string, request, reply any, connection *grpc.ClientConn, invoker grpc.UnaryInvoker, options ...grpc.CallOption) error {
-			return invoker(outgoingRequestContext(ctx), method, request, reply, connection, options...)
-		}),
+		grpc.WithChainUnaryInterceptor(logging.UnaryClientInterceptor()),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("server send: create gRPC client for %q: %w", address, err)

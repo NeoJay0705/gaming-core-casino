@@ -4,11 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/rand"
 	"sync"
 	"time"
 
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 )
 
@@ -86,6 +87,7 @@ type SessionRegistry struct {
 	presence           sessionPresence
 	presenceTTL        time.Duration
 	leasesByConnection map[WebSocketConnectionID]*sessionPresenceLease
+	logger             *logging.Logger
 }
 
 func NewSessionRegistry() *SessionRegistry {
@@ -121,6 +123,10 @@ func newLocalSessionRegistry() *SessionRegistry {
 // distributed Gate constructor. Production Gate composition always supplies
 // a presence owner and a positive lease duration.
 func newSessionRegistry(presence sessionPresence, leaseTTL time.Duration) (*SessionRegistry, error) {
+	return newSessionRegistryWithLogger(presence, leaseTTL, nil)
+}
+
+func newSessionRegistryWithLogger(presence sessionPresence, leaseTTL time.Duration, logger *logging.Logger) (*SessionRegistry, error) {
 	if presence == nil {
 		if leaseTTL > 0 {
 			return nil, fmt.Errorf("gate session: presence owner is required when lease ttl is configured")
@@ -133,6 +139,7 @@ func newSessionRegistry(presence sessionPresence, leaseTTL time.Duration) (*Sess
 	registry := newLocalSessionRegistry()
 	registry.presence = presence
 	registry.presenceTTL = leaseTTL
+	registry.logger = logger
 	return registry, nil
 }
 
@@ -193,7 +200,7 @@ func (r *SessionRegistry) Register(session ClosableWebSocketSession, loginName L
 	r.byLoginName[loginName] = registeredLoginSession{connectionID: connectionID, session: session}
 	r.byConnection[connectionID] = loginName
 	if r.presence != nil {
-		lease := startSessionPresenceLease(r.presence, claimed, r.presenceTTL)
+		lease := startSessionPresenceLease(r.presence, claimed, r.presenceTTL, r.logger)
 		r.leasesByConnection[connectionID] = lease
 	}
 	r.mu.Unlock()
@@ -203,7 +210,10 @@ func (r *SessionRegistry) Register(session ClosableWebSocketSession, loginName L
 		// The new mapping is authoritative before stale socket cleanup. Its old
 		// lease is fenced by epoch, so cleanup cannot release the replacement.
 		if err := r.cleanupDetached(context.Background(), previous, true); err != nil {
-			log.Printf("[gate session] replaced session cleanup failed: login=%s err=%v", loginName, err)
+			if r.logger != nil {
+				r.logger.Error(context.Background(), "session_cleanup", "replaced session cleanup failed", err,
+					slog.String("login_name", string(loginName)))
+			}
 		}
 	}
 	return nil
@@ -227,7 +237,10 @@ func (r *SessionRegistry) Remove(session WebSocketSession) {
 	r.registrationMu.Unlock()
 	if detached.session != nil {
 		if err := r.cleanupDetached(context.Background(), detached, false); err != nil {
-			log.Printf("[gate session] disconnected session cleanup failed: login=%s err=%v", loginName, err)
+			if r.logger != nil {
+				r.logger.Error(context.Background(), "session_cleanup", "disconnected session cleanup failed", err,
+					slog.String("login_name", string(loginName)))
+			}
 		}
 	}
 }
@@ -286,22 +299,26 @@ func (r *SessionRegistry) SendToLoginName(loginName LoginName, data []byte) erro
 }
 
 func (r *SessionRegistry) sendToLoginNameAt(loginName LoginName, data []byte, receivedAt time.Time, target serverSendTarget) error {
+	return r.sendToLoginNameWithContext(context.Background(), loginName, data, receivedAt, target)
+}
+
+func (r *SessionRegistry) sendToLoginNameWithContext(ctx context.Context, loginName LoginName, data []byte, receivedAt time.Time, target serverSendTarget) error {
 	r.mu.RLock()
 	entry, exists := r.byLoginName[loginName]
 	r.mu.RUnlock()
 	if !exists {
 		return fmt.Errorf("%w: %q", ErrLoginSessionNotFound, loginName)
 	}
-	return sendOutbound(entry.session, outboundMessage{data: data, source: outboundSourceServerSend, receivedAt: receivedAt, target: target})
+	return sendOutbound(entry.session, outboundMessage{data: data, source: outboundSourceServerSend, receivedAt: receivedAt, target: target, ctx: ctx})
 }
 
 // BroadcastRoom sends one complete client wire packet to every current local
 // member of roomID. A failed member does not prevent delivery to others.
-func (r *SessionRegistry) BroadcastRoom(roomID RoomID, data []byte) (int, error) {
-	return r.broadcastRoomAt(roomID, data, time.Now(), serverSendTargetRoom)
+func (r *SessionRegistry) BroadcastRoom(ctx context.Context, roomID RoomID, data []byte) (int, error) {
+	return r.broadcastRoomAt(ctx, roomID, data, time.Now(), serverSendTargetRoom)
 }
 
-func (r *SessionRegistry) broadcastRoomAt(roomID RoomID, data []byte, receivedAt time.Time, deliveryTarget serverSendTarget) (int, error) {
+func (r *SessionRegistry) broadcastRoomAt(ctx context.Context, roomID RoomID, data []byte, receivedAt time.Time, deliveryTarget serverSendTarget) (int, error) {
 	if roomID == "" {
 		return 0, ErrRoomIDInvalid
 	}
@@ -318,7 +335,7 @@ func (r *SessionRegistry) broadcastRoomAt(roomID RoomID, data []byte, receivedAt
 	delivered := 0
 	var errs []error
 	for _, member := range targets {
-		if err := sendOutbound(member.session, outboundMessage{data: data, source: outboundSourceServerSend, receivedAt: receivedAt, target: deliveryTarget}); err != nil {
+		if err := sendOutbound(member.session, outboundMessage{data: data, source: outboundSourceServerSend, receivedAt: receivedAt, target: deliveryTarget, ctx: ctx}); err != nil {
 			errs = append(errs, fmt.Errorf("broadcast room %q to login %q: %w", roomID, member.loginName, err))
 			continue
 		}
@@ -458,14 +475,14 @@ func (r *SessionRegistry) releasePresence(ctx context.Context, presence serverse
 	return err
 }
 
-func startSessionPresenceLease(owner sessionPresence, presence serversend.Presence, leaseTTL time.Duration) *sessionPresenceLease {
+func startSessionPresenceLease(owner sessionPresence, presence serversend.Presence, leaseTTL time.Duration, logger *logging.Logger) *sessionPresenceLease {
 	ctx, cancel := context.WithCancel(context.Background())
 	lease := &sessionPresenceLease{presence: presence, owner: owner, cancel: cancel, done: make(chan struct{})}
-	go renewSessionPresence(ctx, lease.done, owner, presence, leaseTTL)
+	go renewSessionPresence(ctx, lease.done, owner, presence, leaseTTL, logger)
 	return lease
 }
 
-func renewSessionPresence(ctx context.Context, done chan struct{}, owner sessionPresence, presence serversend.Presence, leaseTTL time.Duration) {
+func renewSessionPresence(ctx context.Context, done chan struct{}, owner sessionPresence, presence serversend.Presence, leaseTTL time.Duration, logger *logging.Logger) {
 	defer close(done)
 	baseDelay := presenceRenewInterval(leaseTTL)
 	maxDelay := presenceRetryMax(leaseTTL)
@@ -484,12 +501,20 @@ func renewSessionPresence(ctx context.Context, done chan struct{}, owner session
 			continue
 		}
 		if errors.Is(err, serversend.ErrPresenceNotOwner) {
-			log.Printf("[gate session] presence ownership lost: login=%s gate=%s", presence.LoginName, presence.GateID)
+			if logger != nil {
+				logger.Warn(ctx, "presence_renew", "presence ownership lost",
+					slog.String("login_name", string(presence.LoginName)),
+					slog.String("gate_id", string(presence.GateID)))
+			}
 			return
 		}
 		attempt++
 		delay = presenceBackoff(attempt, baseDelay, maxDelay)
-		log.Printf("[gate session] presence renewal failed: login=%s gate=%s err=%v", presence.LoginName, presence.GateID, err)
+		if logger != nil {
+			logger.Error(ctx, "presence_renew", "presence renewal failed", err,
+				slog.String("login_name", string(presence.LoginName)),
+				slog.String("gate_id", string(presence.GateID)))
+		}
 	}
 }
 

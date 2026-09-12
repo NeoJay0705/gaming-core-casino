@@ -1,3 +1,7 @@
+logging:
+  # 非必要：debug、info、warn、error；預設 info。
+  level: info
+
 observability:
   # 必填：/health、/ready、/metrics 共用的 HTTP listener。
   listen_addr: "127.0.0.1:19080"

@@ -43,7 +43,7 @@ func TestContractForwardsOpaquePayloadAndRequestContext(t *testing.T) {
 		CommandID: 0xE10003,
 		Payload:   payload,
 	}
-	ctx := WithGateRequestContext(context.Background(), GateRequestContext{TraceID: "trace-123", Source: RequestSource{GateID: "gate-a", ConnectionID: "connection-42"}})
+	ctx := WithGateRequestContext(context.Background(), GateRequestContext{Source: RequestSource{GateID: "gate-a", ConnectionID: "connection-42"}})
 	if _, err := client.Forward(ctx, request); err != nil {
 		t.Fatalf("forward: %v", err)
 	}
@@ -58,9 +58,6 @@ func TestContractForwardsOpaquePayloadAndRequestContext(t *testing.T) {
 		}
 		if got.requestContext.Source != (RequestSource{GateID: "gate-a", ConnectionID: "connection-42"}) {
 			t.Fatalf("source = %#v, want Gate connection source", got.requestContext.Source)
-		}
-		if got.requestContext.TraceID != "trace-123" {
-			t.Fatalf("trace id = %q, want trace-123", got.requestContext.TraceID)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("handler did not receive request")

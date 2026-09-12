@@ -10,6 +10,7 @@ import (
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -31,7 +32,10 @@ func TestGRPCTransportContractForwardsOpaqueCommand(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = transport.Stop(context.Background()) })
 	endpoint := GateEndpoint{GateID: "gate-a", Address: server.Addr()}
-	ctx := WithRequestContext(context.Background(), RequestContext{TraceID: "trace-123"})
+	ctx, err := logging.ContinueOrNew(context.Background(), "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	payload := []byte("opaque-command")
 	if err := transport.Forward(ctx, endpoint, Message{CommandID: 12, Payload: payload}); err != nil {
@@ -44,8 +48,8 @@ func TestGRPCTransportContractForwardsOpaqueCommand(t *testing.T) {
 	if receiver.remoteCommandID != 12 || string(receiver.remotePayload) != "opaque-command" {
 		t.Fatalf("receiver remote command = id:%d payload:%q", receiver.remoteCommandID, receiver.remotePayload)
 	}
-	if receiver.traceID != "trace-123" {
-		t.Fatalf("receiver trace id = %q, want trace-123", receiver.traceID)
+	if receiver.traceID != "4bf92f3577b34da6a3ce929d0e0e4736" {
+		t.Fatalf("receiver trace id = %q, want W3C trace ID", receiver.traceID)
 	}
 }
 
@@ -124,7 +128,7 @@ func TestGenericIngressesShareOneDispatcher(t *testing.T) {
 	if _, err := service.Forward(context.Background(), &gatelink.GateRequest{CommandId: 77, Payload: []byte("same-payload")}); err != nil {
 		t.Fatalf("gRPC Forward: %v", err)
 	}
-	encoded, err := proto.Marshal(&gatelink.GateRequest{CommandId: 77, Payload: []byte("same-payload")})
+	encoded, err := marshalBroadcastCommand(77, []byte("same-payload"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,11 +173,6 @@ func (r *recordingReceiver) HandleRemote(ctx context.Context, commandID uint32, 
 	defer r.mu.Unlock()
 	r.remoteCommandID = commandID
 	r.remotePayload = append([]byte(nil), payload...)
-	r.traceID, _ = receivedTraceIDFromContext(ctx)
+	r.traceID, _, _ = logging.IDsFromContext(ctx)
 	return nil
-}
-
-func receivedTraceIDFromContext(ctx context.Context) (string, bool) {
-	value, ok := RequestContextFrom(ctx)
-	return value.TraceID, ok
 }

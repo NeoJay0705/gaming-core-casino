@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
@@ -592,14 +593,25 @@ func (s *FallbackBroadcastSender) Broadcast(ctx context.Context, message Message
 	if err := ctx.Err(); err != nil {
 		return Receipt{}, err
 	}
-	primaryReceipt, primaryErr := s.primary.Broadcast(ctx, message)
+	// 兩次傳送屬於同一條 broadcast trace。只有 caller 沒有提供 trace 時才
+	// 建立 root；每個 transport 再建立自己的 child span，不把失敗的 Redis
+	// attempt 當成 gRPC parent。
+	attemptCtx := ctx
+	if _, ok := logging.TraceParentFromContext(attemptCtx); !ok {
+		var err error
+		attemptCtx, err = logging.NewRoot(attemptCtx)
+		if err != nil {
+			return Receipt{}, err
+		}
+	}
+	primaryReceipt, primaryErr := s.primary.Broadcast(attemptCtx, message)
 	if primaryErr == nil {
 		return primaryReceipt, nil
 	}
 	if err := ctx.Err(); err != nil {
 		return Receipt{}, err
 	}
-	fallbackReceipt, fallbackErr := s.fallback.Broadcast(ctx, message)
+	fallbackReceipt, fallbackErr := s.fallback.Broadcast(attemptCtx, message)
 	if fallbackErr == nil {
 		return fallbackReceipt, nil
 	}

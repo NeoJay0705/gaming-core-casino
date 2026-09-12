@@ -8,11 +8,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
+	"runtime/debug"
 	"strings"
 	"sync"
 
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -29,7 +31,8 @@ type Config struct {
 // Server owns one listener and one grpc.Server. Services must be registered
 // during application composition, before Start is called.
 type Server struct {
-	cfg Config
+	cfg    Config
+	logger *logging.Logger
 
 	mu         sync.Mutex
 	server     *grpc.Server
@@ -41,6 +44,17 @@ type Server struct {
 
 // New validates config without binding a port.
 func New(cfg Config) (*Server, error) {
+	return newServer(cfg, nil)
+}
+
+// NewWithLogger 建立帶有 component-scoped structured logger 的 gRPC server。
+// logger 為 nil 時仍可供 low-level contract tests 使用，但 production
+// product 應由 logging.Factory 注入 logger。
+func NewWithLogger(cfg Config, logger *logging.Logger) (*Server, error) {
+	return newServer(cfg, logger)
+}
+
+func newServer(cfg Config, logger *logging.Logger) (*Server, error) {
 	cfg.ListenAddr = strings.TrimSpace(cfg.ListenAddr)
 	if cfg.ListenAddr == "" {
 		return nil, errors.New("grpc server: listen address is required")
@@ -55,9 +69,13 @@ func New(cfg Config) (*Server, error) {
 	if cfg.MaxConcurrentStreams > 0 {
 		serverOptions = append(serverOptions, grpc.MaxConcurrentStreams(cfg.MaxConcurrentStreams))
 	}
-	serverOptions = append(serverOptions, grpc.ChainUnaryInterceptor(recoveryInterceptor))
+	serverOptions = append(serverOptions, grpc.ChainUnaryInterceptor(
+		logging.UnaryServerInterceptor(),
+		recoveryInterceptor(logger),
+	))
 	return &Server{
 		cfg:        cfg,
+		logger:     logger,
 		server:     grpc.NewServer(serverOptions...),
 		registered: make(map[string]struct{}),
 	}, nil
@@ -122,7 +140,10 @@ func (s *Server) Start(ctx context.Context) error {
 	server := s.server
 	go func() {
 		if err := server.Serve(listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
-			log.Printf("[grpc server] serve stopped: addr=%s err=%v", listener.Addr(), err)
+			if s.logger != nil {
+				s.logger.Error(context.Background(), "serve", "gRPC server stopped unexpectedly", err,
+					slog.String("addr", listener.Addr().String()))
+			}
 		}
 	}()
 	return nil
@@ -179,15 +200,21 @@ func (s *Server) Addr() string {
 	return s.listener.Addr().String()
 }
 
-func recoveryInterceptor(ctx context.Context, request any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (response any, err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			log.Printf("[grpc server] unary handler panicked: method=%s panic=%v", info.FullMethod, recovered)
-			response = nil
-			err = status.Error(codes.Internal, "gRPC unary handler failed")
-		}
-	}()
-	return handler(ctx, request)
+func recoveryInterceptor(logger *logging.Logger) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, request any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (response any, err error) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				if logger != nil {
+					logger.Error(ctx, info.FullMethod, "gRPC unary handler panicked", fmt.Errorf("%v", recovered),
+						slog.String("method", info.FullMethod),
+						slog.String("stack", string(debug.Stack())))
+				}
+				response = nil
+				err = status.Error(codes.Internal, "gRPC unary handler failed")
+			}
+		}()
+		return handler(ctx, request)
+	}
 }
 
 var _ interface {

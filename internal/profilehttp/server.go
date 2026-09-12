@@ -8,13 +8,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/pprof"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 )
 
 const readHeaderTimeout = 5 * time.Second
@@ -29,17 +31,21 @@ type Server struct {
 	shutdownOnce sync.Once
 	shutdownDone chan struct{}
 	shutdownErr  error
+	logger       *logging.Logger
 }
 
 // Start 啟動 pprof listener。空白 address 停用 profiling 並回傳 nil, nil；非空
 // address 必須明確指定 localhost 或 loopback IP，wildcard 與 public address 會拒絕。
-func Start(listenAddr string) (*Server, error) {
+func Start(listenAddr string, loggers ...*logging.Logger) (*Server, error) {
 	listenAddr = strings.TrimSpace(listenAddr)
 	if listenAddr == "" {
 		return nil, nil
 	}
 	if err := ValidateLoopbackAddress(listenAddr); err != nil {
 		return nil, err
+	}
+	if len(loggers) > 1 {
+		return nil, errors.New("profilehttp: at most one logger is allowed")
 	}
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -62,13 +68,19 @@ func Start(listenAddr string) (*Server, error) {
 		done:         make(chan error, 1),
 		shutdownDone: make(chan struct{}),
 	}
+	if len(loggers) == 1 {
+		server.logger = loggers[0]
+	}
 	go func() {
 		serveErr := server.server.Serve(listener)
 		if errors.Is(serveErr, http.ErrServerClosed) {
 			serveErr = nil
 		}
 		if serveErr != nil {
-			log.Printf("[profilehttp] pprof server stopped unexpectedly: %v", serveErr)
+			if server.logger != nil {
+				server.logger.Error(context.Background(), "serve", "pprof server stopped unexpectedly", serveErr,
+					slog.String("addr", listener.Addr().String()))
+			}
 		}
 		server.done <- serveErr
 	}()

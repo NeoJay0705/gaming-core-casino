@@ -4,13 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/rand"
 	"sync"
 	"time"
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/protobuf/proto"
 )
@@ -48,11 +49,22 @@ func (s *RedisBroadcastSender) Broadcast(ctx context.Context, message Message) (
 		ctx = context.Background()
 	}
 	message = message.clone()
-	encoded, err := proto.Marshal(&gatelink.GateRequest{CommandId: message.CommandID, Payload: message.Payload})
+	traced, err := logging.Child(ctx)
+	if err != nil {
+		return Receipt{}, err
+	}
+	traceparent, ok := logging.TraceParentFromContext(traced)
+	if !ok {
+		return Receipt{}, errors.New("server send: Redis broadcast trace is unavailable")
+	}
+	encoded, err := proto.Marshal(&RedisBroadcastEnvelope{
+		Traceparent: traceparent,
+		Command:     &gatelink.GateRequest{CommandId: message.CommandID, Payload: message.Payload},
+	})
 	if err != nil {
 		return Receipt{}, fmt.Errorf("server send: encode Redis broadcast command: %w", err)
 	}
-	count, err := s.publisher.Publish(ctx, s.keys.broadcastChannel(), encoded).Result()
+	count, err := s.publisher.Publish(traced, s.keys.broadcastChannel(), encoded).Result()
 	if err != nil {
 		return Receipt{}, routeStoreError("publish broadcast command", err)
 	}
@@ -90,6 +102,7 @@ type RedisBroadcastSubscriber struct {
 	done    chan struct{}
 	sub     broadcastSubscription
 	started bool
+	logger  *logging.Logger
 
 	// subscribe 與 retryInterval 讓 lifecycle 行為可做 contract test，避免
 	// 暴露 Redis Pub/Sub 實作細節。
@@ -98,7 +111,7 @@ type RedisBroadcastSubscriber struct {
 	retryMax      time.Duration
 }
 
-func NewRedisBroadcastSubscriber(store BroadcastSubscriptionStore, keys Keyspace, commandDispatcher *dispatcher.Dispatcher) (*RedisBroadcastSubscriber, error) {
+func NewRedisBroadcastSubscriber(store BroadcastSubscriptionStore, keys Keyspace, commandDispatcher *dispatcher.Dispatcher, loggers ...*logging.Logger) (*RedisBroadcastSubscriber, error) {
 	if store == nil {
 		return nil, fmt.Errorf("%w: Redis broadcast subscription store is required", ErrRouteStoreUnavailable)
 	}
@@ -108,7 +121,14 @@ func NewRedisBroadcastSubscriber(store BroadcastSubscriptionStore, keys Keyspace
 	if commandDispatcher == nil {
 		return nil, errors.New("server send: dispatcher is required")
 	}
-	return &RedisBroadcastSubscriber{store: store, keys: keys, commandDispatcher: commandDispatcher, retryMax: defaultSubscriptionRetryMax}, nil
+	var logger *logging.Logger
+	if len(loggers) > 1 {
+		return nil, errors.New("server send: at most one Redis broadcast logger is allowed")
+	}
+	if len(loggers) == 1 {
+		logger = loggers[0]
+	}
+	return &RedisBroadcastSubscriber{store: store, keys: keys, commandDispatcher: commandDispatcher, retryMax: defaultSubscriptionRetryMax, logger: logger}, nil
 }
 
 func (s *RedisBroadcastSubscriber) Start(ctx context.Context) error {
@@ -197,7 +217,9 @@ func (s *RedisBroadcastSubscriber) consume(ctx context.Context, done chan struct
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("[server send] Redis broadcast subscriber reconnecting: %v", err)
+			if s.logger != nil {
+				s.logger.Warn(ctx, "redis_broadcast_receive", "Redis broadcast subscriber reconnecting", slog.String("cause", err.Error()))
+			}
 			_ = current.Close()
 			attempt++
 			if !waitForSubscriptionRetry(ctx, s.subscriptionRetryDelay(attempt)) {
@@ -205,7 +227,9 @@ func (s *RedisBroadcastSubscriber) consume(ctx context.Context, done chan struct
 			}
 			next, openErr := s.openSubscription(ctx)
 			if openErr != nil {
-				log.Printf("[server send] Redis broadcast resubscribe failed: %v", openErr)
+				if s.logger != nil {
+					s.logger.Error(ctx, "redis_broadcast_subscribe", "Redis broadcast resubscribe failed", openErr)
+				}
 				continue
 			}
 			if !s.replaceSubscription(done, next) {
@@ -216,9 +240,7 @@ func (s *RedisBroadcastSubscriber) consume(ctx context.Context, done chan struct
 			attempt = 0
 			continue
 		}
-		if err := s.handle(ctx, []byte(message.Payload)); err != nil {
-			log.Printf("[server send] Redis broadcast command ignored: %v", err)
-		}
+		_ = s.handle(ctx, []byte(message.Payload))
 	}
 }
 
@@ -290,21 +312,33 @@ func waitForSubscriptionRetry(ctx context.Context, delay time.Duration) bool {
 }
 
 func (s *RedisBroadcastSubscriber) handle(ctx context.Context, encoded []byte) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	logCtx := ctx
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("Redis broadcast handler panic: %v", recovered)
 		}
+		if err != nil && s != nil && s.logger != nil {
+			s.logger.Error(logCtx, "redis_broadcast_dispatch", "Redis broadcast command ignored", err)
+		}
 	}()
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	var request gatelink.GateRequest
-	if err := proto.Unmarshal(encoded, &request); err != nil {
+	var envelope RedisBroadcastEnvelope
+	if err := proto.Unmarshal(encoded, &envelope); err != nil {
 		return fmt.Errorf("decode broadcast command: %w", err)
 	}
-	_, err = dispatchRemoteCommand(ctx, s.commandDispatcher, Message{
-		CommandID: request.GetCommandId(),
-		Payload:   append([]byte(nil), request.GetPayload()...),
+	traced, traceErr := logging.ContinueOrNew(ctx, envelope.GetTraceparent())
+	if traceErr != nil {
+		return traceErr
+	}
+	logCtx = traced
+	if envelope.GetCommand() == nil {
+		return errors.New("decode broadcast command: command is required")
+	}
+	_, err = dispatchRemoteCommand(traced, s.commandDispatcher, Message{
+		CommandID: envelope.GetCommand().GetCommandId(),
+		Payload:   append([]byte(nil), envelope.GetCommand().GetPayload()...),
 	})
 	return err
 }

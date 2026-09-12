@@ -4,10 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -93,6 +94,7 @@ type EndpointRegistrar struct {
 	keys     Keyspace
 	endpoint GateEndpoint
 	cfg      EndpointRegistrarConfig
+	logger   *logging.Logger
 
 	mu      sync.Mutex
 	cancel  context.CancelFunc
@@ -100,7 +102,7 @@ type EndpointRegistrar struct {
 	started bool
 }
 
-func NewEndpointRegistrar(store GateEndpointStore, keys Keyspace, endpoint GateEndpoint, cfg EndpointRegistrarConfig) (*EndpointRegistrar, error) {
+func NewEndpointRegistrar(store GateEndpointStore, keys Keyspace, endpoint GateEndpoint, cfg EndpointRegistrarConfig, loggers ...*logging.Logger) (*EndpointRegistrar, error) {
 	if store == nil {
 		return nil, fmt.Errorf("%w: Gate endpoint store is required", ErrRouteStoreUnavailable)
 	}
@@ -114,7 +116,14 @@ func NewEndpointRegistrar(store GateEndpointStore, keys Keyspace, endpoint GateE
 	if cfg, err = cfg.normalized(); err != nil {
 		return nil, err
 	}
-	return &EndpointRegistrar{store: store, keys: keys, endpoint: endpoint, cfg: cfg}, nil
+	if len(loggers) > 1 {
+		return nil, errors.New("server send: at most one endpoint registrar logger is allowed")
+	}
+	var logger *logging.Logger
+	if len(loggers) == 1 {
+		logger = loggers[0]
+	}
+	return &EndpointRegistrar{store: store, keys: keys, endpoint: endpoint, cfg: cfg, logger: logger}, nil
 }
 
 func (r *EndpointRegistrar) Start(ctx context.Context) error {
@@ -206,7 +215,10 @@ func (r *EndpointRegistrar) refreshLoop(ctx context.Context, done chan struct{})
 				// A transient store failure is retried on the next tick. Since this
 				// registrar's GateID is process-unique, renewal cannot overwrite a
 				// different process's endpoint key.
-				log.Printf("[server send] Gate endpoint renewal failed: gate=%s err=%v", r.endpoint.GateID, err)
+				if r.logger != nil {
+					r.logger.Error(ctx, "endpoint_renew", "Gate endpoint renewal failed", err,
+						slog.String("gate_id", string(r.endpoint.GateID)))
+				}
 			}
 		}
 	}

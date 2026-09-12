@@ -28,7 +28,7 @@ func registerGatePlayerDeliveryCommand(registry *SessionRegistry, metrics *gateM
 // handlePlayerDeliveryCommand 只解碼 framework routing envelope。每個
 // client_payload 保持 opaque，完成 login-name lookup 後複製到既有 WebSocket
 // packet format。
-func handlePlayerDeliveryCommand(registry *SessionRegistry, metrics *gateMetrics, _ context.Context, payload []byte) error {
+func handlePlayerDeliveryCommand(registry *SessionRegistry, metrics *gateMetrics, ctx context.Context, payload []byte) error {
 	if registry == nil {
 		return errors.New("gate player delivery: session registry is nil")
 	}
@@ -66,7 +66,7 @@ func handlePlayerDeliveryCommand(registry *SessionRegistry, metrics *gateMetrics
 			continue
 		}
 		packet := encodeServerSendPacket(message.Message)
-		if err := registry.sendToLoginNameAt(LoginName(message.LoginName), packet, receivedAt, serverSendTargetPlayer); err != nil {
+		if err := registry.sendToLoginNameWithContext(ctx, LoginName(message.LoginName), packet, receivedAt, serverSendTargetPlayer); err != nil {
 			if errors.Is(err, ErrLoginSessionNotFound) {
 				if metrics != nil {
 					metrics.observeServerSendRequest(string(serverSendTargetPlayer), "ignored")

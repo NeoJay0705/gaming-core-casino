@@ -11,10 +11,15 @@ import (
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/protobuf/proto"
 )
+
+func marshalBroadcastCommand(commandID uint32, payload []byte) ([]byte, error) {
+	return proto.Marshal(&RedisBroadcastEnvelope{Command: &gatelink.GateRequest{CommandId: commandID, Payload: payload}})
+}
 
 func TestRedisBroadcastSenderContractPublishesGenericGateRequest(t *testing.T) {
 	keys, err := NewKeyspace("core-casino")
@@ -27,19 +32,26 @@ func TestRedisBroadcastSenderContractPublishesGenericGateRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	payload := []byte("opaque-command")
-	if _, err := sender.Broadcast(context.Background(), Message{CommandID: 9, Payload: payload}); err != nil {
+	ctx, err := logging.ContinueOrNew(context.Background(), "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sender.Broadcast(ctx, Message{CommandID: 9, Payload: payload}); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 	payload[0] = 'X'
 	if publisher.channel != keys.broadcastChannel() {
 		t.Fatalf("channel = %q, want %q", publisher.channel, keys.broadcastChannel())
 	}
-	var request gatelink.GateRequest
-	if err := proto.Unmarshal(publisher.payload, &request); err != nil {
+	var envelope RedisBroadcastEnvelope
+	if err := proto.Unmarshal(publisher.payload, &envelope); err != nil {
 		t.Fatalf("unmarshal command: %v", err)
 	}
-	if request.GetCommandId() != 9 || string(request.GetPayload()) != "opaque-command" {
-		t.Fatalf("published command = id:%d payload:%q", request.GetCommandId(), request.GetPayload())
+	if envelope.GetCommand() == nil || envelope.GetCommand().GetCommandId() != 9 || string(envelope.GetCommand().GetPayload()) != "opaque-command" {
+		t.Fatalf("published command = %#v", envelope.GetCommand())
+	}
+	if !strings.HasPrefix(envelope.GetTraceparent(), "00-4bf92f3577b34da6a3ce929d0e0e4736-") {
+		t.Fatalf("published traceparent = %q", envelope.GetTraceparent())
 	}
 	publisher.err = errors.New("redis down")
 	if _, err := sender.Broadcast(context.Background(), Message{CommandID: 9}); !errors.Is(err, ErrRouteStoreUnavailable) {
@@ -89,7 +101,7 @@ func TestRedisBroadcastSubscriberContractDispatchesOpaqueCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	subscriber := &RedisBroadcastSubscriber{commandDispatcher: commandDispatcher}
-	encoded, err := proto.Marshal(&gatelink.GateRequest{CommandId: 10, Payload: []byte("payload")})
+	encoded, err := marshalBroadcastCommand(10, []byte("payload"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,6 +112,9 @@ func TestRedisBroadcastSubscriberContractDispatchesOpaqueCommand(t *testing.T) {
 	defer receiver.mu.Unlock()
 	if receiver.remoteCommandID != 10 || string(receiver.remotePayload) != "payload" {
 		t.Fatalf("local command = id:%d payload:%q", receiver.remoteCommandID, receiver.remotePayload)
+	}
+	if receiver.traceID == "" {
+		t.Fatal("subscriber dispatch did not establish a trace context")
 	}
 }
 
@@ -115,11 +130,11 @@ func TestRedisBroadcastSubscriberContinuesAfterUnregisteredCommand(t *testing.T)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	invalid, err := proto.Marshal(&gatelink.GateRequest{CommandId: 10})
+	invalid, err := marshalBroadcastCommand(10, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	valid, err := proto.Marshal(&gatelink.GateRequest{CommandId: 11, Payload: []byte("valid")})
+	valid, err := marshalBroadcastCommand(11, []byte("valid"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +226,7 @@ func TestRedisBroadcastSubscriberContractContainsHandlerPanic(t *testing.T) {
 		t.Fatal(err)
 	}
 	subscriber := &RedisBroadcastSubscriber{commandDispatcher: commandDispatcher}
-	encoded, err := proto.Marshal(&gatelink.GateRequest{CommandId: 10})
+	encoded, err := marshalBroadcastCommand(10, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +258,7 @@ func TestRedisBroadcastContractRejectsPayloadAboveProtocolLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	subscriber := &RedisBroadcastSubscriber{commandDispatcher: commandDispatcher}
-	encoded, err := proto.Marshal(&gatelink.GateRequest{CommandId: 1, Payload: make([]byte, DefaultMaxPayloadBytes+1)})
+	encoded, err := marshalBroadcastCommand(1, make([]byte, DefaultMaxPayloadBytes+1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +282,7 @@ func TestRedisBroadcastSubscriberContractReconnectsAndHonorsStopDeadline(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded, err := proto.Marshal(&gatelink.GateRequest{CommandId: 10})
+	encoded, err := marshalBroadcastCommand(10, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

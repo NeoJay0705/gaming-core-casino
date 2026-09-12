@@ -1,10 +1,13 @@
 package gateproduct
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 )
 
 func TestSessionRegistryContractRejectsInvalidOperations(t *testing.T) {
@@ -38,10 +41,10 @@ func TestSessionRegistryContractRejectsInvalidOperations(t *testing.T) {
 		t.Fatalf("leave missing login error = %v", err)
 	}
 
-	if delivered, err := registry.BroadcastRoom("", nil); delivered != 0 || !errors.Is(err, ErrRoomIDInvalid) {
+	if delivered, err := registry.BroadcastRoom(context.Background(), "", nil); delivered != 0 || !errors.Is(err, ErrRoomIDInvalid) {
 		t.Fatalf("empty room broadcast = %d, %v", delivered, err)
 	}
-	if delivered, err := registry.BroadcastRoom("missing", nil); delivered != 0 || err != nil {
+	if delivered, err := registry.BroadcastRoom(context.Background(), "missing", nil); delivered != 0 || err != nil {
 		t.Fatalf("missing room broadcast = %d, %v", delivered, err)
 	}
 	if kicked, err := registry.KickRoom("missing"); kicked != 0 || err != nil {
@@ -160,7 +163,7 @@ func TestSessionRegistryContractReplacementSurvivesStaleDisconnectAndCloseFailur
 	if len(oldSession.Sent()) != 0 || len(replacement.Sent()) != 1 {
 		t.Fatalf("replacement delivery = old:%d new:%d, want 0/1", len(oldSession.Sent()), len(replacement.Sent()))
 	}
-	if delivered, err := registry.BroadcastRoom("room-a", nil); delivered != 0 || err != nil {
+	if delivered, err := registry.BroadcastRoom(context.Background(), "room-a", nil); delivered != 0 || err != nil {
 		t.Fatalf("old room after replacement = delivered:%d error:%v, want 0/nil", delivered, err)
 	}
 	registry.Remove(replacement)
@@ -212,7 +215,7 @@ func TestSessionRegistryContractRoomMembershipAndBroadcast(t *testing.T) {
 	if err := registry.EnterRoom("alice", "room-a"); err != nil {
 		t.Fatalf("idempotent enter room: %v", err)
 	}
-	if delivered, err := registry.BroadcastRoom("room-a", []byte("a-1")); err != nil || delivered != 2 {
+	if delivered, err := registry.BroadcastRoom(context.Background(), "room-a", []byte("a-1")); err != nil || delivered != 2 {
 		t.Fatalf("broadcast room-a = delivered:%d error:%v, want 2/nil", delivered, err)
 	}
 	if len(alice.Sent()) != 1 || len(bob.Sent()) != 1 || len(carol.Sent()) != 0 {
@@ -221,20 +224,50 @@ func TestSessionRegistryContractRoomMembershipAndBroadcast(t *testing.T) {
 	if err := registry.EnterRoom("alice", "room-b"); err != nil {
 		t.Fatalf("move alice to room-b: %v", err)
 	}
-	if delivered, err := registry.BroadcastRoom("room-a", []byte("a-2")); err != nil || delivered != 1 {
+	if delivered, err := registry.BroadcastRoom(context.Background(), "room-a", []byte("a-2")); err != nil || delivered != 1 {
 		t.Fatalf("second room-a broadcast = delivered:%d error:%v, want 1/nil", delivered, err)
 	}
-	if delivered, err := registry.BroadcastRoom("room-b", []byte("b-1")); err != nil || delivered != 2 {
+	if delivered, err := registry.BroadcastRoom(context.Background(), "room-b", []byte("b-1")); err != nil || delivered != 2 {
 		t.Fatalf("room-b broadcast = delivered:%d error:%v, want 2/nil", delivered, err)
 	}
 	if err := registry.LeaveRoom("bob"); err != nil {
 		t.Fatalf("leave room: %v", err)
 	}
-	if delivered, err := registry.BroadcastRoom("room-a", []byte("a-3")); err != nil || delivered != 0 {
+	if delivered, err := registry.BroadcastRoom(context.Background(), "room-a", []byte("a-3")); err != nil || delivered != 0 {
 		t.Fatalf("broadcast after leave = delivered:%d error:%v, want 0/nil", delivered, err)
 	}
 	if err := registry.SendToLoginName("bob", []byte("targeted")); err != nil {
 		t.Fatalf("target bob after leave: %v", err)
+	}
+}
+
+func TestSessionRegistryBroadcastCarriesDetachedTraceContext(t *testing.T) {
+	registry := NewSessionRegistry()
+	session := &registrySession{id: "connection-alice"}
+	if err := registry.Register(session, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.EnterRoom("alice", "room-a"); err != nil {
+		t.Fatal(err)
+	}
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	traced, err := logging.ContinueOrNew(parent, "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTrace, wantSpan, _ := logging.IDsFromContext(traced)
+	if _, err := registry.BroadcastRoom(traced, "room-a", []byte("broadcast")); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	gotContext := session.LastContext()
+	if gotContext == nil || gotContext.Err() != nil {
+		t.Fatalf("broadcast context = %v, want detached context", gotContext)
+	}
+	gotTrace, gotSpan, ok := logging.IDsFromContext(gotContext)
+	if !ok || gotTrace != wantTrace || gotSpan != wantSpan {
+		t.Fatalf("broadcast trace = %q/%q/%t, want %q/%q", gotTrace, gotSpan, ok, wantTrace, wantSpan)
 	}
 }
 
@@ -251,7 +284,7 @@ func TestSessionRegistryContractDisconnectAndBroadcastFailureCleanUpRoomMembersh
 			t.Fatalf("enter room %s: %v", loginName, err)
 		}
 	}
-	if delivered, err := registry.BroadcastRoom("room-a", []byte("broadcast")); delivered != 1 || !errors.Is(err, sendErr) {
+	if delivered, err := registry.BroadcastRoom(context.Background(), "room-a", []byte("broadcast")); delivered != 1 || !errors.Is(err, sendErr) {
 		t.Fatalf("broadcast error = delivered:%d error:%v, want 1/send error", delivered, err)
 	} else if !strings.Contains(err.Error(), `room "room-a"`) || !strings.Contains(err.Error(), `login "alice"`) {
 		t.Fatalf("broadcast error lacks room/login context: %v", err)
@@ -260,11 +293,11 @@ func TestSessionRegistryContractDisconnectAndBroadcastFailureCleanUpRoomMembersh
 		t.Fatalf("bob did not receive broadcast after alice failure")
 	}
 	registry.Remove(bob)
-	if delivered, err := registry.BroadcastRoom("room-a", []byte("after-disconnect")); delivered != 0 || !errors.Is(err, sendErr) {
+	if delivered, err := registry.BroadcastRoom(context.Background(), "room-a", []byte("after-disconnect")); delivered != 0 || !errors.Is(err, sendErr) {
 		t.Fatalf("broadcast after bob disconnect = delivered:%d error:%v, want 0/send error", delivered, err)
 	}
 	registry.Remove(alice)
-	if delivered, err := registry.BroadcastRoom("room-a", nil); delivered != 0 || err != nil {
+	if delivered, err := registry.BroadcastRoom(context.Background(), "room-a", nil); delivered != 0 || err != nil {
 		t.Fatalf("broadcast after room cleanup = delivered:%d error:%v, want 0/nil", delivered, err)
 	}
 }
@@ -295,7 +328,7 @@ func TestSessionRegistryContractKickLoginAndRoom(t *testing.T) {
 	if alice.CloseCount() != 1 {
 		t.Fatalf("alice close count = %d, want 1", alice.CloseCount())
 	}
-	if delivered, err := registry.BroadcastRoom("room-a", nil); delivered != 1 || err != nil {
+	if delivered, err := registry.BroadcastRoom(context.Background(), "room-a", nil); delivered != 1 || err != nil {
 		t.Fatalf("room-a after alice kick = delivered:%d error:%v, want 1/nil", delivered, err)
 	}
 	if err := registry.SendToLoginName("alice", nil); !errors.Is(err, ErrLoginSessionNotFound) {
@@ -332,6 +365,7 @@ type registrySession struct {
 
 	mu         sync.Mutex
 	sent       [][]byte
+	lastCtx    context.Context
 	closeCount int
 	sendErr    error
 	closeErr   error
@@ -339,14 +373,23 @@ type registrySession struct {
 
 func (s *registrySession) ID() WebSocketConnectionID { return s.id }
 
-func (s *registrySession) SendBinary(data []byte) error {
+func (s *registrySession) SendBinary(ctx context.Context, data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// 保留 queue boundary 收到的 context，驗證 trace 與取消語意。
+	// 實際 production session 會在此處將 message 放入 writer queue。
+	s.lastCtx = ctx
 	if s.sendErr != nil {
 		return s.sendErr
 	}
 	s.sent = append(s.sent, append([]byte(nil), data...))
 	return nil
+}
+
+func (s *registrySession) LastContext() context.Context {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastCtx
 }
 
 func (s *registrySession) Close() error {

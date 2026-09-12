@@ -7,7 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -18,6 +18,7 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 	"github.com/gorilla/websocket"
 	"go.uber.org/dig"
 )
@@ -57,7 +58,7 @@ type WebSocketPacket struct {
 // one complete application packet for the connection's sole writer goroutine.
 type WebSocketSession interface {
 	ID() WebSocketConnectionID
-	SendBinary([]byte) error
+	SendBinary(context.Context, []byte) error
 }
 
 // ClosableWebSocketSession is a WebSocket session whose lifecycle can be
@@ -76,6 +77,7 @@ type webSocketServerInputs struct {
 	Sessions   *SessionRegistry
 	Identity   gateIdentity
 	Metrics    *gateMetrics
+	Logs       *logging.Factory
 }
 
 // WebSocketServer owns the Gate player-facing WebSocket listener.
@@ -88,6 +90,7 @@ type WebSocketServer struct {
 	registry   *SessionRegistry
 	gateID     string
 	metrics    *gateMetrics
+	logger     *logging.Logger
 
 	mu       sync.Mutex
 	server   *http.Server
@@ -105,6 +108,13 @@ func newGateWebSocketServer(inputs webSocketServerInputs) (*WebSocketServer, err
 		registry:   inputs.Sessions,
 		gateID:     string(inputs.Identity.GateID),
 		metrics:    inputs.Metrics,
+	}
+	if inputs.Logs != nil {
+		logger, err := inputs.Logs.Component("websocket")
+		if err != nil {
+			return nil, err
+		}
+		server.logger = logger
 	}
 	if server.dispatcher == nil {
 		return nil, errors.New("gate websocket: dispatcher is nil")
@@ -282,7 +292,7 @@ func (s *WebSocketServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	conn.SetReadLimit(maxWebSocketPacketBytes)
-	session := newWebSocketConnection(conn, s.cfg.WriteChanSize, time.Duration(s.cfg.WriteTimeoutMs)*time.Millisecond, s.metrics)
+	session := newWebSocketConnectionWithLogger(conn, s.cfg.WriteChanSize, time.Duration(s.cfg.WriteTimeoutMs)*time.Millisecond, s.metrics, s.logger)
 
 	s.mu.Lock()
 	if s.stopping || s.server == nil {
@@ -325,6 +335,15 @@ func (s *WebSocketServer) serveSession(session *webSocketConnection) {
 // Locally registered commands stay in Gate; every other command is forwarded
 // to Game through the direct Gate-to-Game channel.
 func (s *WebSocketServer) dispatchPacket(ctx context.Context, session *webSocketConnection, packet WebSocketPacket) (ok bool) {
+	traced, traceErr := logging.NewRoot(ctx)
+	if traceErr != nil {
+		if s != nil && s.logger != nil {
+			s.logger.Error(ctx, "dispatch", "create WebSocket trace failed", traceErr,
+				slog.String("session", string(session.ID())))
+		}
+		return false
+	}
+	ctx = traced
 	start := time.Now()
 	route, command := gateCommandRouteAndLabel(s.dispatcher, packet.CommandID)
 	result := "error"
@@ -338,7 +357,11 @@ func (s *WebSocketServer) dispatchPacket(ctx context.Context, session *webSocket
 		}
 		if recovered := recover(); recovered != nil {
 			ok = false
-			log.Printf("[gate websocket] dispatcher panicked: session=%s command=%d panic=%v", session.ID(), packet.CommandID, recovered)
+			if s.logger != nil {
+				s.logger.Error(ctx, "dispatch", "WebSocket dispatcher panicked", fmt.Errorf("%v", recovered),
+					slog.String("session", string(session.ID())),
+					slog.Uint64("command_id", uint64(packet.CommandID)))
+			}
 			_ = session.closeWithReason(closeReasonPanic)
 		}
 	}()
@@ -355,7 +378,11 @@ func (s *WebSocketServer) dispatchPacket(ctx context.Context, session *webSocket
 	})
 	handled, err := s.dispatcher.Dispatch(ctx, WebSocketChannel, dispatcher.CommandID(packet.CommandID), packet.Payload)
 	if err != nil {
-		log.Printf("[gate websocket] dispatcher failed: session=%s command=%d err=%v", session.ID(), packet.CommandID, err)
+		if s.logger != nil {
+			s.logger.Error(ctx, "dispatch", "WebSocket dispatcher failed", err,
+				slog.String("session", string(session.ID())),
+				slog.Uint64("command_id", uint64(packet.CommandID)))
+		}
 		if errors.Is(err, ErrLoginRequired) {
 			_ = session.closeWithReason(closeReasonLoginRequired)
 		} else if errors.Is(err, ErrRoomRequired) {
@@ -393,7 +420,11 @@ func (s *WebSocketServer) dispatchPacket(ctx context.Context, session *webSocket
 			s.metrics.gameGRPCInFlight.Dec()
 			s.metrics.observeGameGRPC(boundedGRPCCode(err), time.Since(grpcStart))
 		}
-		log.Printf("[gate websocket] forward to Game failed: session=%s command=%d err=%v", session.ID(), packet.CommandID, err)
+		if s.logger != nil {
+			s.logger.Error(ctx, "forward_game", "forward to Game failed", err,
+				slog.String("session", string(session.ID())),
+				slog.Uint64("command_id", uint64(packet.CommandID)))
+		}
 		_ = session.closeWithReason(closeReasonForwardError)
 		return false
 	}
@@ -409,7 +440,11 @@ func (s *WebSocketServer) dispatchPacket(ctx context.Context, session *webSocket
 				if s.metrics != nil {
 					s.metrics.observeServerSendRequest(string(serverSendTargetConnection), "ignored")
 				}
-				log.Printf("[gate websocket] forwarded reply identity mismatch: session=%s command=%d", session.ID(), reply.CommandID)
+				if s.logger != nil {
+					s.logger.Warn(ctx, "forward_game", "forwarded reply identity mismatch",
+						slog.String("session", string(session.ID())),
+						slog.Uint64("command_id", uint64(reply.CommandID)))
+				}
 				_ = session.closeWithReason(closeReasonForwardError)
 				return false
 			}
@@ -419,11 +454,16 @@ func (s *WebSocketServer) dispatchPacket(ctx context.Context, session *webSocket
 			source:     outboundSourceServerSend,
 			receivedAt: receivedAt,
 			target:     serverSendTargetConnection,
+			ctx:        ctx,
 		}); err != nil {
 			if s.metrics != nil {
 				s.metrics.observeServerSendRequest(string(serverSendTargetConnection), "error")
 			}
-			log.Printf("[gate websocket] enqueue forwarded reply failed: session=%s command=%d err=%v", session.ID(), reply.CommandID, err)
+			if s.logger != nil {
+				s.logger.Error(ctx, "enqueue_reply", "enqueue forwarded reply failed", err,
+					slog.String("session", string(session.ID())),
+					slog.Uint64("command_id", uint64(reply.CommandID)))
+			}
 			_ = session.closeWithReason(closeReasonForwardError)
 			return false
 		}
@@ -483,6 +523,7 @@ type outboundMessage struct {
 	source     outboundSource
 	receivedAt time.Time
 	target     serverSendTarget
+	ctx        context.Context
 }
 
 type outboundSession interface {
@@ -496,7 +537,7 @@ func sendOutbound(session WebSocketSession, message outboundMessage) error {
 	if sender, ok := session.(outboundSession); ok {
 		return sender.sendOutbound(message)
 	}
-	return session.SendBinary(message.data)
+	return session.SendBinary(logging.Detach(message.ctx), message.data)
 }
 
 type webSocketConnection struct {
@@ -510,6 +551,7 @@ type webSocketConnection struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	metrics      *gateMetrics
+	logger       *logging.Logger
 
 	stateMu     sync.Mutex
 	writeMu     sync.Mutex
@@ -524,6 +566,10 @@ func newWebSocketConnection(conn *websocket.Conn, queueSize int, writeTimeout ti
 	if len(metrics) != 0 {
 		observed = metrics[0]
 	}
+	return newWebSocketConnectionWithLogger(conn, queueSize, writeTimeout, observed, nil)
+}
+
+func newWebSocketConnectionWithLogger(conn *websocket.Conn, queueSize int, writeTimeout time.Duration, metrics *gateMetrics, logger *logging.Logger) *webSocketConnection {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &webSocketConnection{
 		id:           newWebSocketConnectionID(),
@@ -533,7 +579,8 @@ func newWebSocketConnection(conn *websocket.Conn, queueSize int, writeTimeout ti
 		writeTimeout: writeTimeout,
 		ctx:          ctx,
 		cancel:       cancel,
-		metrics:      observed,
+		metrics:      metrics,
+		logger:       logger,
 	}
 }
 
@@ -541,12 +588,13 @@ func (s *webSocketConnection) ID() WebSocketConnectionID { return s.id }
 
 func (s *webSocketConnection) Context() context.Context { return s.ctx }
 
-func (s *webSocketConnection) SendBinary(data []byte) error {
-	return s.sendOutbound(outboundMessage{data: data, source: outboundSourceHandler, receivedAt: time.Now()})
+func (s *webSocketConnection) SendBinary(ctx context.Context, data []byte) error {
+	return s.sendOutbound(outboundMessage{data: data, source: outboundSourceHandler, receivedAt: time.Now(), ctx: ctx})
 }
 
 func (s *webSocketConnection) sendOutbound(message outboundMessage) error {
 	message.data = append([]byte(nil), message.data...)
+	message.ctx = logging.Detach(message.ctx)
 	if message.receivedAt.IsZero() {
 		message.receivedAt = time.Now()
 	}
@@ -709,6 +757,11 @@ func (s *webSocketConnection) writeLoop() {
 				}
 			}
 			if err != nil {
+				if s.logger != nil {
+					s.logger.Error(message.ctx, "write", "WebSocket write failed", err,
+						slog.String("session", string(s.ID())),
+						slog.String("source", string(message.source)))
+				}
 				_ = s.closeWithReason(closeReasonWriteError)
 				return
 			}
@@ -749,7 +802,10 @@ func (s *webSocketConnection) readLoop(ctx context.Context, onPacket func(WebSoc
 		messageType, data, err := s.conn.ReadMessage()
 		if err != nil {
 			if s.currentCloseReason() == "" {
-				log.Printf("[gate websocket] read failed: session=%s err=%v", s.ID(), err)
+				if s.logger != nil {
+					s.logger.Error(ctx, "read", "WebSocket read failed", err,
+						slog.String("session", string(s.ID())))
+				}
 			}
 			if reason := s.currentCloseReason(); reason != "" {
 				return reason
@@ -770,7 +826,10 @@ func (s *webSocketConnection) readLoop(ctx context.Context, onPacket func(WebSoc
 		}
 		packets, err := s.stream.feed(data)
 		if err != nil {
-			log.Printf("[gate websocket] invalid frame: session=%s err=%v", s.ID(), err)
+			if s.logger != nil {
+				s.logger.Error(ctx, "read", "invalid WebSocket frame", err,
+					slog.String("session", string(s.ID())))
+			}
 			return closeReasonInvalidFrame
 		}
 		for _, packet := range packets {

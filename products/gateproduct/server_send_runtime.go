@@ -12,6 +12,7 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/grpcserver"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/infra/redis"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend/redisstore"
 	"go.uber.org/dig"
@@ -91,8 +92,12 @@ func newGatePresenceRegistry(identity gateIdentity, cfg serversend.PresenceConfi
 	return serversend.NewGatePresenceRegistry(presence, identity.GateID)
 }
 
-func newGateSessionRegistry(presence *serversend.GatePresenceRegistry, cfg serversend.PresenceConfig) (*SessionRegistry, error) {
-	return newSessionRegistry(presence, cfg.LeaseTTL)
+func newGateSessionRegistry(presence *serversend.GatePresenceRegistry, cfg serversend.PresenceConfig, factory *logging.Factory) (*SessionRegistry, error) {
+	logger, err := factory.Component("session")
+	if err != nil {
+		return nil, err
+	}
+	return newSessionRegistryWithLogger(presence, cfg.LeaseTTL, logger)
 }
 
 func newServerSendKeyspace(prefix redis.KeyPrefix) (serversend.Keyspace, error) {
@@ -148,12 +153,13 @@ type gateGRPCEndpointRegistration struct {
 	keys   serversend.Keyspace
 	gateID serversend.GateID
 	config serversend.EndpointRegistrarConfig
+	logger *logging.Logger
 
 	mu        sync.Mutex
 	registrar *serversend.EndpointRegistrar
 }
 
-func newGateGRPCEndpointRegistration(server *grpcserver.Server, identity gateIdentity, cfg serversend.EndpointRegistrarConfig, redisClient *redis.Client, keys serversend.Keyspace) (*gateGRPCEndpointRegistration, error) {
+func newGateGRPCEndpointRegistration(server *grpcserver.Server, identity gateIdentity, cfg serversend.EndpointRegistrarConfig, redisClient *redis.Client, keys serversend.Keyspace, factory *logging.Factory) (*gateGRPCEndpointRegistration, error) {
 	if server == nil {
 		return nil, fmt.Errorf("gate gRPC endpoint: server is required")
 	}
@@ -166,7 +172,11 @@ func newGateGRPCEndpointRegistration(server *grpcserver.Server, identity gateIde
 	if keys.Prefix() == "" {
 		return nil, fmt.Errorf("gate gRPC endpoint: keyspace is required")
 	}
-	return &gateGRPCEndpointRegistration{server: server, store: redisstore.New(redisClient), keys: keys, gateID: identity.GateID, config: cfg}, nil
+	logger, err := factory.Component("grpc.endpoint")
+	if err != nil {
+		return nil, err
+	}
+	return &gateGRPCEndpointRegistration{server: server, store: redisstore.New(redisClient), keys: keys, gateID: identity.GateID, config: cfg, logger: logger}, nil
 }
 
 func (r *gateGRPCEndpointRegistration) Start(ctx context.Context) error {
@@ -185,7 +195,7 @@ func (r *gateGRPCEndpointRegistration) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	registrar, err := serversend.NewEndpointRegistrar(r.store, r.keys, serversend.GateEndpoint{GateID: r.gateID, Address: advertiseAddress}, r.config)
+	registrar, err := serversend.NewEndpointRegistrar(r.store, r.keys, serversend.GateEndpoint{GateID: r.gateID, Address: advertiseAddress}, r.config, r.logger)
 	if err != nil {
 		return err
 	}
@@ -218,19 +228,32 @@ type gateServerSendBroadcastRuntime struct {
 	dispatcher *dispatcher.Dispatcher
 	store      *redisstore.Store
 	keys       serversend.Keyspace
+	logger     *logging.Logger
 
 	mu         sync.Mutex
 	subscriber *serversend.RedisBroadcastSubscriber
 }
 
 func newGateServerSendBroadcastRuntime(cfg gateServerSendBroadcastConfig, commandDispatcher *dispatcher.Dispatcher, redisClient *redis.Client, keys serversend.Keyspace) (*gateServerSendBroadcastRuntime, error) {
+	return newGateServerSendBroadcastRuntimeWithLogger(cfg, commandDispatcher, redisClient, keys, nil)
+}
+
+func newGateServerSendBroadcastRuntimeWithLogger(cfg gateServerSendBroadcastConfig, commandDispatcher *dispatcher.Dispatcher, redisClient *redis.Client, keys serversend.Keyspace, factory *logging.Factory) (*gateServerSendBroadcastRuntime, error) {
 	if cfg.Primary != "redis" {
 		return nil, fmt.Errorf("gate broadcast: runtime requires redis primary")
 	}
 	if commandDispatcher == nil || redisClient == nil || keys.Prefix() == "" {
 		return nil, fmt.Errorf("gate broadcast: dependencies are required")
 	}
-	return &gateServerSendBroadcastRuntime{dispatcher: commandDispatcher, store: redisstore.New(redisClient), keys: keys}, nil
+	var logger *logging.Logger
+	if factory != nil {
+		var err error
+		logger, err = factory.Component("redis.broadcast")
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &gateServerSendBroadcastRuntime{dispatcher: commandDispatcher, store: redisstore.New(redisClient), keys: keys, logger: logger}, nil
 }
 
 func (r *gateServerSendBroadcastRuntime) Start(ctx context.Context) error {
@@ -241,7 +264,7 @@ func (r *gateServerSendBroadcastRuntime) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("gate broadcast: get Redis client: %w", err)
 	}
-	subscriber, err := serversend.NewRedisBroadcastSubscriber(rawRedis, r.keys, r.dispatcher)
+	subscriber, err := serversend.NewRedisBroadcastSubscriber(rawRedis, r.keys, r.dispatcher, r.logger)
 	if err != nil {
 		return err
 	}

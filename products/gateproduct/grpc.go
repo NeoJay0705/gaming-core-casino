@@ -9,6 +9,7 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/grpcserver"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 	"google.golang.org/grpc"
 )
@@ -45,8 +46,12 @@ func newGateGameGRPCClient(cfg gatelink.ClientConfig) (*gatelink.Client, error) 
 
 // newGateGRPCServer creates the single product-level Gate listener. Services
 // are registered during composition and do not own a listener themselves.
-func newGateGRPCServer(cfg grpcserver.Config) (*grpcserver.Server, error) {
-	return grpcserver.New(cfg)
+func newGateGRPCServer(cfg grpcserver.Config, factory *logging.Factory) (*grpcserver.Server, error) {
+	logger, err := factory.Component("grpc.server")
+	if err != nil {
+		return nil, err
+	}
+	return grpcserver.NewWithLogger(cfg, logger)
 }
 
 func newGateDeliveryService(commandDispatcher *dispatcher.Dispatcher) (*serversend.GateDeliveryService, error) {

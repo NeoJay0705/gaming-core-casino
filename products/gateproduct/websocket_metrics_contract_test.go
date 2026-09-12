@@ -1,13 +1,37 @@
 package gateproduct
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
 
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
+
+func TestWebSocketSendBinaryCarriesDetachedTraceContext(t *testing.T) {
+	connection := newWebSocketConnection(nil, 1, time.Second)
+	parent, cancel := context.WithCancel(context.Background())
+	traced, err := logging.ContinueOrNew(parent, "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTrace, wantSpan, _ := logging.IDsFromContext(traced)
+	if err := connection.SendBinary(traced, []byte("response")); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	message := <-connection.writeCh
+	if message.ctx == nil || message.ctx.Err() != nil {
+		t.Fatalf("queued context = %v, want detached context", message.ctx)
+	}
+	gotTrace, gotSpan, ok := logging.IDsFromContext(message.ctx)
+	if !ok || gotTrace != wantTrace || gotSpan != wantSpan {
+		t.Fatalf("queued trace = %q/%q/%t, want %q/%q", gotTrace, gotSpan, ok, wantTrace, wantSpan)
+	}
+}
 
 func TestWebSocketQueueMetricsContract(t *testing.T) {
 	registry := prometheus.NewRegistry()
@@ -17,7 +41,7 @@ func TestWebSocketQueueMetricsContract(t *testing.T) {
 	}
 	connection := newWebSocketConnection(nil, 1, time.Second, metrics)
 	connection.markAccepted()
-	if err := connection.SendBinary([]byte("first")); err != nil {
+	if err := connection.SendBinary(context.Background(), []byte("first")); err != nil {
 		t.Fatalf("first SendBinary() error = %v", err)
 	}
 	if err := connection.sendOutbound(outboundMessage{

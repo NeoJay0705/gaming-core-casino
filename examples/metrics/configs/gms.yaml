@@ -1,3 +1,7 @@
+logging:
+  # 非必要：debug、info、warn、error；預設 info。
+  level: info
+
 observability:
   listen_addr: "127.0.0.1:21081"
   pprof_listen_addr: ""

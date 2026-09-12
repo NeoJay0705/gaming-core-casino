@@ -1,6 +1,7 @@
 package gateproduct
 
 import (
+	"context"
 	"testing"
 )
 
@@ -29,6 +30,6 @@ func TestSessionRegistryStateContract(t *testing.T) {
 
 type stateTestSession struct{ id WebSocketConnectionID }
 
-func (s *stateTestSession) ID() WebSocketConnectionID { return s.id }
-func (*stateTestSession) SendBinary([]byte) error     { return nil }
-func (*stateTestSession) Close() error                { return nil }
+func (s *stateTestSession) ID() WebSocketConnectionID              { return s.id }
+func (*stateTestSession) SendBinary(context.Context, []byte) error { return nil }
+func (*stateTestSession) Close() error                             { return nil }

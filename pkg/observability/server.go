@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -39,9 +40,14 @@ type httpServer struct {
 	started  bool
 	stopped  bool
 	ready    atomic.Bool
+	logger   *logging.Logger
 }
 
 func newHTTPServer(cfg Config, owner *registryOwner) (*httpServer, error) {
+	return newHTTPServerWithLogger(cfg, owner, nil)
+}
+
+func newHTTPServerWithLogger(cfg Config, owner *registryOwner, factory *logging.Factory) (*httpServer, error) {
 	if err := validateConfig(&cfg); err != nil {
 		return nil, err
 	}
@@ -50,6 +56,13 @@ func newHTTPServer(cfg Config, owner *registryOwner) (*httpServer, error) {
 	}
 
 	result := &httpServer{cfg: cfg}
+	if factory != nil {
+		logger, err := factory.Component("observability.http")
+		if err != nil {
+			return nil, err
+		}
+		result.logger = logger
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", result.handleHealth)
 	mux.HandleFunc("GET /ready", result.handleReadiness)
@@ -114,7 +127,10 @@ func (s *httpServer) Start(ctx context.Context) error {
 	server := s.server
 	go func() {
 		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("[observability] HTTP server stopped unexpectedly: %v", err)
+			if s.logger != nil {
+				s.logger.Error(context.Background(), "serve", "observability HTTP server stopped unexpectedly", err,
+					slog.String("addr", listener.Addr().String()))
+			}
 		}
 	}()
 	return nil

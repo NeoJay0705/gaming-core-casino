@@ -201,8 +201,8 @@ func startContractGateReceiver(t *testing.T, gateID serversend.GateID) (*Session
 		t.Fatal(err)
 	}
 	for _, commandID := range []uint32{102, 103, 104, 105} {
-		if err := commandDispatcher.Register(serversend.RemoteCommandChannel, dispatcher.CommandID(commandID), func(_ context.Context, payload []byte) error {
-			_, err := sessions.BroadcastRoom("room-a", EncodeWebSocketPacket(WebSocketPacket{CommandID: commandID, Payload: append([]byte(nil), payload...)}))
+		if err := commandDispatcher.Register(serversend.RemoteCommandChannel, dispatcher.CommandID(commandID), func(ctx context.Context, payload []byte) error {
+			_, err := sessions.BroadcastRoom(ctx, "room-a", EncodeWebSocketPacket(WebSocketPacket{CommandID: commandID, Payload: append([]byte(nil), payload...)}))
 			return err
 		}); err != nil {
 			t.Fatal(err)
