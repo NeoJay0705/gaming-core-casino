@@ -113,10 +113,10 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 		if err := r.Provide(newGateSessionRegistry); err != nil {
 			return err
 		}
-		if err := r.Provide(newGateDeliveryReceiver); err != nil {
+		if err := r.Provide(newGateDeliveryService); err != nil {
 			return err
 		}
-		if err := r.Provide(newGateDeliveryService); err != nil {
+		if err := r.Configure(registerGatePlayerDeliveryCommand); err != nil {
 			return err
 		}
 		if err := r.ProvideManaged("gate-grpc-server", framework.PhaseIngress, newGateGRPCServer); err != nil {

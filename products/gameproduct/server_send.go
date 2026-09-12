@@ -102,11 +102,11 @@ func newGameGateDirectory(redisClient *redis.Client, keys serversend.Keyspace) (
 	return serversend.NewRedisGateDirectory(redisstore.New(redisClient), keys)
 }
 
-func newGameFanoutSender(cfg gameFanoutConfig, transport *serversend.GRPCTransport) (*serversend.FanoutSender, error) {
-	directory, err := serversend.NewDNSGateDirectory(cfg.Target, nil)
-	if err != nil {
-		return nil, err
-	}
+func newGameGateFanoutDirectory(cfg gameFanoutConfig) (*serversend.DNSGateDirectory, error) {
+	return serversend.NewDNSGateDirectory(cfg.Target, nil)
+}
+
+func newGameFanoutSender(cfg gameFanoutConfig, directory *serversend.DNSGateDirectory, transport *serversend.GRPCTransport) (*serversend.FanoutSender, error) {
 	return serversend.NewFanoutSender(directory, transport, serversend.FanoutConfig{MaxEndpoints: cfg.MaxEndpoints})
 }
 
@@ -123,12 +123,19 @@ type gamePlayerSenderInputs struct {
 
 	Presence  *serversend.RedisPresenceResolver
 	Directory *serversend.RedisGateDirectory
+	Fallback  *serversend.DNSGateDirectory
+	Config    gameFanoutConfig
 	Transport *serversend.GRPCTransport
-	Fallback  *serversend.FanoutSender `optional:"true"`
 }
 
 func newGamePlayerSender(inputs gamePlayerSenderInputs) (serversend.PlayerSender, error) {
-	return serversend.NewRoutedPlayerSender(inputs.Presence, inputs.Directory, inputs.Transport, inputs.Fallback)
+	return serversend.NewBatchPlayerSender(
+		inputs.Presence,
+		inputs.Directory,
+		inputs.Fallback,
+		inputs.Transport,
+		serversend.FanoutConfig{MaxEndpoints: inputs.Config.MaxEndpoints},
+	)
 }
 
 func newGameRedisBroadcastSender(redisClient *redis.Client, keys serversend.Keyspace) (*serversend.RedisBroadcastSender, error) {

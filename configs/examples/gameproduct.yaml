@@ -20,5 +20,5 @@ grpc:
 
 server_send:
   broadcast:
-    # 非必要：redis 或 grpc；預設 redis，Redis 失敗時固定 fallback gRPC。
+    # 非必要：redis 或 grpc；預設 redis；Redis publish／subscriber 失敗時 fallback gRPC。
     primary: redis

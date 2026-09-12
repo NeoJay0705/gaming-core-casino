@@ -49,8 +49,8 @@ func newGateGRPCServer(cfg grpcserver.Config) (*grpcserver.Server, error) {
 	return grpcserver.New(cfg)
 }
 
-func newGateDeliveryService(receiver *gateDeliveryReceiver, commandDispatcher *dispatcher.Dispatcher) (*serversend.GateDeliveryService, error) {
-	return serversend.NewGateDeliveryService(receiver, commandDispatcher)
+func newGateDeliveryService(commandDispatcher *dispatcher.Dispatcher) (*serversend.GateDeliveryService, error) {
+	return serversend.NewGateDeliveryService(commandDispatcher)
 }
 
 func registerGateDeliveryService(server *grpcserver.Server, service *serversend.GateDeliveryService) error {

@@ -19,7 +19,10 @@ func TestServerSendProtoDescriptorContractKeepsWireSchema(t *testing.T) {
 	if service == nil {
 		t.Fatal("GateDelivery service is missing")
 	}
-	for _, methodName := range []protoreflect.Name{"SendToPlayer", "Forward"} {
+	if got := service.Methods().Len(); got != 1 {
+		t.Fatalf("GateDelivery method count = %d, want 1", got)
+	}
+	for _, methodName := range []protoreflect.Name{"Forward"} {
 		if service.Methods().ByName(methodName) == nil {
 			t.Fatalf("GateDelivery method %q is missing", methodName)
 		}
@@ -30,32 +33,24 @@ func TestServerSendProtoDescriptorContractKeepsWireSchema(t *testing.T) {
 	if method := service.Methods().ByName("Forward"); method.Output().FullName() != "google.protobuf.Empty" {
 		t.Fatalf("Forward output = %q, want google.protobuf.Empty", method.Output().FullName())
 	}
-	assertDescriptorFieldNumbers(t, file.Messages().ByName("SendToPlayerRequest"), map[protoreflect.Name]protoreflect.FieldNumber{
-		"login_name": 1,
-		"command_id": 2,
-		"payload":    3,
+	assertDescriptorFieldNumbers(t, file.Messages().ByName("SendPlayersCommand"), map[protoreflect.Name]protoreflect.FieldNumber{
+		"messages": 1,
+	})
+	assertDescriptorFieldNumbers(t, file.Messages().ByName("PlayerDelivery"), map[protoreflect.Name]protoreflect.FieldNumber{
+		"login_name":        1,
+		"client_command_id": 2,
+		"client_payload":    3,
 	})
 	if file.Messages().ByName("BroadcastRoomRequest") != nil || file.Messages().ByName("RedisBroadcastEnvelope") != nil {
 		t.Fatal("room-specific broadcast messages must not be part of the transport schema")
 	}
-	assertDescriptorFieldNumbers(t, file.Messages().ByName("DeliveryResponse"), map[protoreflect.Name]protoreflect.FieldNumber{
-		"status":          1,
-		"delivered_count": 2,
-	})
-
-	statusDescriptor := file.Enums().ByName("DeliveryStatus")
-	if statusDescriptor == nil {
-		t.Fatal("DeliveryStatus enum is missing")
-	}
-	for name, want := range map[protoreflect.Name]protoreflect.EnumNumber{
-		"DELIVERY_STATUS_UNSPECIFIED": 0,
-		"DELIVERY_STATUS_DELIVERED":   1,
-		"DELIVERY_STATUS_IGNORED":     2,
-	} {
-		value := statusDescriptor.Values().ByName(name)
-		if value == nil || value.Number() != want {
-			t.Fatalf("DeliveryStatus.%s = %v, want %d", name, value, want)
+	for _, name := range []protoreflect.Name{"SendToPlayerRequest", "DeliveryResponse"} {
+		if file.Messages().ByName(name) != nil {
+			t.Fatalf("obsolete transport message %q is present", name)
 		}
+	}
+	if file.Enums().ByName("DeliveryStatus") != nil {
+		t.Fatal("obsolete DeliveryStatus enum is present")
 	}
 }
 

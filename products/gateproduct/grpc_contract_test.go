@@ -10,11 +10,13 @@ import (
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/grpcserver"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 	"github.com/alicebob/miniredis/v2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestGateProductUsesOneProductGRPCServerAndGameClient(t *testing.T) {
@@ -50,9 +52,15 @@ func TestGateProductUsesOneProductGRPCServerAndGameClient(t *testing.T) {
 		t.Fatalf("new Gate delivery client: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	response, err := serversend.NewGateDeliveryClient(conn).SendToPlayer(context.Background(), &serversend.SendToPlayerRequest{LoginName: "not-connected", CommandId: 1})
-	if err != nil || response == nil || response.GetStatus() != serversend.DeliveryStatus_DELIVERY_STATUS_IGNORED {
-		t.Fatalf("GateDelivery call = response:%#v error:%v, want ignored/nil", response, err)
+	payload, err := proto.Marshal(&serversend.SendPlayersCommand{Messages: []*serversend.PlayerDelivery{{
+		LoginName: "not-connected", ClientCommandId: 1,
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := serversend.NewGateDeliveryClient(conn).Forward(context.Background(), &gatelink.GateRequest{CommandId: serversend.PlayerDeliveryCommandID, Payload: payload})
+	if err != nil || response == nil {
+		t.Fatalf("GateDelivery Forward = response:%#v error:%v, want empty/nil", response, err)
 	}
 }
 

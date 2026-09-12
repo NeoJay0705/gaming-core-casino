@@ -11,9 +11,7 @@ import (
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -110,18 +108,6 @@ func (t *GRPCTransport) Stop(context.Context) error {
 	return errors.Join(errs...)
 }
 
-// SendToPlayer delivers to the current local session of one player at endpoint.
-func (t *GRPCTransport) SendToPlayer(ctx context.Context, endpoint GateEndpoint, message PlayerMessage) (DeliveryStatus, error) {
-	if err := message.validatePayload(DefaultMaxPayloadBytes); err != nil {
-		return DeliveryStatus_DELIVERY_STATUS_UNSPECIFIED, err
-	}
-	message = message.clone()
-	response, err := t.call(ctx, endpoint, func(client GateDeliveryClient, ctx context.Context) (*DeliveryResponse, error) {
-		return client.SendToPlayer(ctx, &SendToPlayerRequest{LoginName: string(message.LoginName), CommandId: message.CommandID, Payload: message.Payload})
-	})
-	return t.deliveryResult(response, err)
-}
-
 // Forward 將一筆 opaque command 傳送至 Gate 的 generic remote-command ingress。
 // request shape 與 Gate-to-Game 的 gatelink.Forward 相同；此方法不附帶來源
 // connection 或 request-player reply slot。
@@ -140,26 +126,6 @@ func (t *GRPCTransport) Forward(ctx context.Context, endpoint GateEndpoint, mess
 		return errors.New("server send: Gate returned an empty Forward response")
 	}
 	return nil
-}
-
-func (t *GRPCTransport) call(ctx context.Context, endpoint GateEndpoint, call func(GateDeliveryClient, context.Context) (*DeliveryResponse, error)) (*DeliveryResponse, error) {
-	if t == nil {
-		return nil, errors.New("server send: gRPC transport is nil")
-	}
-	endpoint, err := endpoint.validated()
-	if err != nil {
-		return nil, err
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	conn, err := t.connection(endpoint.Address)
-	if err != nil {
-		return nil, err
-	}
-	ctx, cancel := context.WithTimeout(ctx, t.cfg.RequestTimeout)
-	defer cancel()
-	return call(NewGateDeliveryClient(conn), ctx)
 }
 
 func (t *GRPCTransport) callForward(ctx context.Context, endpoint GateEndpoint, call func(GateDeliveryClient, context.Context) (*emptypb.Empty, error)) (*emptypb.Empty, error) {
@@ -202,27 +168,6 @@ func (t *GRPCTransport) connection(address string) (*grpc.ClientConn, error) {
 	}
 	t.conns[address] = conn
 	return conn, nil
-}
-
-func (t *GRPCTransport) deliveryResult(response *DeliveryResponse, err error) (DeliveryStatus, error) {
-	if err != nil {
-		err = mapTransportError(err)
-		return DeliveryStatus_DELIVERY_STATUS_UNSPECIFIED, err
-	}
-	if response == nil || response.GetStatus() == DeliveryStatus_DELIVERY_STATUS_UNSPECIFIED {
-		return DeliveryStatus_DELIVERY_STATUS_UNSPECIFIED, errors.New("server send: Gate returned an invalid delivery response")
-	}
-	if response.GetStatus() == DeliveryStatus_DELIVERY_STATUS_IGNORED {
-		return response.GetStatus(), fmt.Errorf("%w", ErrTargetNotConnected)
-	}
-	return response.GetStatus(), nil
-}
-
-func mapTransportError(err error) error {
-	if status.Code(err) == codes.NotFound {
-		return fmt.Errorf("%w: %w", ErrTargetNotConnected, err)
-	}
-	return err
 }
 
 var _ interface {

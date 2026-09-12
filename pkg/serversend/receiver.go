@@ -3,7 +3,6 @@ package serversend
 import (
 	"context"
 	"errors"
-	"reflect"
 	"strings"
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
@@ -16,70 +15,22 @@ import (
 
 const traceIDMetadataKey = "x-server-send-trace-id"
 
-// LocalReceiver 是 Gate-local 的 exact player delivery boundary。generic remote
-// command 直接使用 Dispatcher，不在此轉成 player 或 room delivery request。
-type LocalReceiver interface {
-	SendToPlayer(context.Context, PlayerMessage) (DeliveryStatus, error)
-}
-
 // GateDeliveryService implements the generated GateDelivery contract. The
 // product-level grpcserver owns its listener and lifecycle; this service only
-// 負責轉接 exact player delivery 與 generic command ingress。
+// 負責將 generic command ingress 轉交 dispatcher。
 type GateDeliveryService struct {
 	UnimplementedGateDeliveryServer
-	receiver          LocalReceiver
 	commandDispatcher *dispatcher.Dispatcher
 }
 
 // NewGateDeliveryService builds a Gate delivery service without binding a
-// listener。兩個 dependency 都是必要的，因為 service 保留既有 SendToPlayer
-// contract，並新增 generic Forward ingress。
-func NewGateDeliveryService(receiver LocalReceiver, commandDispatcher *dispatcher.Dispatcher) (*GateDeliveryService, error) {
-	if isNilLocalReceiver(receiver) {
-		return nil, errors.New("gate delivery: local receiver is required")
-	}
+// listener。dispatcher 是唯一 dependency；各 product handler 在同一個
+// RemoteCommandChannel namespace 註冊。
+func NewGateDeliveryService(commandDispatcher *dispatcher.Dispatcher) (*GateDeliveryService, error) {
 	if commandDispatcher == nil {
 		return nil, errors.New("gate delivery: dispatcher is required")
 	}
-	return &GateDeliveryService{receiver: receiver, commandDispatcher: commandDispatcher}, nil
-}
-
-func isNilLocalReceiver(receiver LocalReceiver) bool {
-	if receiver == nil {
-		return true
-	}
-	value := reflect.ValueOf(receiver)
-	switch value.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
-		return value.IsNil()
-	default:
-		return false
-	}
-}
-
-func (s *GateDeliveryService) SendToPlayer(ctx context.Context, request *SendToPlayerRequest) (*DeliveryResponse, error) {
-	if request == nil {
-		return nil, status.Error(codes.InvalidArgument, "request is required")
-	}
-	ctx, err := withIncomingRequestContext(ctx)
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
-	message := PlayerMessage{LoginName: LoginName(request.GetLoginName()), Message: Message{CommandID: request.GetCommandId(), Payload: append([]byte(nil), request.GetPayload()...)}}
-	if err := message.validatePayload(DefaultMaxPayloadBytes); err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
-	if s == nil || isNilLocalReceiver(s.receiver) {
-		return nil, status.Error(codes.Unavailable, "gate delivery receiver is not configured")
-	}
-	delivery, err := s.receiver.SendToPlayer(ctx, message)
-	if err != nil {
-		return nil, receiverError(err)
-	}
-	if delivery != DeliveryStatus_DELIVERY_STATUS_DELIVERED && delivery != DeliveryStatus_DELIVERY_STATUS_IGNORED {
-		return nil, status.Error(codes.Internal, "gate delivery receiver returned an invalid status")
-	}
-	return deliveryResponse(delivery), nil
+	return &GateDeliveryService{commandDispatcher: commandDispatcher}, nil
 }
 
 // Forward 接受與 Gate-to-Game Forward 相同的 opaque command shape。Gate product
@@ -103,21 +54,6 @@ func (s *GateDeliveryService) Forward(ctx context.Context, request *gatelink.Gat
 		return nil, remoteCommandError(err)
 	}
 	return &emptypb.Empty{}, nil
-}
-
-func deliveryResponse(delivery DeliveryStatus) *DeliveryResponse {
-	count := uint32(0)
-	if delivery == DeliveryStatus_DELIVERY_STATUS_DELIVERED {
-		count = 1
-	}
-	return &DeliveryResponse{Status: delivery, DeliveredCount: count}
-}
-
-func receiverError(err error) error {
-	if errors.Is(err, ErrTargetNotConnected) {
-		return status.Error(codes.NotFound, err.Error())
-	}
-	return remoteCommandError(err)
 }
 
 func remoteCommandError(err error) error {

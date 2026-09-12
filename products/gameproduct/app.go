@@ -102,6 +102,9 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 			if err := r.Provide(func() gameFanoutConfig { return gateFanout }); err != nil {
 				return err
 			}
+			if err := r.Provide(newGameGateFanoutDirectory); err != nil {
+				return err
+			}
 			if err := r.ProvideManaged("game-gate-grpc-client", framework.PhaseInfrastructure, newGameServerSendTransport); err != nil {
 				return err
 			}

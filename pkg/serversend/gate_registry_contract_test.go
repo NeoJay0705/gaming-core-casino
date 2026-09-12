@@ -42,8 +42,8 @@ func TestRedisGateDirectoryContractResolvesAddressRegistration(t *testing.T) {
 	}
 	store.err = nil
 	store.values[keys.gateEndpoint("gate-a")] = "not-an-endpoint"
-	if _, err := directory.Resolve(context.Background(), "gate-a"); !errors.Is(err, ErrRouteStoreUnavailable) || !strings.Contains(err.Error(), "gate-a") {
-		t.Fatalf("malformed endpoint error = %v, want route-store error containing GateID", err)
+	if _, err := directory.Resolve(context.Background(), "gate-a"); !errors.Is(err, ErrDestinationInvalid) || !strings.Contains(err.Error(), "gate-a") {
+		t.Fatalf("malformed endpoint error = %v, want destination error containing GateID", err)
 	}
 }
 

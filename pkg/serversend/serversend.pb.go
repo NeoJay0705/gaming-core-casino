@@ -23,80 +23,30 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-type DeliveryStatus int32
-
-const (
-	DeliveryStatus_DELIVERY_STATUS_UNSPECIFIED DeliveryStatus = 0
-	// Gate accepted the message into its local WebSocket delivery path.
-	DeliveryStatus_DELIVERY_STATUS_DELIVERED DeliveryStatus = 1
-	// This Gate has no matching local player session.
-	DeliveryStatus_DELIVERY_STATUS_IGNORED DeliveryStatus = 2
-)
-
-// Enum value maps for DeliveryStatus.
-var (
-	DeliveryStatus_name = map[int32]string{
-		0: "DELIVERY_STATUS_UNSPECIFIED",
-		1: "DELIVERY_STATUS_DELIVERED",
-		2: "DELIVERY_STATUS_IGNORED",
-	}
-	DeliveryStatus_value = map[string]int32{
-		"DELIVERY_STATUS_UNSPECIFIED": 0,
-		"DELIVERY_STATUS_DELIVERED":   1,
-		"DELIVERY_STATUS_IGNORED":     2,
-	}
-)
-
-func (x DeliveryStatus) Enum() *DeliveryStatus {
-	p := new(DeliveryStatus)
-	*p = x
-	return p
-}
-
-func (x DeliveryStatus) String() string {
-	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
-}
-
-func (DeliveryStatus) Descriptor() protoreflect.EnumDescriptor {
-	return file_pkg_serversend_serversend_proto_enumTypes[0].Descriptor()
-}
-
-func (DeliveryStatus) Type() protoreflect.EnumType {
-	return &file_pkg_serversend_serversend_proto_enumTypes[0]
-}
-
-func (x DeliveryStatus) Number() protoreflect.EnumNumber {
-	return protoreflect.EnumNumber(x)
-}
-
-// Deprecated: Use DeliveryStatus.Descriptor instead.
-func (DeliveryStatus) EnumDescriptor() ([]byte, []int) {
-	return file_pkg_serversend_serversend_proto_rawDescGZIP(), []int{0}
-}
-
-type SendToPlayerRequest struct {
+// SendPlayersCommand is the framework-owned routing envelope for a batch
+// player delivery command. client_payload remains opaque to this package's
+// transport and is decoded only by the eventual client-facing product code.
+type SendPlayersCommand struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	LoginName     string                 `protobuf:"bytes,1,opt,name=login_name,json=loginName,proto3" json:"login_name,omitempty"`
-	CommandId     uint32                 `protobuf:"varint,2,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
-	Payload       []byte                 `protobuf:"bytes,3,opt,name=payload,proto3" json:"payload,omitempty"`
+	Messages      []*PlayerDelivery      `protobuf:"bytes,1,rep,name=messages,proto3" json:"messages,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *SendToPlayerRequest) Reset() {
-	*x = SendToPlayerRequest{}
+func (x *SendPlayersCommand) Reset() {
+	*x = SendPlayersCommand{}
 	mi := &file_pkg_serversend_serversend_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *SendToPlayerRequest) String() string {
+func (x *SendPlayersCommand) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*SendToPlayerRequest) ProtoMessage() {}
+func (*SendPlayersCommand) ProtoMessage() {}
 
-func (x *SendToPlayerRequest) ProtoReflect() protoreflect.Message {
+func (x *SendPlayersCommand) ProtoReflect() protoreflect.Message {
 	mi := &file_pkg_serversend_serversend_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -108,105 +58,91 @@ func (x *SendToPlayerRequest) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use SendToPlayerRequest.ProtoReflect.Descriptor instead.
-func (*SendToPlayerRequest) Descriptor() ([]byte, []int) {
+// Deprecated: Use SendPlayersCommand.ProtoReflect.Descriptor instead.
+func (*SendPlayersCommand) Descriptor() ([]byte, []int) {
 	return file_pkg_serversend_serversend_proto_rawDescGZIP(), []int{0}
 }
 
-func (x *SendToPlayerRequest) GetLoginName() string {
+func (x *SendPlayersCommand) GetMessages() []*PlayerDelivery {
+	if x != nil {
+		return x.Messages
+	}
+	return nil
+}
+
+type PlayerDelivery struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	LoginName       string                 `protobuf:"bytes,1,opt,name=login_name,json=loginName,proto3" json:"login_name,omitempty"`
+	ClientCommandId uint32                 `protobuf:"varint,2,opt,name=client_command_id,json=clientCommandId,proto3" json:"client_command_id,omitempty"`
+	ClientPayload   []byte                 `protobuf:"bytes,3,opt,name=client_payload,json=clientPayload,proto3" json:"client_payload,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *PlayerDelivery) Reset() {
+	*x = PlayerDelivery{}
+	mi := &file_pkg_serversend_serversend_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PlayerDelivery) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PlayerDelivery) ProtoMessage() {}
+
+func (x *PlayerDelivery) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_serversend_serversend_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PlayerDelivery.ProtoReflect.Descriptor instead.
+func (*PlayerDelivery) Descriptor() ([]byte, []int) {
+	return file_pkg_serversend_serversend_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *PlayerDelivery) GetLoginName() string {
 	if x != nil {
 		return x.LoginName
 	}
 	return ""
 }
 
-func (x *SendToPlayerRequest) GetCommandId() uint32 {
+func (x *PlayerDelivery) GetClientCommandId() uint32 {
 	if x != nil {
-		return x.CommandId
+		return x.ClientCommandId
 	}
 	return 0
 }
 
-func (x *SendToPlayerRequest) GetPayload() []byte {
+func (x *PlayerDelivery) GetClientPayload() []byte {
 	if x != nil {
-		return x.Payload
+		return x.ClientPayload
 	}
 	return nil
-}
-
-type DeliveryResponse struct {
-	state  protoimpl.MessageState `protogen:"open.v1"`
-	Status DeliveryStatus         `protobuf:"varint,1,opt,name=status,proto3,enum=serversend.v1.DeliveryStatus" json:"status,omitempty"`
-	// Single-target delivery returns one when delivered and zero when ignored.
-	DeliveredCount uint32 `protobuf:"varint,2,opt,name=delivered_count,json=deliveredCount,proto3" json:"delivered_count,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
-}
-
-func (x *DeliveryResponse) Reset() {
-	*x = DeliveryResponse{}
-	mi := &file_pkg_serversend_serversend_proto_msgTypes[1]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *DeliveryResponse) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*DeliveryResponse) ProtoMessage() {}
-
-func (x *DeliveryResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_serversend_serversend_proto_msgTypes[1]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use DeliveryResponse.ProtoReflect.Descriptor instead.
-func (*DeliveryResponse) Descriptor() ([]byte, []int) {
-	return file_pkg_serversend_serversend_proto_rawDescGZIP(), []int{1}
-}
-
-func (x *DeliveryResponse) GetStatus() DeliveryStatus {
-	if x != nil {
-		return x.Status
-	}
-	return DeliveryStatus_DELIVERY_STATUS_UNSPECIFIED
-}
-
-func (x *DeliveryResponse) GetDeliveredCount() uint32 {
-	if x != nil {
-		return x.DeliveredCount
-	}
-	return 0
 }
 
 var File_pkg_serversend_serversend_proto protoreflect.FileDescriptor
 
 const file_pkg_serversend_serversend_proto_rawDesc = "" +
 	"\n" +
-	"\x1fpkg/serversend/serversend.proto\x12\rserversend.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1bpkg/gatelink/gatelink.proto\"m\n" +
-	"\x13SendToPlayerRequest\x12\x1d\n" +
+	"\x1fpkg/serversend/serversend.proto\x12\rserversend.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1bpkg/gatelink/gatelink.proto\"O\n" +
+	"\x12SendPlayersCommand\x129\n" +
+	"\bmessages\x18\x01 \x03(\v2\x1d.serversend.v1.PlayerDeliveryR\bmessages\"\x82\x01\n" +
+	"\x0ePlayerDelivery\x12\x1d\n" +
 	"\n" +
-	"login_name\x18\x01 \x01(\tR\tloginName\x12\x1d\n" +
-	"\n" +
-	"command_id\x18\x02 \x01(\rR\tcommandId\x12\x18\n" +
-	"\apayload\x18\x03 \x01(\fR\apayload\"r\n" +
-	"\x10DeliveryResponse\x125\n" +
-	"\x06status\x18\x01 \x01(\x0e2\x1d.serversend.v1.DeliveryStatusR\x06status\x12'\n" +
-	"\x0fdelivered_count\x18\x02 \x01(\rR\x0edeliveredCount*m\n" +
-	"\x0eDeliveryStatus\x12\x1f\n" +
-	"\x1bDELIVERY_STATUS_UNSPECIFIED\x10\x00\x12\x1d\n" +
-	"\x19DELIVERY_STATUS_DELIVERED\x10\x01\x12\x1b\n" +
-	"\x17DELIVERY_STATUS_IGNORED\x10\x022\xa0\x01\n" +
-	"\fGateDelivery\x12S\n" +
-	"\fSendToPlayer\x12\".serversend.v1.SendToPlayerRequest\x1a\x1f.serversend.v1.DeliveryResponse\x12;\n" +
+	"login_name\x18\x01 \x01(\tR\tloginName\x12*\n" +
+	"\x11client_command_id\x18\x02 \x01(\rR\x0fclientCommandId\x12%\n" +
+	"\x0eclient_payload\x18\x03 \x01(\fR\rclientPayload2K\n" +
+	"\fGateDelivery\x12;\n" +
 	"\aForward\x12\x18.gatelink.v1.GateRequest\x1a\x16.google.protobuf.EmptyB9Z7github.com/NeoJay0705/gaming-core-casino/pkg/serversendb\x06proto3"
 
 var (
@@ -221,23 +157,19 @@ func file_pkg_serversend_serversend_proto_rawDescGZIP() []byte {
 	return file_pkg_serversend_serversend_proto_rawDescData
 }
 
-var file_pkg_serversend_serversend_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
 var file_pkg_serversend_serversend_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
 var file_pkg_serversend_serversend_proto_goTypes = []any{
-	(DeliveryStatus)(0),          // 0: serversend.v1.DeliveryStatus
-	(*SendToPlayerRequest)(nil),  // 1: serversend.v1.SendToPlayerRequest
-	(*DeliveryResponse)(nil),     // 2: serversend.v1.DeliveryResponse
-	(*gatelink.GateRequest)(nil), // 3: gatelink.v1.GateRequest
-	(*emptypb.Empty)(nil),        // 4: google.protobuf.Empty
+	(*SendPlayersCommand)(nil),   // 0: serversend.v1.SendPlayersCommand
+	(*PlayerDelivery)(nil),       // 1: serversend.v1.PlayerDelivery
+	(*gatelink.GateRequest)(nil), // 2: gatelink.v1.GateRequest
+	(*emptypb.Empty)(nil),        // 3: google.protobuf.Empty
 }
 var file_pkg_serversend_serversend_proto_depIdxs = []int32{
-	0, // 0: serversend.v1.DeliveryResponse.status:type_name -> serversend.v1.DeliveryStatus
-	1, // 1: serversend.v1.GateDelivery.SendToPlayer:input_type -> serversend.v1.SendToPlayerRequest
-	3, // 2: serversend.v1.GateDelivery.Forward:input_type -> gatelink.v1.GateRequest
-	2, // 3: serversend.v1.GateDelivery.SendToPlayer:output_type -> serversend.v1.DeliveryResponse
-	4, // 4: serversend.v1.GateDelivery.Forward:output_type -> google.protobuf.Empty
-	3, // [3:5] is the sub-list for method output_type
-	1, // [1:3] is the sub-list for method input_type
+	1, // 0: serversend.v1.SendPlayersCommand.messages:type_name -> serversend.v1.PlayerDelivery
+	2, // 1: serversend.v1.GateDelivery.Forward:input_type -> gatelink.v1.GateRequest
+	3, // 2: serversend.v1.GateDelivery.Forward:output_type -> google.protobuf.Empty
+	2, // [2:3] is the sub-list for method output_type
+	1, // [1:2] is the sub-list for method input_type
 	1, // [1:1] is the sub-list for extension type_name
 	1, // [1:1] is the sub-list for extension extendee
 	0, // [0:1] is the sub-list for field type_name
@@ -253,14 +185,13 @@ func file_pkg_serversend_serversend_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pkg_serversend_serversend_proto_rawDesc), len(file_pkg_serversend_serversend_proto_rawDesc)),
-			NumEnums:      1,
+			NumEnums:      0,
 			NumMessages:   2,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
 		GoTypes:           file_pkg_serversend_serversend_proto_goTypes,
 		DependencyIndexes: file_pkg_serversend_serversend_proto_depIdxs,
-		EnumInfos:         file_pkg_serversend_serversend_proto_enumTypes,
 		MessageInfos:      file_pkg_serversend_serversend_proto_msgTypes,
 	}.Build()
 	File_pkg_serversend_serversend_proto = out.File

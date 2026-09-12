@@ -18,12 +18,14 @@ type testReceiverServer struct {
 	server  *grpcserver.Server
 }
 
-func NewReceiverServer(cfg ReceiverConfig, receiver LocalReceiver, commandIDs ...uint32) (*testReceiverServer, error) {
+func NewReceiverServer(cfg ReceiverConfig, receiver interface {
+	HandleRemote(context.Context, uint32, []byte) error
+}, commandIDs ...uint32) (*testReceiverServer, error) {
 	commandDispatcher, err := newTestDeliveryDispatcher(receiver, commandIDs...)
 	if err != nil {
 		return nil, err
 	}
-	service, err := NewGateDeliveryService(receiver, commandDispatcher)
+	service, err := NewGateDeliveryService(commandDispatcher)
 	if err != nil {
 		return nil, err
 	}
@@ -39,16 +41,14 @@ func NewReceiverServer(cfg ReceiverConfig, receiver LocalReceiver, commandIDs ..
 	return &testReceiverServer{service: service, server: server}, nil
 }
 
-func newTestDeliveryDispatcher(receiver LocalReceiver, commandIDs ...uint32) (*dispatcher.Dispatcher, error) {
+func newTestDeliveryDispatcher(receiver interface {
+	HandleRemote(context.Context, uint32, []byte) error
+}, commandIDs ...uint32) (*dispatcher.Dispatcher, error) {
 	commandDispatcher := dispatcher.New()
 	for _, commandID := range commandIDs {
+		commandID := commandID
 		if err := commandDispatcher.Register(RemoteCommandChannel, dispatcher.CommandID(commandID), func(ctx context.Context, payload []byte) error {
-			if recorder, ok := receiver.(interface {
-				HandleRemote(context.Context, uint32, []byte) error
-			}); ok {
-				return recorder.HandleRemote(ctx, commandID, payload)
-			}
-			return nil
+			return receiver.HandleRemote(ctx, commandID, payload)
 		}); err != nil {
 			return nil, err
 		}
@@ -59,7 +59,3 @@ func newTestDeliveryDispatcher(receiver LocalReceiver, commandIDs ...uint32) (*d
 func (s *testReceiverServer) Start(ctx context.Context) error { return s.server.Start(ctx) }
 func (s *testReceiverServer) Stop(ctx context.Context) error  { return s.server.Stop(ctx) }
 func (s *testReceiverServer) Addr() string                    { return s.server.Addr() }
-
-func (s *testReceiverServer) SendToPlayer(ctx context.Context, request *SendToPlayerRequest) (*DeliveryResponse, error) {
-	return s.service.SendToPlayer(ctx, request)
-}

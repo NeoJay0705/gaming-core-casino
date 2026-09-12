@@ -21,19 +21,17 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	GateDelivery_SendToPlayer_FullMethodName = "/serversend.v1.GateDelivery/SendToPlayer"
-	GateDelivery_Forward_FullMethodName      = "/serversend.v1.GateDelivery/Forward"
+	GateDelivery_Forward_FullMethodName = "/serversend.v1.GateDelivery/Forward"
 )
 
 // GateDeliveryClient is the client API for GateDelivery service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// GateDelivery is registered on the product-level Gate gRPC server. It keeps
-// exact player delivery and generic remote-command ingress on one listener;
-// neither method owns a listener or a Gate endpoint lease.
+// GateDelivery is registered on the product-level Gate gRPC server. It is the
+// generic remote-command ingress on the existing listener; it owns neither a
+// listener nor a Gate endpoint lease.
 type GateDeliveryClient interface {
-	SendToPlayer(ctx context.Context, in *SendToPlayerRequest, opts ...grpc.CallOption) (*DeliveryResponse, error)
 	Forward(ctx context.Context, in *gatelink.GateRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 }
 
@@ -43,16 +41,6 @@ type gateDeliveryClient struct {
 
 func NewGateDeliveryClient(cc grpc.ClientConnInterface) GateDeliveryClient {
 	return &gateDeliveryClient{cc}
-}
-
-func (c *gateDeliveryClient) SendToPlayer(ctx context.Context, in *SendToPlayerRequest, opts ...grpc.CallOption) (*DeliveryResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(DeliveryResponse)
-	err := c.cc.Invoke(ctx, GateDelivery_SendToPlayer_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
 }
 
 func (c *gateDeliveryClient) Forward(ctx context.Context, in *gatelink.GateRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
@@ -69,11 +57,10 @@ func (c *gateDeliveryClient) Forward(ctx context.Context, in *gatelink.GateReque
 // All implementations must embed UnimplementedGateDeliveryServer
 // for forward compatibility.
 //
-// GateDelivery is registered on the product-level Gate gRPC server. It keeps
-// exact player delivery and generic remote-command ingress on one listener;
-// neither method owns a listener or a Gate endpoint lease.
+// GateDelivery is registered on the product-level Gate gRPC server. It is the
+// generic remote-command ingress on the existing listener; it owns neither a
+// listener nor a Gate endpoint lease.
 type GateDeliveryServer interface {
-	SendToPlayer(context.Context, *SendToPlayerRequest) (*DeliveryResponse, error)
 	Forward(context.Context, *gatelink.GateRequest) (*emptypb.Empty, error)
 	mustEmbedUnimplementedGateDeliveryServer()
 }
@@ -85,9 +72,6 @@ type GateDeliveryServer interface {
 // pointer dereference when methods are called.
 type UnimplementedGateDeliveryServer struct{}
 
-func (UnimplementedGateDeliveryServer) SendToPlayer(context.Context, *SendToPlayerRequest) (*DeliveryResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method SendToPlayer not implemented")
-}
 func (UnimplementedGateDeliveryServer) Forward(context.Context, *gatelink.GateRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method Forward not implemented")
 }
@@ -110,24 +94,6 @@ func RegisterGateDeliveryServer(s grpc.ServiceRegistrar, srv GateDeliveryServer)
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&GateDelivery_ServiceDesc, srv)
-}
-
-func _GateDelivery_SendToPlayer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(SendToPlayerRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(GateDeliveryServer).SendToPlayer(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: GateDelivery_SendToPlayer_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(GateDeliveryServer).SendToPlayer(ctx, req.(*SendToPlayerRequest))
-	}
-	return interceptor(ctx, in, info, handler)
 }
 
 func _GateDelivery_Forward_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -155,10 +121,6 @@ var GateDelivery_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "serversend.v1.GateDelivery",
 	HandlerType: (*GateDeliveryServer)(nil),
 	Methods: []grpc.MethodDesc{
-		{
-			MethodName: "SendToPlayer",
-			Handler:    _GateDelivery_SendToPlayer_Handler,
-		},
 		{
 			MethodName: "Forward",
 			Handler:    _GateDelivery_Forward_Handler,

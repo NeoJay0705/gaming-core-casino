@@ -58,7 +58,7 @@ func (d *RedisGateDirectory) Resolve(ctx context.Context, gateID GateID) (GateEn
 	}
 	endpoint, err := (GateEndpoint{GateID: gateID, Address: address}).validated()
 	if err != nil {
-		return GateEndpoint{}, routeStoreError(fmt.Sprintf("validate Gate endpoint %q", gateID), err)
+		return GateEndpoint{}, fmt.Errorf("%w: validate Gate endpoint %q: %v", ErrDestinationInvalid, gateID, err)
 	}
 	return endpoint, nil
 }

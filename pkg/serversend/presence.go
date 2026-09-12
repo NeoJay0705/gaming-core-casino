@@ -167,11 +167,15 @@ func (r *RedisPresenceResolver) Resolve(ctx context.Context, loginName LoginName
 	if len(values) == 0 {
 		return Presence{}, fmt.Errorf("%w: %q", ErrPresenceNotFound, loginName)
 	}
-	epoch, err := strconv.ParseUint(values[presenceEpochField], 10, 64)
+	epoch, err := parsePresenceEpoch(values[presenceEpochField])
 	if err != nil || epoch == 0 || values[presenceGateIDField] == "" || values[presenceConnectionIDField] == "" {
-		return Presence{}, fmt.Errorf("%w: malformed presence for %q", ErrRouteStoreUnavailable, loginName)
+		return Presence{}, fmt.Errorf("%w: malformed presence for %q", ErrDestinationInvalid, loginName)
 	}
 	return Presence{LoginName: loginName, GateID: GateID(values[presenceGateIDField]), ConnectionID: ConnectionID(values[presenceConnectionIDField]), Epoch: epoch}, nil
+}
+
+func parsePresenceEpoch(value string) (uint64, error) {
+	return strconv.ParseUint(value, 10, 64)
 }
 
 // Renew extends an unchanged presence lease. A stale lease returns

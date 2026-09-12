@@ -12,6 +12,11 @@ import (
 // responsibility and are intentionally separate.
 const DefaultMaxPayloadBytes = 1 << 20
 
+// PlayerDeliveryCommandID is reserved by the framework on RemoteCommandChannel
+// for the batch player-delivery envelope. Products must not register a
+// different handler for this ID.
+const PlayerDeliveryCommandID uint32 = 0xC00010
+
 var (
 	// ErrMessageInvalid indicates a malformed client-facing message.
 	ErrMessageInvalid = errors.New("server send: message is invalid")
@@ -85,7 +90,8 @@ func (m Message) clone() Message {
 	return m
 }
 
-// PlayerMessage targets the current authoritative session of LoginName.
+// PlayerMessage targets the current authoritative session of LoginName. The
+// command payload remains opaque to this package and to the Gate transport.
 type PlayerMessage struct {
 	LoginName LoginName
 	Message
@@ -109,6 +115,18 @@ func (m PlayerMessage) validatePayload(maxBytes int) error {
 func (m PlayerMessage) clone() PlayerMessage {
 	m.Message = m.Message.clone()
 	return m
+}
+
+func validatePlayerMessages(messages []PlayerMessage) error {
+	if len(messages) == 0 {
+		return fmt.Errorf("%w: at least one player message is required", ErrMessageInvalid)
+	}
+	for index, message := range messages {
+		if err := message.validatePayload(DefaultMaxPayloadBytes); err != nil {
+			return fmt.Errorf("player message %d: %w", index, err)
+		}
+	}
+	return nil
 }
 
 // RequestPlayerMessage targets the exact connection that originated a request.
@@ -147,11 +165,11 @@ type RequestPlayerSender interface {
 	SendToRequestPlayer(context.Context, RequestPlayerMessage) (Receipt, error)
 }
 
-// PlayerSender sends to the Gate that currently owns a player. If the exact
-// route fails, its configured bounded all-Gate fallback checks each local
-// owner; this API never turns a private message into a room broadcast.
+// PlayerSender sends a batch to the Gates that currently own the players. The
+// implementation may group messages by endpoint, but it never turns a
+// private message into a room broadcast.
 type PlayerSender interface {
-	SendToPlayer(context.Context, PlayerMessage) (Receipt, error)
+	SendToPlayers(context.Context, []PlayerMessage) (Receipt, error)
 }
 
 // BroadcastSender 透過明確選用的 transport 將一筆 opaque command 傳給所有

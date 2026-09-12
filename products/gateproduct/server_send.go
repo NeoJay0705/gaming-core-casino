@@ -6,46 +6,86 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
+	"google.golang.org/protobuf/proto"
 )
 
-// gateDeliveryReceiver adapts exact Game-to-Gate player delivery to the local
-// WebSocket registry. Generic remote commands are handled by product modules.
-type gateDeliveryReceiver struct {
-	sessions *SessionRegistry
-	metrics  *gateMetrics
+// registerGatePlayerDeliveryCommand 在 Gate Forward 與 Redis Pub/Sub ingress
+// 共用的 dispatcher namespace 註冊 framework-owned player batch command。
+func registerGatePlayerDeliveryCommand(registry *SessionRegistry, metrics *gateMetrics, commandDispatcher *dispatcher.Dispatcher) error {
+	if registry == nil {
+		return errors.New("gate player delivery: session registry is nil")
+	}
+	if commandDispatcher == nil {
+		return errors.New("gate player delivery: dispatcher is nil")
+	}
+	return commandDispatcher.Register(serversend.RemoteCommandChannel, dispatcher.CommandID(serversend.PlayerDeliveryCommandID), func(ctx context.Context, payload []byte) error {
+		return handlePlayerDeliveryCommand(registry, metrics, ctx, payload)
+	})
 }
 
-func newGateDeliveryReceiver(sessions *SessionRegistry, metrics ...*gateMetrics) (*gateDeliveryReceiver, error) {
-	if sessions == nil {
-		return nil, errors.New("gate delivery: session registry is nil")
+// handlePlayerDeliveryCommand 只解碼 framework routing envelope。每個
+// client_payload 保持 opaque，完成 login-name lookup 後複製到既有 WebSocket
+// packet format。
+func handlePlayerDeliveryCommand(registry *SessionRegistry, metrics *gateMetrics, _ context.Context, payload []byte) error {
+	if registry == nil {
+		return errors.New("gate player delivery: session registry is nil")
 	}
-	var observed *gateMetrics
-	if len(metrics) != 0 {
-		observed = metrics[0]
+	if len(payload) > serversend.DefaultMaxPayloadBytes {
+		return fmt.Errorf("%w: player delivery batch is %d bytes", serversend.ErrPayloadTooLarge, len(payload))
 	}
-	return &gateDeliveryReceiver{sessions: sessions, metrics: observed}, nil
-}
+	command := new(serversend.SendPlayersCommand)
+	if err := proto.Unmarshal(payload, command); err != nil {
+		return fmt.Errorf("%w: decode player delivery command: %v", serversend.ErrMessageInvalid, err)
+	}
+	if len(command.GetMessages()) == 0 {
+		return fmt.Errorf("%w: player delivery batch is empty", serversend.ErrMessageInvalid)
+	}
 
-func (r *gateDeliveryReceiver) SendToPlayer(_ context.Context, message serversend.PlayerMessage) (serversend.DeliveryStatus, error) {
-	if r == nil || r.sessions == nil {
-		return serversend.DeliveryStatus_DELIVERY_STATUS_UNSPECIFIED, errors.New("gate delivery: receiver is not configured")
-	}
 	receivedAt := time.Now()
-	if err := r.sessions.sendToLoginNameAt(LoginName(message.LoginName), encodeServerSendPacket(message.Message), receivedAt, serverSendTargetPlayer); err != nil {
-		if errors.Is(err, ErrLoginSessionNotFound) {
-			r.metrics.observeServerSendRequest(string(serverSendTargetPlayer), "ignored")
-			return serversend.DeliveryStatus_DELIVERY_STATUS_IGNORED, nil
+	var errs []error
+	for index, delivery := range command.GetMessages() {
+		if delivery == nil {
+			errs = append(errs, fmt.Errorf("%w: player delivery item %d is nil", serversend.ErrMessageInvalid, index))
+			continue
 		}
-		r.metrics.observeServerSendRequest(string(serverSendTargetPlayer), "error")
-		return serversend.DeliveryStatus_DELIVERY_STATUS_UNSPECIFIED, fmt.Errorf("deliver to login %q: %w", message.LoginName, err)
+		message := serversend.PlayerMessage{
+			LoginName: serversend.LoginName(delivery.GetLoginName()),
+			Message: serversend.Message{
+				CommandID: delivery.GetClientCommandId(),
+				Payload:   append([]byte(nil), delivery.GetClientPayload()...),
+			},
+		}
+		if err := message.Validate(); err != nil {
+			errs = append(errs, fmt.Errorf("player delivery item %d: %w", index, err))
+			continue
+		}
+		if len(message.Payload) > serversend.DefaultMaxPayloadBytes {
+			errs = append(errs, fmt.Errorf("player delivery item %d: %w", index, serversend.ErrPayloadTooLarge))
+			continue
+		}
+		packet := encodeServerSendPacket(message.Message)
+		if err := registry.sendToLoginNameAt(LoginName(message.LoginName), packet, receivedAt, serverSendTargetPlayer); err != nil {
+			if errors.Is(err, ErrLoginSessionNotFound) {
+				if metrics != nil {
+					metrics.observeServerSendRequest(string(serverSendTargetPlayer), "ignored")
+				}
+				continue
+			}
+			if metrics != nil {
+				metrics.observeServerSendRequest(string(serverSendTargetPlayer), "error")
+			}
+			errs = append(errs, fmt.Errorf("deliver player %q: %w", message.LoginName, err))
+			continue
+		}
+		if metrics != nil {
+			metrics.observeServerSendRequest(string(serverSendTargetPlayer), "queued")
+		}
 	}
-	r.metrics.observeServerSendRequest(string(serverSendTargetPlayer), "queued")
-	return serversend.DeliveryStatus_DELIVERY_STATUS_DELIVERED, nil
+	return errors.Join(errs...)
 }
 
 func encodeServerSendPacket(message serversend.Message) []byte {
 	return encodeWebSocketPacket(WebSocketPacket{CommandID: message.CommandID, Payload: message.Payload})
 }
-
-var _ serversend.LocalReceiver = (*gateDeliveryReceiver)(nil)

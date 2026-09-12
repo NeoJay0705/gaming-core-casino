@@ -3,6 +3,7 @@ package gateproduct
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -54,11 +55,14 @@ func TestGameServerSendContractDeliversAcrossTwoGates(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = transport.Stop(context.Background()) })
 
-	routed, err := serversend.NewRoutedPlayerSender(dualGatePresenceResolver{presence: serversend.Presence{LoginName: "bob", GateID: "gate-b", ConnectionID: "gate-b-bob", Epoch: 1}}, directory, transport, nil)
+	presence := dualGatePresenceResolver{presences: map[serversend.LoginName]serversend.Presence{
+		"bob": {LoginName: "bob", GateID: "gate-b", ConnectionID: "gate-b-bob", Epoch: 1},
+	}}
+	routed, err := serversend.NewBatchPlayerSender(presence, directory, directory, transport)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := routed.SendToPlayer(context.Background(), serversend.PlayerMessage{LoginName: "bob", Message: serversend.Message{CommandID: 102, Payload: []byte("private")}}); err != nil {
+	if _, err := routed.SendToPlayers(context.Background(), []serversend.PlayerMessage{{LoginName: "bob", Message: serversend.Message{CommandID: 102, Payload: []byte("private")}}}); err != nil {
 		t.Fatalf("routed player send: %v", err)
 	}
 	assertServerSendPacket(t, bob, 102, "private")
@@ -175,28 +179,27 @@ func TestGameServerSendContractPlayerRouteReturnsStalePrimaryError(t *testing.T)
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = transport.Stop(context.Background()) })
-	fanout, err := serversend.NewFanoutSender(directory, transport)
+	routed, err := serversend.NewBatchPlayerSender(dualGatePresenceResolver{presences: map[serversend.LoginName]serversend.Presence{
+		"bob": {LoginName: "bob", GateID: "stale-gate", ConnectionID: "gate-b-bob", Epoch: 1},
+	}}, dualGateDirectory{endpoints: directory.endpoints}, directory, transport)
 	if err != nil {
 		t.Fatal(err)
 	}
-	routed, err := serversend.NewRoutedPlayerSender(dualGatePresenceResolver{presence: serversend.Presence{LoginName: "bob", GateID: "stale-gate", ConnectionID: "gate-b-bob", Epoch: 1}}, directory, transport, fanout)
-	if err != nil {
-		t.Fatal(err)
+	if receipt, err := routed.SendToPlayers(context.Background(), []serversend.PlayerMessage{{LoginName: "bob", Message: serversend.Message{CommandID: 105, Payload: []byte("route")}}}); !errors.Is(err, serversend.ErrGateEndpointNotFound) || !receipt.AcceptedAt.IsZero() {
+		t.Fatalf("stale player route = receipt:%#v error:%v, want empty/ErrGateEndpointNotFound", receipt, err)
 	}
-	if receipt, err := routed.SendToPlayer(context.Background(), serversend.PlayerMessage{LoginName: "bob", Message: serversend.Message{CommandID: 105, Payload: []byte("route")}}); err != nil || receipt.AcceptedAt.IsZero() {
-		t.Fatalf("stale player route fallback = receipt:%#v error:%v, want accepted/nil", receipt, err)
+	if len(bob.Sent()) != 0 {
+		t.Fatalf("stale player route unexpectedly delivered: %x", bob.Sent())
 	}
-	assertServerSendPacket(t, bob, 105, "route")
 }
 
 func startContractGateReceiver(t *testing.T, gateID serversend.GateID) (*SessionRegistry, *dispatcher.Dispatcher, serversend.GateEndpoint) {
 	t.Helper()
 	sessions := NewSessionRegistry()
-	receiver, err := newGateDeliveryReceiver(sessions)
-	if err != nil {
+	commandDispatcher := dispatcher.New()
+	if err := registerGatePlayerDeliveryCommand(sessions, nil, commandDispatcher); err != nil {
 		t.Fatal(err)
 	}
-	commandDispatcher := dispatcher.New()
 	for _, commandID := range []uint32{102, 103, 104, 105} {
 		if err := commandDispatcher.Register(serversend.RemoteCommandChannel, dispatcher.CommandID(commandID), func(_ context.Context, payload []byte) error {
 			_, err := sessions.BroadcastRoom("room-a", EncodeWebSocketPacket(WebSocketPacket{CommandID: commandID, Payload: append([]byte(nil), payload...)}))
@@ -205,7 +208,7 @@ func startContractGateReceiver(t *testing.T, gateID serversend.GateID) (*Session
 			t.Fatal(err)
 		}
 	}
-	service, err := serversend.NewGateDeliveryService(receiver, commandDispatcher)
+	service, err := serversend.NewGateDeliveryService(commandDispatcher)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,12 +245,31 @@ func (d dualGateDirectory) List(context.Context) ([]serversend.GateEndpoint, err
 	return append([]serversend.GateEndpoint(nil), d.endpoints...), nil
 }
 
-type dualGatePresenceResolver struct {
-	presence serversend.Presence
+func (d dualGateDirectory) ResolveMany(_ context.Context, gateIDs []serversend.GateID) (map[serversend.GateID]serversend.GateEndpoint, error) {
+	result := make(map[serversend.GateID]serversend.GateEndpoint, len(gateIDs))
+	for _, gateID := range gateIDs {
+		for _, endpoint := range d.endpoints {
+			if endpoint.GateID == gateID {
+				result[gateID] = endpoint
+				break
+			}
+		}
+	}
+	return result, nil
 }
 
-func (r dualGatePresenceResolver) Resolve(context.Context, serversend.LoginName) (serversend.Presence, error) {
-	return r.presence, nil
+type dualGatePresenceResolver struct {
+	presences map[serversend.LoginName]serversend.Presence
+}
+
+func (r dualGatePresenceResolver) ResolveMany(_ context.Context, names []serversend.LoginName) (map[serversend.LoginName]serversend.Presence, error) {
+	result := make(map[serversend.LoginName]serversend.Presence, len(names))
+	for _, name := range names {
+		if presence, ok := r.presences[name]; ok {
+			result[name] = presence
+		}
+	}
+	return result, nil
 }
 
 func assertServerSendPacket(t *testing.T, session *registrySession, commandID uint32, payload string) {

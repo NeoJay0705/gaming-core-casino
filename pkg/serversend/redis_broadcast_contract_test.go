@@ -371,10 +371,6 @@ func (p *recordingBroadcastPublisher) Publish(_ context.Context, channel string,
 
 type panicReceiver struct{}
 
-func (panicReceiver) SendToPlayer(context.Context, PlayerMessage) (DeliveryStatus, error) {
-	panic("test handler panic")
-}
-
 func (panicReceiver) HandleRemote(context.Context, uint32, []byte) error {
 	panic("test handler panic")
 }

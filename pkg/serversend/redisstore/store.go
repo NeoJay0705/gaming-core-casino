@@ -43,6 +43,15 @@ func (s *Store) HGetAll(ctx context.Context, key string) *clientredis.MapStringS
 	return client.HGetAll(ctx, key)
 }
 
+// Pipelined 執行 batch routing 所需的 Redis pipeline operation。
+func (s *Store) Pipelined(ctx context.Context, fn func(clientredis.Pipeliner) error) ([]clientredis.Cmder, error) {
+	client, err := s.Client()
+	if err != nil {
+		return nil, err
+	}
+	return client.Pipelined(ctx, fn)
+}
+
 func (s *Store) Set(ctx context.Context, key string, value any, ttl time.Duration) *clientredis.StatusCmd {
 	client, err := s.Client()
 	if err != nil {
