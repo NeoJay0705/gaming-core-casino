@@ -24,6 +24,100 @@ Load 預設使用完整的 `game` Echo 路徑；若要隔離 Gate WebSocket 與 
 local route 只在 Gate 回覆，不呼叫 Game。每次執行只選一種 route，結束 log 會輸出 `echo_route`，方便與
 Prometheus snapshots 對照。
 
+## Server-send push validation
+
+正式 baseline 請使用 repository 內唯一的 orchestration entrypoint；campaign 開始時只 build 一次並保存
+Game／Gate／load binary snapshot，之後每個 attempt 都重新啟動相同 checksum 的 binary。--full-campaign
+會先執行 Broadcast／Player 各一個 10-connection correctness run；兩者必須 evidence_valid 且
+delivery_complete，否則不會啟動 matrix。通過後才以交錯順序執行四個 1000-connection cases，每個
+case 取得三個 evidence_valid attempts，最多再嘗試兩個 environment_invalid attempts。它會在 connection
+ready 且 collectors preflight 通過後才放行 warm-up，並保存 phase events、metrics、Redis 與 macOS
+host/process artifacts。不要把單案例或未使用 orchestration barrier 的手動命令當成可比較結果：
+correctness 每個 workload 固定只執行 run-1；run-1 無效時 campaign 立即停止，不執行 matrix retry。
+
+```sh
+run_root="artifacts/server-send/$(date -u +%Y%m%dT%H%M%SZ)"
+examples/metrics/scripts/run-server-send-validation.sh \
+  --artifact-root "$run_root" --full-campaign
+examples/metrics/scripts/run-server-send-validation.sh \
+  --validate-only "$run_root/matrix/broadcast-33/run-1"
+```
+
+`environment_invalid` 不佔用 evidence-valid slots，但單一 case 最多執行
+`requested_valid_attempts + 2` 次；超過上限即以非零狀態停止並保留 artifacts。campaign root 會產生
+`bin/`、`binary-checksums.txt`、`source-state.txt`、`correctness-gate.json` 與 `evidence-manifest.tsv`，
+raw artifacts 應留在 local／CI artifact 儲存，不提交到 Git。`--validate-only` 可對任一 phase 下的 attempt
+重新驗證 marker、counter、run ID、metrics／OS coverage 與 checksum，不會重新啟動服務或修改 staging。
+
+Profile-only 仍使用 `--profile-target game|gate|load`（可加 `--trace`），並走相同 warm-up result、quiet
+drain、baseline 與 measured barrier；profile observer effect 使該 run 只供診斷，不計入 baseline 或 capacity
+median。Warm-up `missed` 不會再觸發略過 warm-up 的 workaround。
+
+`load` 也提供 example-only 的非同步 push workload。它會先建立並完成全部 WebSocket、Login、EnterRoom，
+再由第一條 connection 傳送 `StartPushRequest`；Game 接受後以既有 `RequestPlayerSender` 回到同一條
+connection，runner 才開始固定頻率送出。每條 connection 僅啟動一個 reader，因此 Broadcast 與 Player
+的 server-send frame 可與 control response 交錯讀取。`-workload echo`（預設）的既有 closed-loop 行為
+不變。
+
+下列 `go run` 命令僅供開發除錯與 smoke；它們不產生正式 correctness／baseline 證據，也不取代上方唯一的
+orchestration entrypoint。正式 correctness gate 應在同一 campaign binary snapshot 下執行。測試固定 32-byte
+application payload、`GOMAXPROCS=4`；`broadcast` 走 Redis Pub/Sub primary，`player` 每個 tick 只呼叫一次含
+所有 login names 的 `SendToPlayers` batch：
+
+```sh
+GOMAXPROCS=4 go run ./examples/metrics/load \
+  -workload broadcast -connections 10 -duration 30s -payload-bytes 32 \
+  -push-interval 33ms -push-warmup-duration 5s -drain-timeout 10s \
+  -setup-concurrency 32 -setup-timeout 2m -request-timeout 10s \
+  -metrics-addr 127.0.0.1:22081
+
+GOMAXPROCS=4 go run ./examples/metrics/load \
+  -workload player -connections 1000 -duration 30s -payload-bytes 32 \
+  -push-interval 16ms -push-warmup-duration 5s -drain-timeout 10s
+```
+
+`-push-interval` 僅接受 `33ms` 或 `16ms`；`-duration` 是 measured sender admission window。Warm-up
+completion 先由 script 寫入 `warmup-result.json`，load 等待至少一個 interval 的 quiet drain 後寫入
+`warmup-drained.json`；即使 `missed`、partial、error 或 theoretical delivery shortage 存在，只要
+lifecycle／protocol／queue drain 成功，仍開始 measured run。Measured 結束後 load
+仍保留 reader 與 `/metrics` 到 drain／summary 完成；Prometheus 應以 1 秒 scrape Game、Gate 與 load，保存
+warm-up 後 baseline、measured window time series 及 drain 後 final snapshot。
+
+新增 load metrics：
+
+```promql
+rate(gaming_core_example_load_push_messages_total{result="received"}[10s])
+histogram_quantile(0.95, sum by (le) (
+  rate(gaming_core_example_load_push_delivery_duration_seconds_bucket[30s])
+))
+gaming_core_example_load_push_readers
+```
+
+Game producer 端使用下列 bounded series（`operation` 為 `broadcast` 或 `player`，不含 login／room label）：
+
+```promql
+rate(gaming_core_game_server_send_requests_total{operation="player",result="success"}[10s])
+histogram_quantile(0.95, sum by (le) (
+  rate(gaming_core_game_server_send_duration_seconds_bucket{operation="player",result="success"}[30s])
+))
+gaming_core_game_server_send_in_flight{operation="player"}
+rate(gaming_core_example_push_missed_ticks_total{mode="player"}[10s])
+```
+
+Broadcast 使用 `operation="broadcast"`。Gate 端則對照既有 server-send delivery、WebSocket write／queue
+與 connection metrics；Player 應核對 `server_send_requests_total{target="player"}` queued count，Broadcast
+則核對 room delivery terminal histogram count。`delivery_complete` 的 measured window 應為 sender `partial`／
+`error`、missed ticks、client `duplicate`／`sequence_gap`／`invalid` 均為 0，且 drain 後 readers、in-flight
+與 write queue 回到 0；warm-up 的 missed／partial／error 另存於 run status，不會阻止 measured。這些 acceptance
+只表示 delivery correctness，不把 sender acceptance 誤稱為 client 已收到。
+
+四個 case（Broadcast／Player × 33ms／16ms）各做三次，交錯執行並以中位數及 min／max 比較。每輪保存
+commit/config、完整 command、PID/GOMAXPROCS、Game／Gate／load `/metrics` baseline／timeseries／final、
+Redis `INFO` 及每秒 `os/redis.tsv`、macOS `top`／`vm_stat`／`nettop`／`netstat`／`lsof` 原始輸出；只有三輪 metrics 與 OS 結果
+可重現後，才對被指向的單一 process 另做 20 秒 CPU、heap／goroutine（必要時 5 秒 trace）profile-only。
+結果依 repository root 的 `SERVER_SEND_PERFORMANCE_VALIDATION_REPORT.md` 格式整理，數字必須能回鏈到
+持久化 artifacts，不保存 credential 或實際業務 payload。
+
 各服務的 `/metrics` endpoint 分別是 Game `http://127.0.0.1:19080/metrics`、Gate
 `http://127.0.0.1:18081/metrics`、API `http://127.0.0.1:20081/metrics`、GMS
 `http://127.0.0.1:21081/metrics`；同一 listener 也提供 `/health` 與 `/ready`。

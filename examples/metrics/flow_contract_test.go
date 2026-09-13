@@ -173,6 +173,45 @@ redis:
 	if string(localEcho.GetPayload()) != string(localPayload) {
 		t.Fatalf("local Echo payload = %q, want %q", localEcho.GetPayload(), localPayload)
 	}
+	for _, test := range []struct {
+		name string
+		mode protocol.PushMode
+	}{
+		{name: "broadcast", mode: protocol.PushMode_PUSH_MODE_BROADCAST},
+		{name: "player", mode: protocol.PushMode_PUSH_MODE_PLAYER},
+	} {
+		if test.mode == protocol.PushMode_PUSH_MODE_PLAYER {
+			// The first workload is bounded to one immediate tick. Allow its
+			// sender goroutine to publish and release the active-run slot before
+			// submitting the second workload.
+			time.Sleep(50 * time.Millisecond)
+		}
+		pushRequest := &protocol.StartPushRequest{
+			RunId:          "flow-" + test.name,
+			Mode:           test.mode,
+			RoomId:         "flow-room",
+			LoginNames:     []string{"flow-player"},
+			IntervalMillis: 33,
+			DurationMillis: 33,
+			PayloadBytes:   4,
+		}
+		if test.mode == protocol.PushMode_PUSH_MODE_PLAYER {
+			pushRequest.RoomId = ""
+		}
+		if err := writeFlowPacket(conn, protocol.StartPushRequestCommandID, 5, mustFlowMarshal(pushRequest)); err != nil {
+			t.Fatalf("write %s push control: %v", test.name, err)
+		}
+		response, message, err := readFlowPushResult(conn, pushRequest.GetRunId())
+		if err != nil {
+			t.Fatalf("read %s push result: %v", test.name, err)
+		}
+		if response.GetPlannedTicks() != 1 {
+			t.Fatalf("%s planned ticks = %d, want 1", test.name, response.GetPlannedTicks())
+		}
+		if message.GetRunId() != pushRequest.GetRunId() || message.GetSequence() != 1 || len(message.GetPayload()) != 4 {
+			t.Fatalf("%s push message = %+v", test.name, message)
+		}
+	}
 
 	unauthenticated, _, err := websocket.DefaultDialer.Dial("ws://"+gateAddr+"/ws", nil)
 	if err != nil {
@@ -241,7 +280,7 @@ redis:
 	}, 1)
 	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_commands_total", map[string]string{
 		"route": "game", "command": "forward", "result": "success",
-	}, 2)
+	}, 4)
 	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_commands_total", map[string]string{
 		"route": "game", "command": "forward", "result": "error",
 	}, 1)
@@ -251,11 +290,12 @@ redis:
 	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_commands_total", map[string]string{
 		"route": "local", "command": strconv.FormatUint(uint64(protocol.LocalEchoRequestCommandID), 10), "result": "error",
 	}, 2)
-	assertCounterSample(t, gateRegisterer, "gaming_core_gate_game_grpc_requests_total", map[string]string{"code": "OK"}, 2)
+	assertCounterSample(t, gateRegisterer, "gaming_core_gate_game_grpc_requests_total", map[string]string{"code": "OK"}, 4)
 	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_writes_total", map[string]string{"source": "handler", "result": "success"}, 5)
-	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_writes_total", map[string]string{"source": "server_send", "result": "success"}, 2)
-	assertHistogramSample(t, gateRegisterer, "gaming_core_gate_server_send_delivery_duration_seconds", map[string]string{"target": "connection", "result": "success"}, 1)
-	assertHistogramSample(t, gateRegisterer, "gaming_core_gate_server_send_delivery_duration_seconds", map[string]string{"target": "room", "result": "success"}, 1)
+	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_writes_total", map[string]string{"source": "server_send", "result": "success"}, 6)
+	assertHistogramSample(t, gateRegisterer, "gaming_core_gate_server_send_delivery_duration_seconds", map[string]string{"target": "connection", "result": "success"}, 3)
+	assertHistogramSample(t, gateRegisterer, "gaming_core_gate_server_send_delivery_duration_seconds", map[string]string{"target": "room", "result": "success"}, 2)
+	assertHistogramSample(t, gateRegisterer, "gaming_core_gate_server_send_delivery_duration_seconds", map[string]string{"target": "player", "result": "success"}, 1)
 	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_connection_closes_total", map[string]string{"reason": "login_required"}, 2)
 	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_connection_closes_total", map[string]string{"reason": "room_required"}, 2)
 	assertCounterSample(t, gateRegisterer, "gaming_core_gate_websocket_connection_closes_total", map[string]string{"reason": "client_closed"}, 1)
@@ -275,8 +315,20 @@ redis:
 		"command": strconv.FormatUint(uint64(protocol.BroadcastRoomCommandID), 10),
 		"result":  "success",
 	}, 1)
-	assertOnlyCounterSample(t, gameRegisterer, "gaming_core_game_server_send_requests_total", map[string]string{
+	assertCounterSample(t, gameRegisterer, "gaming_core_game_gate_commands_total", map[string]string{
+		"command": strconv.FormatUint(uint64(protocol.StartPushRequestCommandID), 10),
+		"result":  "success",
+	}, 2)
+	assertCounterSample(t, gameRegisterer, "gaming_core_game_server_send_requests_total", map[string]string{
 		"operation": "request_player",
+		"result":    "success",
+	}, 3)
+	assertCounterSample(t, gameRegisterer, "gaming_core_game_server_send_requests_total", map[string]string{
+		"operation": "broadcast",
+		"result":    "success",
+	}, 2)
+	assertCounterSample(t, gameRegisterer, "gaming_core_game_server_send_requests_total", map[string]string{
+		"operation": "player",
 		"result":    "success",
 	}, 1)
 	assertGaugeZero(t, gameRegisterer, "gaming_core_game_gate_commands_in_flight")
@@ -388,6 +440,44 @@ func readFlowPacket(conn *websocket.Conn, commandID uint32) ([]byte, error) {
 		}
 		return data[16:size], nil
 	}
+}
+
+func readFlowPushResult(conn *websocket.Conn, runID string) (*protocol.StartPushResponse, *protocol.PushMessage, error) {
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var response *protocol.StartPushResponse
+	var message *protocol.PushMessage
+	for response == nil || message == nil {
+		messageType, data, err := conn.ReadMessage()
+		if err != nil {
+			return nil, nil, err
+		}
+		if messageType != websocket.BinaryMessage || len(data) < 16 {
+			continue
+		}
+		size := int(binary.BigEndian.Uint32(data[4:8]))
+		if size < 16 || size > len(data) {
+			return nil, nil, fmt.Errorf("invalid push packet size %d", size)
+		}
+		switch binary.BigEndian.Uint32(data[0:4]) {
+		case protocol.StartPushResponseCommandID:
+			value := new(protocol.StartPushResponse)
+			if err := proto.Unmarshal(data[16:size], value); err != nil {
+				return nil, nil, err
+			}
+			if value.GetRunId() == runID {
+				response = value
+			}
+		case protocol.PushMessageCommandID:
+			value := new(protocol.PushMessage)
+			if err := proto.Unmarshal(data[16:size], value); err != nil {
+				return nil, nil, err
+			}
+			if value.GetRunId() == runID {
+				message = value
+			}
+		}
+	}
+	return response, message, nil
 }
 
 func expectFlowConnectionClose(conn *websocket.Conn) error {

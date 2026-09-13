@@ -56,6 +56,159 @@ func TestParseEchoRoute(t *testing.T) {
 	}
 }
 
+func TestParsePushWorkload(t *testing.T) {
+	for _, value := range []string{"broadcast", "PLAYER", " player "} {
+		if mode, err := parsePushWorkload(value); err != nil || (mode != pushWorkloadBroadcast && mode != pushWorkloadPlayer) {
+			t.Fatalf("parsePushWorkload(%q) = %q, %v", value, mode, err)
+		}
+	}
+	if _, err := parsePushWorkload("echo"); err == nil {
+		t.Fatal("parsePushWorkload(echo) error = nil")
+	}
+}
+
+func TestDecodeLoadPacketValidatesHeaderAndPreservesFields(t *testing.T) {
+	want := gateproduct.EncodeWebSocketPacket(gateproduct.WebSocketPacket{
+		CommandID: protocol.PushMessageCommandID,
+		Sequence:  9,
+		Session:   3,
+		Version:   4,
+		Payload:   []byte{1, 2, 3},
+	})
+	got, err := decodeLoadPacket(want)
+	if err != nil {
+		t.Fatalf("decodeLoadPacket() error = %v", err)
+	}
+	if got.CommandID != protocol.PushMessageCommandID || got.Sequence != 9 || got.Session != 3 || got.Version != 4 || string(got.Payload) != string([]byte{1, 2, 3}) {
+		t.Fatalf("decodeLoadPacket() = %+v", got)
+	}
+	for _, malformed := range [][]byte{
+		{},
+		make([]byte, 15),
+		append(append([]byte(nil), want...), 0),
+	} {
+		if _, err := decodeLoadPacket(malformed); err == nil {
+			t.Fatalf("decodeLoadPacket(%d bytes) error = nil", len(malformed))
+		}
+	}
+}
+
+func TestPushClientDemultiplexesControlAndPushFramesWithOneReader(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	serverDone := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		connection, err := upgrader.Upgrade(writer, request, nil)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer connection.Close()
+		_, data, err := connection.ReadMessage()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		packet, err := decodeLoadPacket(data)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		requestMessage := new(protocol.StartPushRequest)
+		if err := proto.Unmarshal(packet.Payload, requestMessage); err != nil {
+			serverDone <- err
+			return
+		}
+		response, err := proto.Marshal(&protocol.StartPushResponse{RunId: requestMessage.GetRunId(), PlannedTicks: 2})
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		write := func(commandID uint32, payload []byte) error {
+			return connection.WriteMessage(websocket.BinaryMessage, gateproduct.EncodeWebSocketPacket(gateproduct.WebSocketPacket{CommandID: commandID, Payload: payload}))
+		}
+		if err := write(protocol.StartPushResponseCommandID, response); err != nil {
+			serverDone <- err
+			return
+		}
+		for _, message := range []*protocol.PushMessage{
+			{RunId: requestMessage.GetRunId(), Sequence: 1, SentUnixNano: time.Now().UnixNano(), Payload: []byte("data")},
+			{RunId: requestMessage.GetRunId(), Sequence: 2, SentUnixNano: time.Now().UnixNano(), Payload: []byte("data")},
+			{RunId: requestMessage.GetRunId(), Sequence: 2, SentUnixNano: time.Now().UnixNano(), Payload: []byte("data")},
+			{RunId: requestMessage.GetRunId(), Sequence: 4, SentUnixNano: time.Now().UnixNano(), Payload: []byte("data")},
+		} {
+			payload, marshalErr := proto.Marshal(message)
+			writeErr := write(protocol.PushMessageCommandID, payload)
+			if marshalErr != nil || writeErr != nil {
+				if marshalErr != nil {
+					serverDone <- marshalErr
+				} else {
+					serverDone <- writeErr
+				}
+				return
+			}
+		}
+		if err := write(protocol.PushMessageCommandID, []byte{0xff}); err != nil {
+			serverDone <- err
+			return
+		}
+		serverDone <- nil
+	}))
+	t.Cleanup(server.Close)
+
+	connection, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial test server: %v", err)
+	}
+	prepared := []preparedConnection{{conn: connection, sequence: 1, name: "alice"}}
+	registry := prometheus.NewRegistry()
+	metrics, err := newLoadMetrics(registry)
+	if err != nil {
+		t.Fatalf("newLoadMetrics: %v", err)
+	}
+	client, err := newPushClient(context.Background(), prepared, metrics, pushWorkloadBroadcast, 4)
+	if err != nil {
+		t.Fatalf("newPushClient: %v", err)
+	}
+	if err := client.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	request := newPushStartRequest("reader-test", pushWorkloadBroadcast, []string{"alice"}, 33*time.Millisecond, time.Second, 4)
+	planned, err := client.startRun(context.Background(), &prepared[0], request, true, time.Second)
+	if err != nil {
+		client.Stop()
+		t.Fatalf("startRun: %v", err)
+	}
+	if planned != 2 {
+		client.Stop()
+		t.Fatalf("planned ticks = %d, want 2", planned)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		stats := client.snapshot()
+		if stats.received == 2 && stats.duplicate == 1 && stats.sequenceGap == 1 && stats.invalid == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			client.Stop()
+			t.Fatalf("push stats = %+v", stats)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	client.Stop()
+	if err := <-serverDone; err != nil {
+		t.Fatalf("test server: %v", err)
+	}
+	if got := gaugeSampleValue(t, registry, "gaming_core_example_load_push_readers"); got != 0 {
+		t.Fatalf("push readers = %v, want 0", got)
+	}
+	if got := pushHistogramSampleCount(t, registry, pushWorkloadBroadcast); got != 4 {
+		t.Fatalf("push delivery duration count = %d, want 4", got)
+	}
+	if got := client.missingAtLeast(4); got != 1 {
+		t.Fatalf("push missing sequence count = %d, want 1", got)
+	}
+}
+
 func TestRunLoadRejectsInvalidEchoRouteBeforeObserver(t *testing.T) {
 	err := runLoad(context.Background(), "", 1, time.Second, 8, ":invalid", time.Second, 1, 0, time.Second, "invalid")
 	if err == nil || !strings.Contains(err.Error(), `echo-route must be "game" or "local"`) {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -18,6 +19,11 @@ const (
 	loadResultSuccess   = "success"
 	loadResultError     = "error"
 	loadResultCancelled = "cancelled"
+
+	pushResultReceived    = "received"
+	pushResultDuplicate   = "duplicate"
+	pushResultSequenceGap = "sequence_gap"
+	pushResultInvalid     = "invalid"
 )
 
 // roundTripDurationBuckets 覆蓋壓測端觀察到的微秒至秒級 round-trip，
@@ -28,12 +34,16 @@ var roundTripDurationBuckets = []float64{
 	0.1, 0.25, 0.5, 1, 2.5, 5, 10,
 }
 
-// loadMetrics 只觀測壓測端看到的 Echo round trip，不與 framework product
-// registry 混用，也不把 connection 或 request identity 放入 labels。
+// loadMetrics 使用壓測端自己的 registry，觀測 Echo round trip 與非同步 push
+// delivery；不與 framework product registry 混用，也不把 connection 或
+// request identity 放入 labels。
 type loadMetrics struct {
 	echoRoundTrips         *prometheus.CounterVec
 	echoRoundTripDuration  *prometheus.HistogramVec
 	echoRoundTripsInFlight prometheus.Gauge
+	pushMessages           *prometheus.CounterVec
+	pushDeliveryDuration   *prometheus.HistogramVec
+	pushReaders            prometheus.Gauge
 }
 
 func newLoadMetrics(registerer prometheus.Registerer) (*loadMetrics, error) {
@@ -54,17 +64,55 @@ func newLoadMetrics(registerer prometheus.Registerer) (*loadMetrics, error) {
 			Name: "gaming_core_example_load_echo_round_trips_in_flight",
 			Help: "Current number of load-client Echo round trips awaiting a terminal result.",
 		}),
+		pushMessages: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gaming_core_example_load_push_messages_total",
+			Help: "Total number of asynchronous push messages observed by terminal result and mode.",
+		}, []string{"mode", "result"}),
+		pushDeliveryDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gaming_core_example_load_push_delivery_duration_seconds",
+			Help:    "End-to-end duration from Game push timestamp to load-client frame read in seconds.",
+			Buckets: roundTripDurationBuckets,
+		}, []string{"mode"}),
+		pushReaders: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "gaming_core_example_load_push_readers",
+			Help: "Current number of load-client WebSocket push reader goroutines.",
+		}),
 	}
 	for _, collector := range []prometheus.Collector{
 		metrics.echoRoundTrips,
 		metrics.echoRoundTripDuration,
 		metrics.echoRoundTripsInFlight,
+		metrics.pushMessages,
+		metrics.pushDeliveryDuration,
+		metrics.pushReaders,
 	} {
 		if err := registerer.Register(collector); err != nil {
 			return nil, fmt.Errorf("register load metrics: %w", err)
 		}
 	}
 	return metrics, nil
+}
+
+func (m *loadMetrics) startPushReader() {
+	if m != nil {
+		m.pushReaders.Inc()
+	}
+}
+
+func (m *loadMetrics) finishPushReader() {
+	if m != nil {
+		m.pushReaders.Dec()
+	}
+}
+
+func (m *loadMetrics) observePush(mode, result string, elapsed time.Duration) {
+	if m == nil {
+		return
+	}
+	m.pushMessages.WithLabelValues(mode, result).Inc()
+	if result != pushResultInvalid && elapsed >= 0 {
+		m.pushDeliveryDuration.WithLabelValues(mode).Observe(elapsed.Seconds())
+	}
 }
 
 func (m *loadMetrics) startEcho() {
@@ -102,7 +150,13 @@ func newLoadObserver(listenAddr string) (*loadObserver, error) {
 	}
 	registry := prometheus.NewRegistry()
 	for _, collector := range []prometheus.Collector{
-		collectors.NewGoCollector(),
+		collectors.NewGoCollector(
+			collectors.WithGoCollectorRuntimeMetrics(
+				collectors.GoRuntimeMetricsRule{
+					Matcher: regexp.MustCompile(`^/sched/latencies:seconds$`),
+				},
+			),
+		),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	} {
 		if err := registry.Register(collector); err != nil {

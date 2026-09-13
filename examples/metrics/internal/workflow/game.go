@@ -12,14 +12,24 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// GameModule 在 Game GateRequestChannel 註冊 Echo 與 room broadcast producer。
+// GameModule 在 Game GateRequestChannel 註冊 Echo、room broadcast producer
+// 與 example push control。
 // Echo 透過 direct request-player contract 回傳；broadcast 則透過
 // BroadcastSender 發送至 Gate。
 func GameModule() framework.Module {
 	return func(r framework.Registry) error {
-		return r.Configure(func(commandDispatcher *dispatcher.Dispatcher, sender serversend.RequestPlayerSender, broadcastSender serversend.BroadcastSender) error {
+		if err := r.Provide(newPushRunner); err != nil {
+			return err
+		}
+		if err := r.AddHook(newPushRunnerHook); err != nil {
+			return err
+		}
+		return r.Configure(func(commandDispatcher *dispatcher.Dispatcher, sender serversend.RequestPlayerSender, broadcastSender serversend.BroadcastSender, runner *pushRunner) error {
 			if broadcastSender == nil {
 				return fmt.Errorf("broadcast sender is required")
+			}
+			if runner == nil {
+				return fmt.Errorf("push runner is required")
 			}
 			if err := commandDispatcher.Register(gameproduct.GateRequestChannel, dispatcher.CommandID(protocol.EchoRequestCommandID), func(ctx context.Context, payload []byte) error {
 				request := new(protocol.EchoRequest)
@@ -40,6 +50,11 @@ func GameModule() framework.Module {
 			}); err != nil {
 				return err
 			}
+			if err := commandDispatcher.Register(gameproduct.GateRequestChannel, dispatcher.CommandID(protocol.StartPushRequestCommandID), func(ctx context.Context, payload []byte) error {
+				return startPushHandler(ctx, payload, runner, sender)
+			}); err != nil {
+				return err
+			}
 			return commandDispatcher.Register(gameproduct.GateRequestChannel, dispatcher.CommandID(protocol.BroadcastRoomCommandID), func(ctx context.Context, payload []byte) error {
 				command := new(protocol.BroadcastRoomCommand)
 				if err := proto.Unmarshal(payload, command); err != nil {
@@ -52,6 +67,28 @@ func GameModule() framework.Module {
 			})
 		})
 	}
+}
+
+func startPushHandler(ctx context.Context, payload []byte, runner *pushRunner, sender serversend.RequestPlayerSender) error {
+	request := new(protocol.StartPushRequest)
+	if err := proto.Unmarshal(payload, request); err != nil {
+		return fmt.Errorf("decode start-push request: %w", err)
+	}
+	planned, err := runner.Submit(ctx, request)
+	if err != nil {
+		return fmt.Errorf("submit push workload: %w", err)
+	}
+	responsePayload, err := proto.Marshal(&protocol.StartPushResponse{RunId: request.GetRunId(), PlannedTicks: planned})
+	if err != nil {
+		return fmt.Errorf("encode start-push response: %w", err)
+	}
+	if _, err := sender.SendToRequestPlayer(ctx, serversend.RequestPlayerMessage{Message: serversend.Message{
+		CommandID: protocol.StartPushResponseCommandID,
+		Payload:   responsePayload,
+	}}); err != nil {
+		return fmt.Errorf("send start-push response: %w", err)
+	}
+	return nil
 }
 
 // BroadcastRoom 封裝範例 Game producer 的最小 room command。outer command

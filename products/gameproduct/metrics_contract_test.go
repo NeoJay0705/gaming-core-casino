@@ -138,6 +138,78 @@ func TestMeasuredRequestPlayerSenderContractRecordsSuccessAndError(t *testing.T)
 	}
 }
 
+func TestMeasuredPlayerAndBroadcastSendersClassifyPartialAndTrackLatency(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	metrics, err := newGameMetrics(registry)
+	if err != nil {
+		t.Fatalf("newGameMetrics() error = %v", err)
+	}
+	partialErr := errors.New("partial delivery")
+	player := &measuredPlayerSender{
+		delegate: &recordingPlayerSender{results: []senderResult{
+			{receipt: serversend.Receipt{AcceptedAt: time.Now()}},
+			{err: partialErr, receipt: serversend.Receipt{AcceptedAt: time.Now()}},
+			{err: errors.New("player failed")},
+		}},
+		metrics: metrics,
+	}
+	for i := 0; i < 3; i++ {
+		_, _ = player.SendToPlayers(context.Background(), []serversend.PlayerMessage{{LoginName: "alice", Message: serversend.Message{CommandID: 1}}})
+	}
+	broadcast := &measuredBroadcastSender{
+		delegate: &recordingBroadcastSender{results: []senderResult{
+			{receipt: serversend.Receipt{AcceptedAt: time.Now()}},
+			{err: partialErr, receipt: serversend.Receipt{AcceptedAt: time.Now()}},
+			{err: errors.New("broadcast failed")},
+		}},
+		metrics: metrics,
+	}
+	for i := 0; i < 3; i++ {
+		_, _ = broadcast.Broadcast(context.Background(), serversend.Message{CommandID: 1})
+	}
+	for _, operation := range []string{serverSendOperationPlayer, serverSendOperationBroadcast} {
+		for _, result := range []string{serverSendResultSuccess, serverSendResultPartial, serverSendResultError} {
+			labels := map[string]string{"operation": operation, "result": result}
+			if got := counterValue(t, registry, "gaming_core_game_server_send_requests_total", labels); got != 1 {
+				t.Fatalf("%s %s count = %v, want 1", operation, result, got)
+			}
+			if got := counterValue(t, registry, "gaming_core_game_server_send_duration_seconds", labels); got != 1 {
+				t.Fatalf("%s %s duration count = %v, want 1", operation, result, got)
+			}
+		}
+		if got := counterValue(t, registry, "gaming_core_game_server_send_in_flight", map[string]string{"operation": operation}); got != 0 {
+			t.Fatalf("%s in-flight = %v, want 0", operation, got)
+		}
+	}
+}
+
+type senderResult struct {
+	receipt serversend.Receipt
+	err     error
+}
+
+type recordingPlayerSender struct {
+	results []senderResult
+	index   int
+}
+
+func (s *recordingPlayerSender) SendToPlayers(context.Context, []serversend.PlayerMessage) (serversend.Receipt, error) {
+	result := s.results[s.index]
+	s.index++
+	return result.receipt, result.err
+}
+
+type recordingBroadcastSender struct {
+	results []senderResult
+	index   int
+}
+
+func (s *recordingBroadcastSender) Broadcast(context.Context, serversend.Message) (serversend.Receipt, error) {
+	result := s.results[s.index]
+	s.index++
+	return result.receipt, result.err
+}
+
 type recordingRequestPlayerSender struct{ err error }
 
 func (s *recordingRequestPlayerSender) SendToRequestPlayer(context.Context, serversend.RequestPlayerMessage) (serversend.Receipt, error) {

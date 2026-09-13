@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package metrics.example.v1;
+
+option go_package = "github.com/NeoJay0705/gaming-core-casino/examples/metrics/internal/protocol;protocol";
+
+// PushMode 是範例 server-send 壓測要驗證的 sender contract 模式。
+enum PushMode {
+  PUSH_MODE_UNSPECIFIED = 0;
+  PUSH_MODE_BROADCAST = 1;
+  PUSH_MODE_PLAYER = 2;
+}
+
+// StartPushRequest 是壓測控制訊息；只用於 examples/metrics，非 framework API。
+message StartPushRequest {
+  string run_id = 1;
+  PushMode mode = 2;
+  string room_id = 3;
+  repeated string login_names = 4;
+  uint64 interval_millis = 5;
+  uint64 duration_millis = 6;
+  uint32 payload_bytes = 7;
+}
+
+// StartPushResponse 確認 Game 已接受 workload，並提供預期 tick 數供 load drain 驗證。
+message StartPushResponse {
+  string run_id = 1;
+  uint64 planned_ticks = 2;
+}
+
+// PushMessage 是送往 client 的 opaque example payload。
+message PushMessage {
+  string run_id = 1;
+  uint64 sequence = 2;
+  int64 sent_unix_nano = 3;
+  bytes payload = 4;
+}

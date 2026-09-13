@@ -63,6 +63,7 @@ func TestGateMetricsContractUsesBoundedLabels(t *testing.T) {
 		"gaming_core_gate_websocket_commands_total",
 		"gaming_core_gate_game_grpc_requests_total",
 		"gaming_core_gate_server_send_requests_total",
+		"gaming_core_gate_server_send_delivery_duration_seconds",
 		"gaming_core_gate_session_ownership_active_leases",
 		"gaming_core_gate_session_ownership_renewals_total",
 		"gaming_core_gate_session_ownership_renewal_batch_duration_seconds",

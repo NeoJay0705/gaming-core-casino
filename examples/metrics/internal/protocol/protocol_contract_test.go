@@ -19,6 +19,9 @@ func TestExampleCommandContractIDsAndDescriptors(t *testing.T) {
 		{name: "LocalEchoRequest", got: LocalEchoRequestCommandID, want: 0xF1000021},
 		{name: "LocalEchoResponse", got: LocalEchoResponseCommandID, want: 0xF1000022},
 		{name: "BroadcastRoom", got: BroadcastRoomCommandID, want: 0xF1000031},
+		{name: "StartPushRequest", got: StartPushRequestCommandID, want: 0xF1000041},
+		{name: "StartPushResponse", got: StartPushResponseCommandID, want: 0xF1000042},
+		{name: "PushMessage", got: PushMessageCommandID, want: 0xF1000043},
 	}
 	seen := make(map[uint32]struct{}, len(ids))
 	for _, item := range ids {
@@ -73,6 +76,60 @@ func TestExampleCommandContractIDsAndDescriptors(t *testing.T) {
 		field := (&BroadcastRoomCommand{}).ProtoReflect().Descriptor().Fields().ByName(name)
 		if field == nil || field.Number() != number {
 			t.Fatalf("BroadcastRoomCommand.%s = %v, want field number %d", name, field, number)
+		}
+	}
+	for name, number := range map[protoreflect.Name]protoreflect.FieldNumber{
+		"run_id":          1,
+		"mode":            2,
+		"room_id":         3,
+		"login_names":     4,
+		"interval_millis": 5,
+		"duration_millis": 6,
+		"payload_bytes":   7,
+	} {
+		field := (&StartPushRequest{}).ProtoReflect().Descriptor().Fields().ByName(name)
+		if field == nil || field.Number() != number {
+			t.Fatalf("StartPushRequest.%s = %v, want field number %d", name, field, number)
+		}
+	}
+	for name, number := range map[protoreflect.Name]protoreflect.FieldNumber{
+		"run_id":        1,
+		"planned_ticks": 2,
+	} {
+		field := (&StartPushResponse{}).ProtoReflect().Descriptor().Fields().ByName(name)
+		if field == nil || field.Number() != number {
+			t.Fatalf("StartPushResponse.%s = %v, want field number %d", name, field, number)
+		}
+	}
+	for name, number := range map[protoreflect.Name]protoreflect.FieldNumber{
+		"run_id":         1,
+		"sequence":       2,
+		"sent_unix_nano": 3,
+		"payload":        4,
+	} {
+		field := (&PushMessage{}).ProtoReflect().Descriptor().Fields().ByName(name)
+		if field == nil || field.Number() != number {
+			t.Fatalf("PushMessage.%s = %v, want field number %d", name, field, number)
+		}
+	}
+	if got := (&StartPushRequest{}).ProtoReflect().Descriptor().FullName(); got != "metrics.example.v1.StartPushRequest" {
+		t.Fatalf("StartPushRequest full name = %q", got)
+	}
+	if got := (&StartPushResponse{}).ProtoReflect().Descriptor().FullName(); got != "metrics.example.v1.StartPushResponse" {
+		t.Fatalf("StartPushResponse full name = %q", got)
+	}
+	if got := (&PushMessage{}).ProtoReflect().Descriptor().FullName(); got != "metrics.example.v1.PushMessage" {
+		t.Fatalf("PushMessage full name = %q", got)
+	}
+	pushModes := (&StartPushRequest{}).ProtoReflect().Descriptor().Fields().ByName("mode").Enum().Values()
+	for name, want := range map[protoreflect.Name]protoreflect.EnumNumber{
+		"PUSH_MODE_UNSPECIFIED": 0,
+		"PUSH_MODE_BROADCAST":   1,
+		"PUSH_MODE_PLAYER":      2,
+	} {
+		value := pushModes.ByName(name)
+		if value == nil || value.Number() != want {
+			t.Fatalf("PushMode.%s = %v, want %d", name, value, want)
 		}
 	}
 }

@@ -48,6 +48,33 @@ func TestLoadMetricsRecordsTerminalResultsAndReturnsInFlightToZero(t *testing.T)
 	}
 }
 
+func TestLoadMetricsRecordsPushOutcomesAndReaderGauge(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	metrics, err := newLoadMetrics(registry)
+	if err != nil {
+		t.Fatalf("newLoadMetrics() error = %v", err)
+	}
+	metrics.startPushReader()
+	metrics.startPushReader()
+	metrics.observePush(pushWorkloadBroadcast, pushResultReceived, time.Millisecond)
+	metrics.observePush(pushWorkloadBroadcast, pushResultDuplicate, time.Millisecond)
+	metrics.observePush(pushWorkloadBroadcast, pushResultSequenceGap, time.Millisecond)
+	metrics.observePush(pushWorkloadBroadcast, pushResultInvalid, 0)
+	metrics.finishPushReader()
+	metrics.finishPushReader()
+	for _, result := range []string{pushResultReceived, pushResultDuplicate, pushResultSequenceGap, pushResultInvalid} {
+		if got := pushCounterSampleValue(t, registry, pushWorkloadBroadcast, result); got != 1 {
+			t.Fatalf("push result=%q = %v, want 1", result, got)
+		}
+	}
+	if got := pushHistogramSampleCount(t, registry, pushWorkloadBroadcast); got != 3 {
+		t.Fatalf("push delivery duration count = %d, want 3 valid frames", got)
+	}
+	if got := gaugeSampleValue(t, registry, "gaming_core_example_load_push_readers"); got != 0 {
+		t.Fatalf("push readers = %v, want 0", got)
+	}
+}
+
 func TestEchoRoundTripRecordsClientMetrics(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	serverResult := make(chan error, 1)
@@ -148,6 +175,9 @@ func TestLoadObserverExposesOnlyMetricsAndShutsDown(t *testing.T) {
 	if !strings.Contains(string(body), "go_sched_gomaxprocs_threads ") {
 		t.Fatalf("GET /metrics body does not contain GOMAXPROCS metrics:\n%s", body)
 	}
+	if !strings.Contains(string(body), "# TYPE go_sched_latencies_seconds histogram") {
+		t.Fatalf("GET /metrics body does not contain scheduler latency histogram:\n%s", body)
+	}
 	if runtime.GOOS == "linux" || runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
 		if !strings.Contains(string(body), "process_cpu_seconds_total ") {
 			t.Fatalf("GET /metrics body does not contain process metrics:\n%s", body)
@@ -208,4 +238,36 @@ func metricLabel(metric *dto.Metric, name string) string {
 		}
 	}
 	return ""
+}
+
+func pushCounterSampleValue(t *testing.T, gatherer prometheus.Gatherer, mode, result string) float64 {
+	t.Helper()
+	metric := pushMetricSample(t, gatherer, "gaming_core_example_load_push_messages_total", mode, result)
+	return metric.GetCounter().GetValue()
+}
+
+func pushHistogramSampleCount(t *testing.T, gatherer prometheus.Gatherer, mode string) uint64 {
+	t.Helper()
+	metric := pushMetricSample(t, gatherer, "gaming_core_example_load_push_delivery_duration_seconds", mode, "")
+	return metric.GetHistogram().GetSampleCount()
+}
+
+func pushMetricSample(t *testing.T, gatherer prometheus.Gatherer, name, mode, result string) *dto.Metric {
+	t.Helper()
+	families, err := gatherer.Gather()
+	if err != nil {
+		t.Fatalf("Gather() error = %v", err)
+	}
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			if metricLabel(metric, "mode") == mode && (result == "" || metricLabel(metric, "result") == result) {
+				return metric
+			}
+		}
+	}
+	t.Fatalf("metric %q mode=%q result=%q not found", name, mode, result)
+	return nil
 }

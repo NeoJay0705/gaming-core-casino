@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/NeoJay0705/gaming-core-casino/examples/metrics/internal/protocol"
+	"github.com/NeoJay0705/gaming-core-casino/internal/profilehttp"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gateproto"
 	"github.com/NeoJay0705/gaming-core-casino/products/gateproduct"
 	"github.com/gorilla/websocket"
@@ -31,6 +32,8 @@ const (
 	defaultSetupConcurrency = 32
 	defaultWarmupRequests   = 1
 	defaultRequestTimeout   = 10 * time.Second
+	defaultPushWarmup       = 5 * time.Second
+	defaultPushDrain        = 10 * time.Second
 )
 
 type echoRoute string
@@ -75,20 +78,46 @@ func main() {
 	gateURL := flag.String("gate-url", "ws://127.0.0.1:18080/ws", "Gate WebSocket URL")
 	connections := flag.Int("connections", 1, "number of closed-loop WebSocket connections")
 	duration := flag.Duration("duration", 30*time.Second, "load duration")
-	payloadBytes := flag.Int("payload-bytes", 32, "Echo payload size, bounded to 1 MiB")
+	payloadBytes := flag.Int("payload-bytes", 32, "application payload size, bounded to the shared 1 MiB packet limit")
+	workload := flag.String("workload", "echo", "workload: echo, broadcast, or player")
+	pushInterval := flag.Duration("push-interval", 33*time.Millisecond, "push interval: 33ms or 16ms")
+	pushWarmup := flag.Duration("push-warmup-duration", defaultPushWarmup, "push warm-up duration")
+	drainTimeout := flag.Duration("drain-timeout", defaultPushDrain, "maximum push drain duration")
+	orchestrationDir := flag.String("orchestration-dir", "", "example-only push validation orchestration directory")
+	pprofAddr := flag.String("pprof-addr", "", "optional loopback pprof listen address")
 	echoRouteValue := flag.String("echo-route", string(echoRouteGame), "Echo route: game or local")
 	metricsAddr := flag.String("metrics-addr", "127.0.0.1:22081", "load metrics listen address")
 	setupTimeout := flag.Duration("setup-timeout", defaultSetupTimeout, "timeout for WebSocket setup and warm-up")
 	setupConcurrency := flag.Int("setup-concurrency", defaultSetupConcurrency, "maximum concurrent WebSocket setup operations")
 	warmupRequests := flag.Int("warmup-requests", defaultWarmupRequests, "Echo requests per connection before measurement")
-	requestTimeout := flag.Duration("request-timeout", defaultRequestTimeout, "timeout for one Login, EnterRoom, or Echo round trip")
+	requestTimeout := flag.Duration("request-timeout", defaultRequestTimeout, "timeout for one Login, EnterRoom, Echo, or push control round trip")
 	flag.Parse()
 	if *connections <= 0 || *duration <= 0 || *payloadBytes < 0 || *payloadBytes > maxPayloadBytes || *setupTimeout <= 0 || *setupConcurrency <= 0 || *warmupRequests < 0 || *requestTimeout <= 0 {
 		log.Fatalf("connections, duration, setup-timeout, setup-concurrency, and request-timeout must be positive; warmup-requests must not be negative; payload-bytes must be between 0 and %d", maxPayloadBytes)
 	}
+	if !strings.EqualFold(strings.TrimSpace(*workload), "echo") && (*pushWarmup <= 0 || *drainTimeout <= 0) {
+		log.Fatalf("push-warmup-duration and drain-timeout must be positive")
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := runLoad(ctx, *gateURL, *connections, *duration, *payloadBytes, *metricsAddr, *setupTimeout, *setupConcurrency, *warmupRequests, *requestTimeout, *echoRouteValue); err != nil && ctx.Err() == nil {
+	profileServer, profileErr := profilehttp.Start(*pprofAddr)
+	if profileErr != nil {
+		log.Fatal(profileErr)
+	}
+	defer func() {
+		shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
+		defer shutdownCancel()
+		if shutdownErr := profileServer.Shutdown(shutdownContext); shutdownErr != nil {
+			log.Printf("stop pprof server: %v", shutdownErr)
+		}
+	}()
+	var err error
+	if strings.EqualFold(strings.TrimSpace(*workload), "echo") {
+		err = runLoad(ctx, *gateURL, *connections, *duration, *payloadBytes, *metricsAddr, *setupTimeout, *setupConcurrency, *warmupRequests, *requestTimeout, *echoRouteValue)
+	} else {
+		err = runPushLoad(ctx, *gateURL, *workload, *connections, *duration, *payloadBytes, *metricsAddr, *setupTimeout, *setupConcurrency, *pushWarmup, *drainTimeout, *pushInterval, *requestTimeout, *orchestrationDir)
+	}
+	if err != nil && ctx.Err() == nil {
 		log.Fatal(err)
 	}
 }

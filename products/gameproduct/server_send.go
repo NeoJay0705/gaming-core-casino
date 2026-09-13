@@ -126,16 +126,21 @@ type gamePlayerSenderInputs struct {
 	Fallback  *serversend.DNSGateDirectory
 	Config    gameFanoutConfig
 	Transport *serversend.GRPCTransport
+	Metrics   *gameMetrics
 }
 
 func newGamePlayerSender(inputs gamePlayerSenderInputs) (serversend.PlayerSender, error) {
-	return serversend.NewBatchPlayerSender(
+	sender, err := serversend.NewBatchPlayerSender(
 		inputs.Presence,
 		inputs.Directory,
 		inputs.Fallback,
 		inputs.Transport,
 		serversend.FanoutConfig{MaxEndpoints: inputs.Config.MaxEndpoints},
 	)
+	if err != nil {
+		return nil, err
+	}
+	return &measuredPlayerSender{delegate: sender, metrics: inputs.Metrics}, nil
 }
 
 func newGameRedisBroadcastSender(redisClient *redis.Client, keys serversend.Keyspace) (*serversend.RedisBroadcastSender, error) {
@@ -145,9 +150,10 @@ func newGameRedisBroadcastSender(redisClient *redis.Client, keys serversend.Keys
 type gameBroadcastSenderInputs struct {
 	dig.In
 
-	Config gameServerSendBroadcastConfig
-	Redis  *serversend.RedisBroadcastSender `optional:"true"`
-	Fanout *serversend.FanoutSender         `optional:"true"`
+	Config  gameServerSendBroadcastConfig
+	Redis   *serversend.RedisBroadcastSender `optional:"true"`
+	Fanout  *serversend.FanoutSender         `optional:"true"`
+	Metrics *gameMetrics
 }
 
 func newGameBroadcastSender(inputs gameBroadcastSenderInputs) (serversend.BroadcastSender, error) {
@@ -159,12 +165,16 @@ func newGameBroadcastSender(inputs gameBroadcastSenderInputs) (serversend.Broadc
 		if inputs.Fanout == nil {
 			return nil, fmt.Errorf("game broadcast: gRPC fan-out sender is not configured")
 		}
-		return serversend.NewFallbackBroadcastSender(inputs.Redis, inputs.Fanout)
+		sender, err := serversend.NewFallbackBroadcastSender(inputs.Redis, inputs.Fanout)
+		if err != nil {
+			return nil, err
+		}
+		return &measuredBroadcastSender{delegate: sender, metrics: inputs.Metrics}, nil
 	case "grpc":
 		if inputs.Fanout == nil {
 			return nil, fmt.Errorf("game broadcast: gRPC fan-out sender is not configured")
 		}
-		return inputs.Fanout, nil
+		return &measuredBroadcastSender{delegate: inputs.Fanout, metrics: inputs.Metrics}, nil
 	default:
 		return nil, fmt.Errorf("game broadcast: unsupported primary %q", inputs.Config.Primary)
 	}
