@@ -23,12 +23,18 @@ func TestNewValidatesListenAddress(t *testing.T) {
 			}
 		})
 	}
-	server, err := New(Config{ListenAddr: " 127.0.0.1:0 ", MaxConcurrentStreams: 7})
+	server, err := New(Config{ListenAddr: " 127.0.0.1:0 ", MaxConcurrentStreams: 7, WriteBufferSizeBytes: 64 * 1024})
 	if err != nil {
 		t.Fatalf("New(valid) error = %v", err)
 	}
-	if server.cfg.ListenAddr != "127.0.0.1:0" || server.cfg.MaxConcurrentStreams != 7 {
+	if server.cfg.ListenAddr != "127.0.0.1:0" || server.cfg.MaxConcurrentStreams != 7 || server.cfg.WriteBufferSizeBytes != 64*1024 {
 		t.Fatalf("normalized config = %#v", server.cfg)
+	}
+}
+
+func TestNewRejectsNegativeWriteBufferSize(t *testing.T) {
+	if _, err := New(Config{ListenAddr: "127.0.0.1:0", WriteBufferSizeBytes: -1}); err == nil {
+		t.Fatal("New(negative write buffer) error = nil")
 	}
 }
 

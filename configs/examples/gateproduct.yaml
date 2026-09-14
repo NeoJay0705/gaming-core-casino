@@ -32,6 +32,8 @@ grpc:
       # dns_refresh_interval: "10s"
       # 非必要：每個 resolved Game endpoint 的 HTTP/2 connection 數；預設 1。
       # connections_per_host: 1
+      # 非必要：每條 Gate → Game gRPC connection 的 write buffer bytes；0 保留 grpc-go default。
+      # write_buffer_size_bytes: 0
     gate:
       # 非必要：Gate-to-Gate fan-out RPC timeout；預設 3s。
       # timeout: "3s"

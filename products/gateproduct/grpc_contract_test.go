@@ -114,17 +114,18 @@ func TestGateProductRejectsUnknownServerSendFields(t *testing.T) {
 
 func TestGateGameGRPCConfigMapsAffinityTopologyOptions(t *testing.T) {
 	want := gateGRPCClientConfig{
-		Target:             "dns:///game-headless:9090",
-		Timeout:            2 * time.Second,
-		DNSRefreshInterval: 7 * time.Second,
-		ConnectionsPerHost: 3,
+		Target:               "dns:///game-headless:9090",
+		Timeout:              2 * time.Second,
+		DNSRefreshInterval:   7 * time.Second,
+		ConnectionsPerHost:   3,
+		WriteBufferSizeBytes: 64 * 1024,
 	}
 	got, err := gateGameGRPCConfig(gateGameClientSnapshot{config: want})
 	if err != nil {
 		t.Fatalf("gateGameGRPCConfig() error = %v", err)
 	}
-	if got.Target != want.Target || got.Timeout != want.Timeout || got.DNSRefreshInterval != want.DNSRefreshInterval || got.ConnectionsPerHost != want.ConnectionsPerHost {
-		t.Fatalf("mapped config = %#v, want target=%q timeout=%s refresh=%s connections=%d", got, want.Target, want.Timeout, want.DNSRefreshInterval, want.ConnectionsPerHost)
+	if got.Target != want.Target || got.Timeout != want.Timeout || got.DNSRefreshInterval != want.DNSRefreshInterval || got.ConnectionsPerHost != want.ConnectionsPerHost || got.WriteBufferSizeBytes != want.WriteBufferSizeBytes {
+		t.Fatalf("mapped config = %#v, want target=%q timeout=%s refresh=%s connections=%d write_buffer=%d", got, want.Target, want.Timeout, want.DNSRefreshInterval, want.ConnectionsPerHost, want.WriteBufferSizeBytes)
 	}
 }
 
@@ -136,6 +137,7 @@ func TestGateGameGRPCConfigRejectsNegativeTopologyOptions(t *testing.T) {
 	}{
 		{name: "refresh", cfg: gateGRPCClientConfig{Target: "127.0.0.1:9090", DNSRefreshInterval: -time.Second}, want: "dns_refresh_interval"},
 		{name: "connections", cfg: gateGRPCClientConfig{Target: "127.0.0.1:9090", ConnectionsPerHost: -1}, want: "connections_per_host"},
+		{name: "write buffer", cfg: gateGRPCClientConfig{Target: "127.0.0.1:9090", WriteBufferSizeBytes: -1}, want: "write_buffer_size_bytes"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if _, err := gateGameGRPCConfig(gateGameClientSnapshot{config: test.cfg}); err == nil || !strings.Contains(err.Error(), test.want) {

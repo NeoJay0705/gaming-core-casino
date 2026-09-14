@@ -83,7 +83,7 @@ func main() {
 	pushInterval := flag.Duration("push-interval", 33*time.Millisecond, "push interval: 33ms or 16ms")
 	pushWarmup := flag.Duration("push-warmup-duration", defaultPushWarmup, "push warm-up duration")
 	drainTimeout := flag.Duration("drain-timeout", defaultPushDrain, "maximum push drain duration")
-	orchestrationDir := flag.String("orchestration-dir", "", "example-only push validation orchestration directory")
+	orchestrationDir := flag.String("orchestration-dir", "", "example-only Echo/push validation orchestration directory")
 	pprofAddr := flag.String("pprof-addr", "", "optional loopback pprof listen address")
 	echoRouteValue := flag.String("echo-route", string(echoRouteGame), "Echo route: game or local")
 	metricsAddr := flag.String("metrics-addr", "127.0.0.1:22081", "load metrics listen address")
@@ -113,7 +113,7 @@ func main() {
 	}()
 	var err error
 	if strings.EqualFold(strings.TrimSpace(*workload), "echo") {
-		err = runLoad(ctx, *gateURL, *connections, *duration, *payloadBytes, *metricsAddr, *setupTimeout, *setupConcurrency, *warmupRequests, *requestTimeout, *echoRouteValue)
+		err = runLoadWithOrchestration(ctx, *gateURL, *connections, *duration, *payloadBytes, *metricsAddr, *setupTimeout, *setupConcurrency, *warmupRequests, *requestTimeout, *echoRouteValue, *orchestrationDir)
 	} else {
 		err = runPushLoad(ctx, *gateURL, *workload, *connections, *duration, *payloadBytes, *metricsAddr, *setupTimeout, *setupConcurrency, *pushWarmup, *drainTimeout, *pushInterval, *requestTimeout, *orchestrationDir)
 	}
@@ -123,6 +123,10 @@ func main() {
 }
 
 func runLoad(ctx context.Context, gateURL string, connectionCount int, duration time.Duration, payloadBytes int, metricsAddr string, setupTimeout time.Duration, setupConcurrency int, warmupRequests int, requestTimeout time.Duration, echoRouteValue string) error {
+	return runLoadWithOrchestration(ctx, gateURL, connectionCount, duration, payloadBytes, metricsAddr, setupTimeout, setupConcurrency, warmupRequests, requestTimeout, echoRouteValue, "")
+}
+
+func runLoadWithOrchestration(ctx context.Context, gateURL string, connectionCount int, duration time.Duration, payloadBytes int, metricsAddr string, setupTimeout time.Duration, setupConcurrency int, warmupRequests int, requestTimeout time.Duration, echoRouteValue, orchestrationDir string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -136,6 +140,11 @@ func runLoad(ctx context.Context, gateURL string, connectionCount int, duration 
 	observer, err := newLoadObserver(metricsAddr)
 	if err != nil {
 		return fmt.Errorf("start load metrics observer: %w", err)
+	}
+	orchestration, err := newEchoOrchestration(orchestrationDir)
+	if err != nil {
+		_ = observer.Shutdown(context.Background())
+		return err
 	}
 	prepared := make([]preparedConnection, 0, connectionCount)
 	defer func() {
@@ -165,6 +174,12 @@ func runLoad(ctx context.Context, gateURL string, connectionCount int, duration 
 		return fmt.Errorf("warm up connections: %w", err)
 	}
 	setupDuration := time.Since(setupStartedAt)
+	if err := orchestration.writeReady(connectionCount, warmupRequests); err != nil {
+		return fmt.Errorf("write Echo orchestration ready marker: %w", err)
+	}
+	if err := orchestration.waitForStart(ctx, setupTimeout); err != nil {
+		return fmt.Errorf("wait for Echo orchestration start: %w", err)
+	}
 
 	var (
 		measurementStart time.Time
@@ -195,7 +210,18 @@ func runLoad(ctx context.Context, gateURL string, connectionCount int, duration 
 	close(startMeasured)
 	wg.Wait()
 	measurementEnd := time.Now()
-	log.Printf("load complete: echo_route=%s connections=%d prepared=%d setup_duration=%s warmup_requests=%d successful_echo_requests=%d connection_failures=%d measurement_start=%s admission_end=%s measurement_end=%s measured_duration=%s", echo.route, connectionCount, len(prepared), setupDuration.Round(time.Millisecond), warmupRequests, successfulRequests.Load(), connectionFailures.Load(), measurementStart.Format(time.RFC3339Nano), admissionEnd.Format(time.RFC3339Nano), measurementEnd.Format(time.RFC3339Nano), measurementEnd.Sub(measurementStart).Round(time.Millisecond))
+	preparedCount := len(prepared)
+	if orchestration != nil {
+		closePreparedConnections(prepared)
+		prepared = nil
+		if err := orchestration.writeMeasured(measurementStart, admissionEnd, measurementEnd, successfulRequests.Load(), connectionFailures.Load()); err != nil {
+			return fmt.Errorf("write Echo orchestration measured marker: %w", err)
+		}
+		if err := orchestration.waitForFinalScraped(ctx, setupTimeout); err != nil {
+			return fmt.Errorf("wait for Echo orchestration final scrape: %w", err)
+		}
+	}
+	log.Printf("load complete: echo_route=%s connections=%d prepared=%d setup_duration=%s warmup_requests=%d successful_echo_requests=%d connection_failures=%d measurement_start=%s admission_end=%s measurement_end=%s measured_duration=%s", echo.route, connectionCount, preparedCount, setupDuration.Round(time.Millisecond), warmupRequests, successfulRequests.Load(), connectionFailures.Load(), measurementStart.Format(time.RFC3339Nano), admissionEnd.Format(time.RFC3339Nano), measurementEnd.Format(time.RFC3339Nano), measurementEnd.Sub(measurementStart).Round(time.Millisecond))
 	return nil
 }
 

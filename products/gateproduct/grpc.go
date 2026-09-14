@@ -19,10 +19,11 @@ import (
 const WebSocketChannel dispatcher.Channel = "gate-websocket"
 
 type gateGRPCClientConfig struct {
-	Target             string        `config:"target" yaml:"target"`
-	Timeout            time.Duration `config:"timeout" yaml:"timeout"`
-	DNSRefreshInterval time.Duration `config:"dns_refresh_interval" yaml:"dns_refresh_interval"`
-	ConnectionsPerHost int           `config:"connections_per_host" yaml:"connections_per_host"`
+	Target               string        `config:"target" yaml:"target"`
+	Timeout              time.Duration `config:"timeout" yaml:"timeout"`
+	DNSRefreshInterval   time.Duration `config:"dns_refresh_interval" yaml:"dns_refresh_interval"`
+	ConnectionsPerHost   int           `config:"connections_per_host" yaml:"connections_per_host"`
+	WriteBufferSizeBytes int           `config:"write_buffer_size_bytes" yaml:"write_buffer_size_bytes"`
 }
 
 // gateDeliveryGRPCClientConfig describes Gate-to-Gate fan-out topology. The
@@ -148,11 +149,15 @@ func gateGameGRPCConfig(snapshot config.SourceSnapshot) (gatelink.ClientConfig, 
 	if cfg.ConnectionsPerHost < 0 {
 		return gatelink.ClientConfig{}, fmt.Errorf("gate gRPC: grpc.clients.game.connections_per_host must not be negative")
 	}
+	if cfg.WriteBufferSizeBytes < 0 {
+		return gatelink.ClientConfig{}, fmt.Errorf("gate gRPC: grpc.clients.game.write_buffer_size_bytes must not be negative")
+	}
 	return gatelink.ClientConfig{
-		Target:             cfg.Target,
-		Timeout:            cfg.Timeout,
-		DNSRefreshInterval: cfg.DNSRefreshInterval,
-		ConnectionsPerHost: cfg.ConnectionsPerHost,
+		Target:               cfg.Target,
+		Timeout:              cfg.Timeout,
+		DNSRefreshInterval:   cfg.DNSRefreshInterval,
+		ConnectionsPerHost:   cfg.ConnectionsPerHost,
+		WriteBufferSizeBytes: cfg.WriteBufferSizeBytes,
 	}, nil
 }
 

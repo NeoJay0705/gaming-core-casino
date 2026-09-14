@@ -49,6 +49,9 @@ type ClientConfig struct {
 	// ConnectionsPerHost 是每個 resolved Game endpoint 建立的獨立 HTTP/2
 	// transport 數量；zero 使用 DefaultConnectionsPerHost。
 	ConnectionsPerHost int `config:"connections_per_host" yaml:"connections_per_host"`
+	// WriteBufferSizeBytes 為每條 gRPC client transport 的 write buffer size；
+	// zero 不傳入 option，保留 grpc-go default。
+	WriteBufferSizeBytes int `config:"write_buffer_size_bytes" yaml:"write_buffer_size_bytes"`
 }
 
 // Client 將 opaque Gate packet 轉送至 Game，並擁有 resolver lifecycle、immutable
@@ -97,6 +100,9 @@ func newClient(cfg ClientConfig, logger *logging.Logger, resolver hostResolver) 
 	}
 	if cfg.ConnectionsPerHost < 0 {
 		return nil, errors.New("gatelink: connections_per_host must not be negative")
+	}
+	if cfg.WriteBufferSizeBytes < 0 {
+		return nil, errors.New("gatelink: write_buffer_size_bytes must not be negative")
 	}
 	target, err := parseClientTarget(cfg.Target)
 	if err != nil {
@@ -237,11 +243,14 @@ func (c *Client) reconcile(ctx context.Context, addresses []string) (reconcileRe
 func (c *Client) newEndpointPool(address string) (*endpointPool, error) {
 	endpoint := &endpointPool{address: address, conns: make([]*clientConnection, 0, c.cfg.ConnectionsPerHost)}
 	for index := 0; index < c.cfg.ConnectionsPerHost; index++ {
-		conn, err := grpc.NewClient(
-			"passthrough:///"+address,
+		dialOptions := []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 			grpc.WithChainUnaryInterceptor(logging.UnaryClientInterceptor(), outgoingRequestContextInterceptor),
-		)
+		}
+		if c.cfg.WriteBufferSizeBytes > 0 {
+			dialOptions = append(dialOptions, grpc.WithWriteBufferSize(c.cfg.WriteBufferSizeBytes))
+		}
+		conn, err := grpc.NewClient("passthrough:///"+address, dialOptions...)
 		if err != nil {
 			_ = closeEndpointPool(endpoint)
 			return nil, fmt.Errorf("gatelink: create connection for endpoint %q: %w", address, err)

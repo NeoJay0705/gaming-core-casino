@@ -11,6 +11,8 @@ grpc:
     listen_addr: ":9090"
     # 非必要：每條 HTTP/2 connection 的 concurrent streams；0 使用 grpc-go default，預設 0。
     # max_concurrent_streams: 0
+    # 非必要：每條 Game gRPC connection 的 write buffer bytes；0 保留 grpc-go default。
+    # write_buffer_size_bytes: 0
 
   # Game 透過 Redis presence／endpoint directory 找到指定 Gate；此 client
   # 只設定每次 delivery 的 timeout，不設定固定 target。

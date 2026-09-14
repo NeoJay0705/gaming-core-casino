@@ -259,6 +259,19 @@ func TestContractRequiresClientTarget(t *testing.T) {
 	}
 }
 
+func TestContractClientWriteBufferSizeValidation(t *testing.T) {
+	client, err := NewClient(ClientConfig{Target: "127.0.0.1:9090", WriteBufferSizeBytes: 64 * 1024})
+	if err != nil {
+		t.Fatalf("positive write buffer error = %v", err)
+	}
+	if client.cfg.WriteBufferSizeBytes != 64*1024 {
+		t.Fatalf("write buffer size = %d, want %d", client.cfg.WriteBufferSizeBytes, 64*1024)
+	}
+	if _, err := NewClient(ClientConfig{Target: "127.0.0.1:9090", WriteBufferSizeBytes: -1}); err == nil || !strings.Contains(err.Error(), "write_buffer_size_bytes") {
+		t.Fatalf("negative write buffer error = %v, want validation error", err)
+	}
+}
+
 func TestContractDefaultsForwardTimeout(t *testing.T) {
 	client, err := NewClient(ClientConfig{Target: "dns:///gameproduct:9090"})
 	if err != nil {

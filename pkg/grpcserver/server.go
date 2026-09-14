@@ -26,6 +26,9 @@ type Config struct {
 	// MaxConcurrentStreams 為正值時限制每條 gRPC transport 的並行 stream；
 	// 0 保留 grpc-go default。
 	MaxConcurrentStreams uint32 `config:"max_concurrent_streams" yaml:"max_concurrent_streams"`
+	// WriteBufferSizeBytes 為正值時設定每條 gRPC transport 的 write buffer；
+	// 0 不傳入 option，保留 grpc-go default。
+	WriteBufferSizeBytes int `config:"write_buffer_size_bytes" yaml:"write_buffer_size_bytes"`
 }
 
 // Server owns one listener and one grpc.Server. Services must be registered
@@ -65,9 +68,15 @@ func newServer(cfg Config, logger *logging.Logger) (*Server, error) {
 	if _, err := net.ResolveTCPAddr("tcp", cfg.ListenAddr); err != nil {
 		return nil, fmt.Errorf("grpc server: invalid listen address %q: %w", cfg.ListenAddr, err)
 	}
-	serverOptions := make([]grpc.ServerOption, 0, 2)
+	if cfg.WriteBufferSizeBytes < 0 {
+		return nil, errors.New("grpc server: write_buffer_size_bytes must not be negative")
+	}
+	serverOptions := make([]grpc.ServerOption, 0, 3)
 	if cfg.MaxConcurrentStreams > 0 {
 		serverOptions = append(serverOptions, grpc.MaxConcurrentStreams(cfg.MaxConcurrentStreams))
+	}
+	if cfg.WriteBufferSizeBytes > 0 {
+		serverOptions = append(serverOptions, grpc.WriteBufferSize(cfg.WriteBufferSizeBytes))
 	}
 	serverOptions = append(serverOptions, grpc.ChainUnaryInterceptor(
 		logging.UnaryServerInterceptor(),
