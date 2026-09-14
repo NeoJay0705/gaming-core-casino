@@ -28,6 +28,19 @@ type gameMetrics struct {
 	serverSendRequests *prometheus.CounterVec
 	serverSendDuration *prometheus.HistogramVec
 	serverSendInFlight *prometheus.GaugeVec
+
+	asyncQueueMessages       *prometheus.GaugeVec
+	asyncQueueBytes          *prometheus.GaugeVec
+	asyncQueueCapacityMsgs   *prometheus.GaugeVec
+	asyncQueueCapacityBytes  *prometheus.GaugeVec
+	asyncQueueRejected       *prometheus.CounterVec
+	asyncQueueWait           *prometheus.HistogramVec
+	asyncWorkerDuration      *prometheus.HistogramVec
+	asyncPlayerBatchMessages prometheus.Histogram
+	asyncPlayerBatchBytes    prometheus.Histogram
+	asyncDependencyDuration  *prometheus.HistogramVec
+	asyncFallback            *prometheus.CounterVec
+	asyncDiscarded           *prometheus.CounterVec
 }
 
 const (
@@ -77,6 +90,59 @@ func newGameMetrics(registerer prometheus.Registerer) (*gameMetrics, error) {
 			Name: "gaming_core_game_server_send_in_flight",
 			Help: "Current number of Game server-send API calls in flight by operation.",
 		}, []string{"operation"}),
+		asyncQueueMessages: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "gaming_core_game_server_send_queue_messages",
+			Help: "Current queued Game server-send messages or Broadcast commands.",
+		}, []string{"operation"}),
+		asyncQueueBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "gaming_core_game_server_send_queue_bytes",
+			Help: "Current deterministic encoded bytes queued for Game server-send.",
+		}, []string{"operation"}),
+		asyncQueueCapacityMsgs: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "gaming_core_game_server_send_queue_capacity_messages",
+			Help: "Configured Game server-send queue message capacity.",
+		}, []string{"operation"}),
+		asyncQueueCapacityBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "gaming_core_game_server_send_queue_capacity_bytes",
+			Help: "Configured Game server-send queue byte capacity.",
+		}, []string{"operation"}),
+		asyncQueueRejected: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gaming_core_game_server_send_queue_rejected_total",
+			Help: "Total rejected Game server-send queue admissions.",
+		}, []string{"operation", "reason"}),
+		asyncQueueWait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gaming_core_game_server_send_queue_wait_duration_seconds",
+			Help:    "Time from Game server-send admission until worker processing starts.",
+			Buckets: handlerDurationBuckets,
+		}, []string{"operation"}),
+		asyncWorkerDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gaming_core_game_server_send_worker_duration_seconds",
+			Help:    "Background Game server-send worker duration.",
+			Buckets: handlerDurationBuckets,
+		}, []string{"operation", "result"}),
+		asyncPlayerBatchMessages: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "gaming_core_game_server_send_player_batch_messages",
+			Help:    "Number of Player messages in each Game worker batch.",
+			Buckets: []float64{1, 4, 16, 32, 64, 128, 256, 512, 1000, 5000, 10000},
+		}),
+		asyncPlayerBatchBytes: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "gaming_core_game_server_send_player_batch_bytes",
+			Help:    "Deterministic bytes in each Game Player worker batch.",
+			Buckets: []float64{1024, 16 * 1024, 64 * 1024, 256 * 1024, 1 << 20, 4 << 20, 8 << 20},
+		}),
+		asyncDependencyDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gaming_core_game_server_send_dependency_duration_seconds",
+			Help:    "Game server-send dependency duration by bounded dependency and result.",
+			Buckets: handlerDurationBuckets,
+		}, []string{"operation", "dependency", "result"}),
+		asyncFallback: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gaming_core_game_server_send_fallback_total",
+			Help: "Total Game server-send fallback activations.",
+		}, []string{"operation", "reason"}),
+		asyncDiscarded: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gaming_core_game_server_send_discarded_total",
+			Help: "Total Game server-send messages discarded during shutdown.",
+		}, []string{"operation", "reason"}),
 	}
 	for _, collector := range []prometheus.Collector{
 		m.gateCommands,
@@ -85,6 +151,18 @@ func newGameMetrics(registerer prometheus.Registerer) (*gameMetrics, error) {
 		m.serverSendRequests,
 		m.serverSendDuration,
 		m.serverSendInFlight,
+		m.asyncQueueMessages,
+		m.asyncQueueBytes,
+		m.asyncQueueCapacityMsgs,
+		m.asyncQueueCapacityBytes,
+		m.asyncQueueRejected,
+		m.asyncQueueWait,
+		m.asyncWorkerDuration,
+		m.asyncPlayerBatchMessages,
+		m.asyncPlayerBatchBytes,
+		m.asyncDependencyDuration,
+		m.asyncFallback,
+		m.asyncDiscarded,
 	} {
 		if err := registerer.Register(collector); err != nil {
 			return nil, err
@@ -183,3 +261,117 @@ func (s *measuredBroadcastSender) Broadcast(ctx context.Context, message servers
 	}
 	return receipt, err
 }
+
+func gameAsyncOperation(operation string) (string, bool) {
+	switch operation {
+	case serverSendOperationPlayer, serverSendOperationBroadcast:
+		return operation, true
+	default:
+		return "", false
+	}
+}
+
+func gameAsyncResult(result string) (string, bool) {
+	switch result {
+	case serverSendResultSuccess, serverSendResultPartial, serverSendResultError:
+		return result, true
+	default:
+		return "", false
+	}
+}
+
+func gameAsyncDependency(dependency string) (string, bool) {
+	switch dependency {
+	case "redis_presence", "redis_endpoint", "redis_publish", "grpc":
+		return dependency, true
+	default:
+		return "", false
+	}
+}
+
+func (m *gameMetrics) SetQueueCapacity(operation string, messages, bytes int) {
+	operation, ok := gameAsyncOperation(operation)
+	if m == nil || !ok {
+		return
+	}
+	m.asyncQueueCapacityMsgs.WithLabelValues(operation).Set(float64(messages))
+	m.asyncQueueCapacityBytes.WithLabelValues(operation).Set(float64(bytes))
+}
+
+func (m *gameMetrics) ObserveQueue(operation string, messages, bytes int) {
+	operation, ok := gameAsyncOperation(operation)
+	if m == nil || !ok {
+		return
+	}
+	m.asyncQueueMessages.WithLabelValues(operation).Set(float64(messages))
+	m.asyncQueueBytes.WithLabelValues(operation).Set(float64(bytes))
+}
+
+func (m *gameMetrics) ObserveQueueRejected(operation, reason string) {
+	operation, ok := gameAsyncOperation(operation)
+	if m == nil || !ok {
+		return
+	}
+	switch reason {
+	case "full", "too_large", "not_running":
+	default:
+		return
+	}
+	m.asyncQueueRejected.WithLabelValues(operation, reason).Inc()
+}
+
+func (m *gameMetrics) ObserveQueueWait(operation string, elapsed time.Duration) {
+	operation, ok := gameAsyncOperation(operation)
+	if m == nil || !ok {
+		return
+	}
+	m.asyncQueueWait.WithLabelValues(operation).Observe(elapsed.Seconds())
+}
+
+func (m *gameMetrics) ObserveWorker(operation, result string, elapsed time.Duration) {
+	operation, operationOK := gameAsyncOperation(operation)
+	result, resultOK := gameAsyncResult(result)
+	if m == nil || !operationOK || !resultOK {
+		return
+	}
+	m.asyncWorkerDuration.WithLabelValues(operation, result).Observe(elapsed.Seconds())
+}
+
+func (m *gameMetrics) ObservePlayerBatch(messages, bytes int) {
+	if m == nil {
+		return
+	}
+	m.asyncPlayerBatchMessages.Observe(float64(messages))
+	m.asyncPlayerBatchBytes.Observe(float64(bytes))
+}
+
+func (m *gameMetrics) ObserveDependency(operation, dependency, result string, elapsed time.Duration) {
+	operation, operationOK := gameAsyncOperation(operation)
+	dependency, dependencyOK := gameAsyncDependency(dependency)
+	result, resultOK := gameAsyncResult(result)
+	if m == nil || !operationOK || !dependencyOK || !resultOK {
+		return
+	}
+	m.asyncDependencyDuration.WithLabelValues(operation, dependency, result).Observe(elapsed.Seconds())
+}
+
+func (m *gameMetrics) ObserveFallback(operation, reason string) {
+	operation, ok := gameAsyncOperation(operation)
+	if m == nil || !ok {
+		return
+	}
+	if reason != "redis_error" && reason != "no_subscriber" {
+		return
+	}
+	m.asyncFallback.WithLabelValues(operation, reason).Inc()
+}
+
+func (m *gameMetrics) ObserveDiscarded(operation, reason string, messages, _ int) {
+	operation, ok := gameAsyncOperation(operation)
+	if m == nil || !ok || reason != "shutdown_timeout" || messages <= 0 {
+		return
+	}
+	m.asyncDiscarded.WithLabelValues(operation, reason).Add(float64(messages))
+}
+
+var _ serversend.AsyncMetricsObserver = (*gameMetrics)(nil)

@@ -52,6 +52,11 @@ assert_success validate_warmup_drained "$valid_drained"
 assert_failure validate_warmup_drained '{"timestamp":"2026-01-01T00:00:00.000000000Z","run_id":"run-1","planned":4,"attempted":4,"success":4,"partial":0,"error":0,"missed":0,"received":4,"duplicate":1,"sequence_gap":0,"invalid":0,"missing":0,"reader_failures":0}'
 assert_failure validate_warmup_drained '{"timestamp":"2026-01-01T00:00:00.000000000Z","run_id":"run-1","planned":4,"attempted":4,"success":4,"partial":0,"error":0,"missed":0,"received":4,"duplicate":0,"sequence_gap":0,"invalid":0,"missing":0,"reader_failures":0'
 
+# planned 與 attempted 的差額只代表 cadence；實際 emitted ticks 全部送達時，
+# 即使 planned missing 非零，也不能判定為 delivery failure。
+assert_success client_delivery_matches_emitted 1870000 1870 1000 0 0 0 0
+assert_failure client_delivery_matches_emitted 1869999 1870 1000 0 0 0 0
+
 bin_dir="$fixture/bin"
 mkdir -p "$bin_dir"
 for name in game gate load; do
@@ -89,12 +94,18 @@ if (
 		local dir=$1
 		printf '%s\n' \
 			'gaming_core_game_gate_commands_in_flight 0' \
-			'gaming_core_game_server_send_in_flight 0' >"$dir/metrics/baseline-game.prom"
+			'gaming_core_game_server_send_in_flight 0' \
+			'gaming_core_game_server_send_queue_messages{operation="broadcast"} 0' \
+			'gaming_core_game_server_send_queue_bytes{operation="broadcast"} 0' \
+			'gaming_core_game_server_send_queue_messages{operation="player"} 0' \
+			'gaming_core_game_server_send_queue_bytes{operation="player"} 0' >"$dir/metrics/baseline-game.prom"
 		printf '%s\n' \
 			'gaming_core_gate_websocket_commands_in_flight 0' \
 			'gaming_core_gate_game_grpc_in_flight 0' \
 			'gaming_core_gate_websocket_writes_in_flight 0' \
-			'gaming_core_gate_websocket_write_queue_messages 0' >"$dir/metrics/baseline-gate.prom"
+			'gaming_core_gate_websocket_write_queue_messages 0' \
+			'gaming_core_gate_server_send_outbound_queue_messages{operation="broadcast"} 0' \
+			'gaming_core_gate_server_send_outbound_queue_bytes{operation="broadcast"} 0' >"$dir/metrics/baseline-gate.prom"
 		printf 'load\n' >"$dir/metrics/baseline-load.prom"
 	}
 	capture_baseline_when_warmup_completes "$baseline_flow_dir"
@@ -108,16 +119,34 @@ printf '%s\n' \
 	'gaming_core_game_server_send_requests_total{operation="broadcast",result="success"} 1' \
 	'gaming_core_game_server_send_duration_seconds_count{operation="broadcast",result="success"} 1' \
 	'gaming_core_game_gate_commands_in_flight 0' \
-	'gaming_core_game_server_send_in_flight 0' >"$baseline_dir/metrics/baseline-game.prom"
+	'gaming_core_game_server_send_in_flight 0' \
+	'gaming_core_game_server_send_queue_messages{operation="broadcast"} 0' \
+	'gaming_core_game_server_send_queue_bytes{operation="broadcast"} 0' \
+	'gaming_core_game_server_send_queue_messages{operation="player"} 0' \
+	'gaming_core_game_server_send_queue_bytes{operation="player"} 0' >"$baseline_dir/metrics/baseline-game.prom"
 printf '%s\n' \
 	'gaming_core_gate_server_send_delivery_duration_seconds_count{target="room",result="success"} 1' \
 	'gaming_core_gate_websocket_writes_total{source="server_send",result="success"} 1' \
 	'gaming_core_gate_websocket_commands_in_flight 0' \
 	'gaming_core_gate_game_grpc_in_flight 0' \
 	'gaming_core_gate_websocket_writes_in_flight 0' \
-	'gaming_core_gate_websocket_write_queue_messages 0' >"$baseline_dir/metrics/baseline-gate.prom"
+	'gaming_core_gate_websocket_write_queue_messages 0' \
+	'gaming_core_gate_server_send_outbound_queue_messages{operation="broadcast"} 0' \
+	'gaming_core_gate_server_send_outbound_queue_bytes{operation="broadcast"} 0' >"$baseline_dir/metrics/baseline-gate.prom"
 printf 'load\n' >"$baseline_dir/metrics/baseline-load.prom"
 assert_success validate_baseline_before_measured "$baseline_dir"
+
+counter_before="$fixture/counters-before.prom"
+counter_after="$fixture/counters-after.prom"
+printf '%s\n' \
+	'gaming_core_game_server_send_queue_rejected_total{operation="broadcast",reason="full"} 0' \
+	'gaming_core_game_server_send_worker_duration_seconds_count{operation="broadcast",result="error"} 0' >"$counter_before"
+cp "$counter_before" "$counter_after"
+assert_success validate_async_terminal_counters "$counter_before" "$counter_after" "$counter_before" "$counter_after" broadcast
+printf '%s\n' \
+	'gaming_core_game_server_send_queue_rejected_total{operation="broadcast",reason="full"} 1' \
+	'gaming_core_game_server_send_worker_duration_seconds_count{operation="broadcast",result="error"} 0' >"$counter_after"
+assert_failure validate_async_terminal_counters "$counter_before" "$counter_after" "$counter_before" "$counter_after" broadcast
 
 CASE_ARTIFACT_ROOT="$fixture/summary"
 mkdir -p "$CASE_ARTIFACT_ROOT/run-1" "$CASE_ARTIFACT_ROOT/run-2"

@@ -89,6 +89,10 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 		if err != nil {
 			return err
 		}
+		playerConfig, err := gameServerSendPlayer(snapshot)
+		if err != nil {
+			return err
+		}
 		broadcastEnabled := broadcastConfigured
 		if broadcastEnabled && !gateClientEnabled {
 			return fmt.Errorf("game broadcast: grpc.clients.gate is required")
@@ -121,7 +125,13 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 			if err := r.Provide(newGameGateDirectory); err != nil {
 				return err
 			}
-			if err := r.Provide(newGamePlayerSender); err != nil {
+			if err := r.Provide(func() serversend.AsyncPlayerConfig { return playerConfig }); err != nil {
+				return err
+			}
+			if err := r.ProvideManaged("game-server-send-player", framework.PhaseService, newGamePlayerSender); err != nil {
+				return err
+			}
+			if err := r.Provide(exposeGamePlayerSender); err != nil {
 				return err
 			}
 		}
@@ -134,7 +144,10 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 					return err
 				}
 			}
-			if err := r.Provide(newGameBroadcastSender); err != nil {
+			if err := r.ProvideManaged("game-server-send-broadcast", framework.PhaseService, newGameBroadcastSender); err != nil {
+				return err
+			}
+			if err := r.Provide(exposeGameBroadcastSender); err != nil {
 				return err
 			}
 		}

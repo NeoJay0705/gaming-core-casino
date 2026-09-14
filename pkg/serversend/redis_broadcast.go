@@ -26,7 +26,10 @@ type BroadcastPublisher interface {
 type RedisBroadcastSender struct {
 	publisher BroadcastPublisher
 	keys      Keyspace
+	observer  AsyncMetricsObserver
 }
+
+var errBroadcastNoSubscribers = errors.New("server send: broadcast publish has no subscribers")
 
 func NewRedisBroadcastSender(publisher BroadcastPublisher, keys Keyspace) (*RedisBroadcastSender, error) {
 	if publisher == nil {
@@ -64,14 +67,26 @@ func (s *RedisBroadcastSender) Broadcast(ctx context.Context, message Message) (
 	if err != nil {
 		return Receipt{}, fmt.Errorf("server send: encode Redis broadcast command: %w", err)
 	}
+	started := time.Now()
 	count, err := s.publisher.Publish(traced, s.keys.broadcastChannel(), encoded).Result()
+	if s.observer != nil {
+		s.observer.ObserveDependency("broadcast", "redis_publish", asyncDependencyResult(err), time.Since(started))
+	}
 	if err != nil {
 		return Receipt{}, routeStoreError("publish broadcast command", err)
 	}
 	if count == 0 {
-		return Receipt{}, fmt.Errorf("%w: publish broadcast command has no subscribers", ErrRouteStoreUnavailable)
+		return Receipt{}, fmt.Errorf("%w: %w", ErrRouteStoreUnavailable, errBroadcastNoSubscribers)
 	}
 	return newReceipt(), nil
+}
+
+// SetAsyncMetricsObserver attaches the product metrics adapter to Redis
+// publish latency without coupling this package to a metrics implementation.
+func (s *RedisBroadcastSender) SetAsyncMetricsObserver(observer AsyncMetricsObserver) {
+	if s != nil {
+		s.observer = observer
+	}
 }
 
 // BroadcastSubscriptionStore 是窄型 Redis Pub/Sub subscription dependency。

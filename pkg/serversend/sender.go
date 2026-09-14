@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/gatelink"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
@@ -82,6 +83,7 @@ type BatchPlayerSender struct {
 	fallback     GateEndpointLister
 	transport    *GRPCTransport
 	maxEndpoints int
+	observer     AsyncMetricsObserver
 }
 
 // NewBatchPlayerSender 建立同步的 batch sender。fallback directory 必須獨立於
@@ -133,8 +135,11 @@ func (s *BatchPlayerSender) SendToPlayers(ctx context.Context, messages []Player
 	for _, message := range messages {
 		loginNames = append(loginNames, message.LoginName)
 	}
+	presenceStarted := time.Now()
 	presenceByLogin, presenceErr := s.presence.ResolveMany(ctx, loginNames)
+	s.observeDependency("redis_presence", asyncDependencyResult(presenceErr), time.Since(presenceStarted))
 	if shouldPlayerFallback(ctx, presenceErr) {
+		s.observeFallback("redis_error")
 		return s.fallbackAll(ctx, messages, presenceErr)
 	}
 	if err := contextError(ctx, presenceErr); err != nil {
@@ -161,8 +166,11 @@ func (s *BatchPlayerSender) SendToPlayers(ctx context.Context, messages []Player
 	if len(gateIDs) == 0 {
 		return Receipt{}, errors.Join(routeErrs...)
 	}
+	endpointStarted := time.Now()
 	endpointByGate, endpointErr := s.directory.ResolveMany(ctx, gateIDs)
+	s.observeDependency("redis_endpoint", asyncDependencyResult(endpointErr), time.Since(endpointStarted))
 	if shouldPlayerFallback(ctx, endpointErr) {
+		s.observeFallback("redis_error")
 		return s.fallbackAll(ctx, messages, endpointErr)
 	}
 	if err := contextError(ctx, endpointErr); err != nil {
@@ -383,13 +391,36 @@ func (s *BatchPlayerSender) sendPlan(ctx context.Context, plan playerEndpointPla
 			errs = append(errs, err)
 			break
 		}
-		if err := s.transport.Forward(ctx, plan.endpoint, chunk); err != nil {
+		started := time.Now()
+		err := s.transport.Forward(ctx, plan.endpoint, chunk)
+		s.observeDependency("grpc", asyncDependencyResult(err), time.Since(started))
+		if err != nil {
 			errs = append(errs, fmt.Errorf("send player batch to Gate %q endpoint %q chunk %d: %w", plan.endpoint.GateID, plan.endpoint.Address, index, err))
 			continue
 		}
 		accepted = true
 	}
 	return accepted, errors.Join(errs...)
+}
+
+// SetAsyncMetricsObserver attaches the product metrics adapter without making
+// the serversend package depend on Prometheus.
+func (s *BatchPlayerSender) SetAsyncMetricsObserver(observer AsyncMetricsObserver) {
+	if s != nil {
+		s.observer = observer
+	}
+}
+
+func (s *BatchPlayerSender) observeDependency(dependency, result string, elapsed time.Duration) {
+	if s != nil && s.observer != nil {
+		s.observer.ObserveDependency("player", dependency, result, elapsed)
+	}
+}
+
+func (s *BatchPlayerSender) observeFallback(reason string) {
+	if s != nil && s.observer != nil {
+		s.observer.ObserveFallback("player", reason)
+	}
 }
 
 func (s *BatchPlayerSender) fallbackAll(ctx context.Context, messages []PlayerMessage, routeErr error) (Receipt, error) {
@@ -422,6 +453,7 @@ type FanoutSender struct {
 	directory    GateEndpointLister
 	transport    *GRPCTransport
 	maxEndpoints int
+	observer     AsyncMetricsObserver
 }
 
 // FanoutConfig 限制 all-Gate endpoint 列舉數；0 使用預設值。
@@ -473,7 +505,10 @@ func (s *FanoutSender) Broadcast(ctx context.Context, message Message) (Receipt,
 		return Receipt{}, err
 	}
 	results := fanoutEndpoints(ctx, endpoints, func(endpoint GateEndpoint) error {
-		if err := s.transport.Forward(ctx, endpoint, message); err != nil {
+		started := time.Now()
+		err := s.transport.Forward(ctx, endpoint, message)
+		s.observeDependency("grpc", asyncDependencyResult(err), time.Since(started))
+		if err != nil {
 			return fmt.Errorf("fan out command %d to Gate %q endpoint %q: %w", message.CommandID, endpoint.GateID, endpoint.Address, err)
 		}
 		return nil
@@ -494,6 +529,20 @@ func (s *FanoutSender) Broadcast(ctx context.Context, message Message) (Receipt,
 		return Receipt{}, errors.Join(errs...)
 	}
 	return newReceipt(), errors.Join(errs...)
+}
+
+// SetAsyncMetricsObserver attaches the product metrics adapter without making
+// the serversend package depend on Prometheus.
+func (s *FanoutSender) SetAsyncMetricsObserver(observer AsyncMetricsObserver) {
+	if s != nil {
+		s.observer = observer
+	}
+}
+
+func (s *FanoutSender) observeDependency(dependency, result string, elapsed time.Duration) {
+	if s != nil && s.observer != nil {
+		s.observer.ObserveDependency("broadcast", dependency, result, elapsed)
+	}
 }
 
 func listGateEndpoints(ctx context.Context, directory GateEndpointLister, maxEndpoints int) ([]GateEndpoint, error) {
@@ -571,6 +620,7 @@ schedule:
 type FallbackBroadcastSender struct {
 	primary  BroadcastSender
 	fallback BroadcastSender
+	observer AsyncMetricsObserver
 }
 
 func NewFallbackBroadcastSender(primary, fallback BroadcastSender) (*FallbackBroadcastSender, error) {
@@ -611,11 +661,26 @@ func (s *FallbackBroadcastSender) Broadcast(ctx context.Context, message Message
 	if err := ctx.Err(); err != nil {
 		return Receipt{}, err
 	}
+	if s.observer != nil {
+		reason := "redis_error"
+		if errors.Is(primaryErr, errBroadcastNoSubscribers) {
+			reason = "no_subscriber"
+		}
+		s.observer.ObserveFallback("broadcast", reason)
+	}
 	fallbackReceipt, fallbackErr := s.fallback.Broadcast(attemptCtx, message)
 	if fallbackErr == nil {
 		return fallbackReceipt, nil
 	}
 	return fallbackReceipt, errors.Join(primaryErr, fallbackErr)
+}
+
+// SetAsyncMetricsObserver attaches the product metrics adapter to fallback
+// decisions. The primary/fallback sender remains otherwise unchanged.
+func (s *FallbackBroadcastSender) SetAsyncMetricsObserver(observer AsyncMetricsObserver) {
+	if s != nil {
+		s.observer = observer
+	}
 }
 
 var _ RequestPlayerSender = (*DirectRequestPlayerSender)(nil)

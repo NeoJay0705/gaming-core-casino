@@ -61,3 +61,7 @@ server_send:
   broadcast:
     # 非必要：redis 或 grpc；預設 redis；Redis publish／subscriber 失敗時 fallback gRPC。
     primary: redis
+    # 非必要：Broadcast outer command queue；省略時使用 10000。
+    # queue_capacity_messages: 10000
+    # 非必要：Broadcast outer command queue bytes；省略時使用 64MiB。
+    # queue_capacity_bytes: 67108864

@@ -44,6 +44,9 @@ func GateModule() framework.Module {
 }
 
 func broadcastRoomHandler(registry *gateproduct.SessionRegistry, ctx context.Context, payload []byte) error {
+	if len(payload) > serversend.DefaultMaxPayloadBytes {
+		return serversend.ErrPayloadTooLarge
+	}
 	command := new(protocol.BroadcastRoomCommand)
 	if err := proto.Unmarshal(payload, command); err != nil {
 		return fmt.Errorf("decode broadcast room command: %w", err)
@@ -52,19 +55,35 @@ func broadcastRoomHandler(registry *gateproduct.SessionRegistry, ctx context.Con
 	if roomID == "" {
 		return gateproduct.ErrRoomIDInvalid
 	}
-	if command.GetClientCommandId() == 0 {
-		return fmt.Errorf("client_command_id is required")
+	if len(command.GetMessages()) == 0 {
+		return fmt.Errorf("broadcast messages are required")
 	}
 	if registry == nil {
 		return fmt.Errorf("session registry is required")
 	}
-	packet := gateproduct.EncodeWebSocketPacket(gateproduct.WebSocketPacket{
-		CommandID: command.GetClientCommandId(),
-		Payload:   append([]byte(nil), command.GetClientPayload()...),
-	})
-	_, err := registry.BroadcastRoom(ctx, gateproduct.RoomID(roomID), packet)
-	if err != nil {
-		return fmt.Errorf("broadcast room %q: %w", roomID, err)
+	for index, message := range command.GetMessages() {
+		if message == nil {
+			return fmt.Errorf("broadcast message %d is nil", index)
+		}
+		clientMessage := serversend.Message{
+			CommandID: message.GetClientCommandId(),
+			Payload:   message.GetClientPayload(),
+		}
+		if err := clientMessage.Validate(); err != nil {
+			return fmt.Errorf("broadcast message %d: %w", index, err)
+		}
+		if len(clientMessage.Payload) > serversend.DefaultMaxPayloadBytes {
+			return fmt.Errorf("broadcast message %d: %w", index, serversend.ErrPayloadTooLarge)
+		}
+	}
+	for index, message := range command.GetMessages() {
+		packet := gateproduct.EncodeWebSocketPacket(gateproduct.WebSocketPacket{
+			CommandID: message.GetClientCommandId(),
+			Payload:   append([]byte(nil), message.GetClientPayload()...),
+		})
+		if _, err := registry.BroadcastRoom(ctx, gateproduct.RoomID(roomID), packet); err != nil {
+			return fmt.Errorf("broadcast room %q message %d: %w", roomID, index, err)
+		}
 	}
 	return nil
 }

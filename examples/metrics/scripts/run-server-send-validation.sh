@@ -252,6 +252,18 @@ validate_operation_metrics() {
 	grep -q '^gaming_core_gate_websocket_writes_total{.*source="server_send"' "$dir/metrics/baseline-gate.prom" || return 1
 }
 
+# 只用實際成功送出的 tick 判定 client delivery；planned 與 attempted 的差額
+# 屬於 producer cadence，不應再次被當成 delivery loss。
+client_delivery_matches_emitted() {
+	local received=$1 sender_success=$2 connections=$3 duplicate=$4 gap=$5 invalid=$6 reader_failures=$7 expected
+	[[ "$received" =~ ^[0-9]+$ && "$sender_success" =~ ^[0-9]+$ && "$connections" =~ ^[0-9]+$ &&
+		"$duplicate" =~ ^[0-9]+$ && "$gap" =~ ^[0-9]+$ && "$invalid" =~ ^[0-9]+$ &&
+		"$reader_failures" =~ ^[0-9]+$ ]] || return 1
+	expected=$((sender_success * connections))
+	[[ "$received" -eq "$expected" && "$duplicate" -eq 0 && "$gap" -eq 0 &&
+		"$invalid" -eq 0 && "$reader_failures" -eq 0 ]]
+}
+
 phase_timestamp() {
 	local file=$1 phase=$2 event=$3
 	sed -n "s/.*\"timestamp\":\"\([^\"]*\)\".*\"phase\":\"$phase\".*\"event\":\"$event\".*/\1/p" "$file" | tail -n 1
@@ -696,10 +708,14 @@ capture_process_snapshot() {
 wait_for_gate_queue_empty() {
 	local dir=$1 value deadline=$((SECONDS + DRAIN_SECONDS))
 	while ((SECONDS < deadline)); do
-		if curl -fsS --max-time 2 http://127.0.0.1:18081/metrics >"$dir/control/gate-queue.prom.tmp" 2>/dev/null; then
+		if curl -fsS --max-time 2 http://127.0.0.1:18081/metrics >"$dir/control/gate-queue.prom.tmp" 2>/dev/null &&
+			curl -fsS --max-time 2 http://127.0.0.1:19080/metrics >"$dir/control/game-queue.prom.tmp" 2>/dev/null; then
 			mv "$dir/control/gate-queue.prom.tmp" "$dir/control/gate-queue.prom"
+			mv "$dir/control/game-queue.prom.tmp" "$dir/control/game-queue.prom"
 			value=$(awk '$1 == "gaming_core_gate_websocket_write_queue_messages" { print $2; exit }' "$dir/control/gate-queue.prom" || true)
-			if [[ "$value" == "0" || "$value" == "0.0" ]] && validate_gate_terminal_gauges "$dir/control/gate-queue.prom"; then
+			if [[ "$value" == "0" || "$value" == "0.0" ]] &&
+				validate_gate_terminal_gauges "$dir/control/gate-queue.prom" &&
+				validate_game_terminal_gauges "$dir/control/game-queue.prom"; then
 				return 0
 			fi
 		fi
@@ -714,13 +730,20 @@ validate_gate_terminal_gauges() {
 		value=$(awk -v gauge="$gauge" '$1 == gauge { print $2; exit }' "$file" || true)
 		[[ "$value" == "0" || "$value" == "0.0" ]] || return 1
 	done
+	if [[ "${WORKLOAD:-}" == broadcast ]]; then
+		metric_values_zero_if_present "$file" gaming_core_gate_server_send_outbound_queue_messages || return 1
+		metric_values_zero_if_present "$file" gaming_core_gate_server_send_outbound_queue_bytes || return 1
+	fi
 }
 
 validate_game_terminal_gauges() {
-	local file=$1 gauge
+	local file=$1 gauge operation=${WORKLOAD:-}
 	for gauge in gaming_core_game_gate_commands_in_flight gaming_core_game_server_send_in_flight; do
 		metric_values_zero "$file" "$gauge" || return 1
 	done
+	[[ "$operation" == player || "$operation" == broadcast ]] || return 1
+	metric_values_zero_for_operation "$file" gaming_core_game_server_send_queue_messages "$operation" || return 1
+	metric_values_zero_for_operation "$file" gaming_core_game_server_send_queue_bytes "$operation" || return 1
 }
 
 capture_baseline_when_warmup_completes() {
@@ -942,6 +965,62 @@ metric_delta() {
 metric_values_zero() {
 	local file=$1 name=$2
 	awk -v name="$name" '$1 ~ ("^" name "(\\{|$)") { found=1; if ($NF != "0" && $NF != "0.0") invalid=1 } END { exit(found && !invalid ? 0 : 1) }' "$file"
+}
+
+metric_values_zero_if_present() {
+	local file=$1 name=$2
+	awk -v name="$name" '$1 ~ ("^" name "(\\{|$)") { found=1; if ($NF != "0" && $NF != "0.0") invalid=1 } END { exit(!found || !invalid ? 0 : 1) }' "$file"
+}
+
+metric_values_zero_for_operation() {
+	local file=$1 name=$2 operation=$3
+	awk -v name="$name" -v operation="$operation" \
+		'$1 ~ ("^" name "\\{") && $1 ~ ("operation=\"" operation "\"") { found=1; if ($NF != "0" && $NF != "0.0") invalid=1 } END { exit(found && !invalid ? 0 : 1) }' "$file"
+}
+
+metric_counter_delta_zero() {
+	local before_file=$1 after_file=$2 name=$3 label_one=${4:-} label_two=${5:-}
+	local before after delta
+	before=$(sample_value "$before_file" "$name" "$label_one" "$label_two")
+	after=$(sample_value "$after_file" "$name" "$label_one" "$label_two")
+	# Prometheus does not expose an unobserved CounterVec label. Missing in both
+	# snapshots therefore means zero; appearing only in the final snapshot is a
+	# positive delta and must fail the successful-workload contract.
+	if [[ "$before" == null && "$after" == null ]]; then
+		return 0
+	fi
+	delta=$(metric_delta "$before" "$after") || return 1
+	[[ "$delta" == 0 ]]
+}
+
+validate_async_terminal_counters() {
+	local game_before=$1 game_after=$2 gate_before=$3 gate_after=$4 operation=$5
+	local reason result
+	for reason in full too_large not_running; do
+		metric_counter_delta_zero "$game_before" "$game_after" gaming_core_game_server_send_queue_rejected_total \
+			"operation=\"$operation\"" "reason=\"$reason\"" || return 1
+	done
+	for result in partial error; do
+		metric_counter_delta_zero "$game_before" "$game_after" gaming_core_game_server_send_worker_duration_seconds_count \
+			"operation=\"$operation\"" "result=\"$result\"" || return 1
+	done
+	metric_counter_delta_zero "$game_before" "$game_after" gaming_core_game_server_send_discarded_total \
+		"operation=\"$operation\"" 'reason="shutdown_timeout"' || return 1
+
+	# Gate only owns the outbound Broadcast queue. Player workload delivery is
+	# handled by Game's existing Player sender and has no Gate async queue.
+	if [[ "$operation" == broadcast ]]; then
+		for reason in full too_large not_running; do
+			metric_counter_delta_zero "$gate_before" "$gate_after" gaming_core_gate_server_send_outbound_queue_rejected_total \
+				'operation="broadcast"' "reason=\"$reason\"" || return 1
+		done
+		for result in partial error; do
+			metric_counter_delta_zero "$gate_before" "$gate_after" gaming_core_gate_server_send_outbound_worker_duration_seconds_count \
+				'operation="broadcast"' "result=\"$result\"" || return 1
+		done
+		metric_counter_delta_zero "$gate_before" "$gate_after" gaming_core_gate_server_send_outbound_discarded_total \
+			'operation="broadcast"' 'reason="shutdown_timeout"' || return 1
+	fi
 }
 
 validate_baseline_before_measured() {
@@ -1587,7 +1666,7 @@ classify_attempt() {
 	local warmup_attempted warmup_success warmup_partial warmup_error warmup_missed measured_attempted measured_success measured_partial measured_error measured_missed planned received
 	local warmup_received warmup_duplicate warmup_gap warmup_invalid warmup_reader_failures load_duplicate load_gap load_invalid load_missing load_reader_failures expected
 	local baseline_gate final_gate gate_terminal baseline_write final_write write_success baseline_sender final_sender sender_success
-	local evidence_status workload_status first_failure warmup_started measured_started baseline_ready collector_preflight terminal_gauges_zero
+	local evidence_status workload_status first_failure warmup_started measured_started baseline_ready collector_preflight terminal_gauges_zero async_terminal_counters_zero
 	local warmup_workload_status warmup_first_failure warmup_cadence_failed warmup_sender_failed warmup_delivery_failed cadence_failed sender_failed delivery_failed
 	warmup_line=$(grep '\"message\":\"example push workload completed\"' "$dir/game.log" | grep warmup | tail -n 1 || true)
 	measured_line=$(grep '\"message\":\"example push workload completed\"' "$dir/game.log" | grep measured | tail -n 1 || true)
@@ -1634,13 +1713,15 @@ classify_attempt() {
 		done
 	fi
 	terminal_gauges_zero=true
-	for gauge in gaming_core_game_gate_commands_in_flight gaming_core_game_server_send_in_flight; do
-		metric_values_zero "$dir/metrics/final-game.prom" "$gauge" 2>/dev/null || terminal_gauges_zero=false
-	done
-	for gauge in gaming_core_gate_websocket_commands_in_flight gaming_core_gate_game_grpc_in_flight \
-		gaming_core_gate_websocket_writes_in_flight gaming_core_gate_websocket_write_queue_messages; do
-		metric_values_zero "$dir/metrics/final-gate.prom" "$gauge" 2>/dev/null || terminal_gauges_zero=false
-	done
+	validate_game_terminal_gauges "$dir/metrics/final-game.prom" 2>/dev/null || terminal_gauges_zero=false
+	validate_gate_terminal_gauges "$dir/metrics/final-gate.prom" 2>/dev/null || terminal_gauges_zero=false
+	async_terminal_counters_zero=true
+	if [[ "$measured_started" == true ]]; then
+		validate_async_terminal_counters \
+			"$dir/metrics/baseline-game.prom" "$dir/metrics/final-game.prom" \
+			"$dir/metrics/baseline-gate.prom" "$dir/metrics/final-gate.prom" "$WORKLOAD" ||
+			async_terminal_counters_zero=false
+	fi
 	evidence_status=evidence_valid; workload_status=not_run; first_failure=
 	warmup_workload_status=; warmup_first_failure=
 	warmup_cadence_failed=false; warmup_sender_failed=false; warmup_delivery_failed=false
@@ -1718,9 +1799,9 @@ classify_attempt() {
 		if [[ "$load_exit" -ne 0 ]]; then
 			delivery_failed=true
 		fi
-		if [[ "$received" != null && "$sender_success" != null ]]; then
-			expected=$((sender_success * CONNECTIONS))
-			[[ "$received" -eq "$expected" ]] || delivery_failed=true
+		if ! client_delivery_matches_emitted "$received" "$sender_success" "$CONNECTIONS" \
+			"$load_duplicate" "$load_gap" "$load_invalid" "$load_reader_failures"; then
+			delivery_failed=true
 		fi
 		if [[ "$gate_terminal" != null && "$sender_success" != null ]]; then
 			expected=$((sender_success * CONNECTIONS))
@@ -1730,10 +1811,8 @@ classify_attempt() {
 			expected=$((sender_success * CONNECTIONS + 1))
 			[[ "$write_success" -eq "$expected" ]] || delivery_failed=true
 		fi
-		for value in "$load_duplicate" "$load_gap" "$load_invalid" "$load_missing" "$load_reader_failures"; do
-			[[ "$value" == null || "$value" == 0 ]] || delivery_failed=true
-		done
 		[[ "$terminal_gauges_zero" == true ]] || delivery_failed=true
+		[[ "$async_terminal_counters_zero" == true ]] || delivery_failed=true
 		if [[ -n "$warmup_first_failure" ]]; then
 			workload_status=$warmup_workload_status; first_failure=$warmup_first_failure
 		elif [[ "$cadence_failed" == true ]]; then
@@ -1747,7 +1826,7 @@ classify_attempt() {
 		fi
 	fi
 	cat >"$dir/run-status.json" <<EOF
-	{"case":"$CASE_NAME","attempt":$CURRENT_ATTEMPT,"evidence_status":"$evidence_status","workload_status":"$workload_status","first_failure":"$first_failure","workload":"$WORKLOAD","interval":"$INTERVAL","connections":$CONNECTIONS,"load_exit_code":$load_exit,"collector_preflight":"$collector_preflight","warmup_started":$warmup_started,"measured_started":$measured_started,"baseline_ready":$baseline_ready,"terminal_gauges_zero":$terminal_gauges_zero,"warmup_cadence_failed":$warmup_cadence_failed,"warmup_sender_failed":$warmup_sender_failed,"warmup_delivery_failed":$warmup_delivery_failed,"cadence_failed":$cadence_failed,"sender_failed":$sender_failed,"delivery_failed":$delivery_failed,"warmup_attempted":$warmup_attempted,"warmup_success":$warmup_success,"warmup_partial":$warmup_partial,"warmup_error":$warmup_error,"warmup_missed":$warmup_missed,"measured_planned_ticks":$planned,"measured_attempted":$measured_attempted,"measured_success":$measured_success,"measured_partial":$measured_partial,"measured_error":$measured_error,"measured_missed":$measured_missed,"sender_success":$sender_success,"client_received":$received,"client_duplicate":$load_duplicate,"client_sequence_gap":$load_gap,"client_invalid":$load_invalid,"client_missing_per_reader_at_least":$load_missing,"client_reader_failures":$load_reader_failures,"gate_delivery_terminal_delta":$gate_terminal,"websocket_server_send_write_success_delta":$write_success,"profile_target":"$PROFILE_TARGET","evidence":{"metadata":"metadata.txt","phase_events":"phase-events.jsonl","commands":"commands.txt","metrics":"metrics/","os":"os/","redis_before":"redis-before.txt","redis_after":"redis-after.txt","redis_samples":"os/redis.tsv","pprof":"pprof/","warmup_result":"control/warmup-result.json","warmup_drained":"control/warmup-drained.json","binary_checksums":"checksums.txt","source_state":"source-state.txt"}}
+	{"case":"$CASE_NAME","attempt":$CURRENT_ATTEMPT,"evidence_status":"$evidence_status","workload_status":"$workload_status","first_failure":"$first_failure","workload":"$WORKLOAD","interval":"$INTERVAL","connections":$CONNECTIONS,"load_exit_code":$load_exit,"collector_preflight":"$collector_preflight","warmup_started":$warmup_started,"measured_started":$measured_started,"baseline_ready":$baseline_ready,"terminal_gauges_zero":$terminal_gauges_zero,"async_terminal_counters_zero":$async_terminal_counters_zero,"warmup_cadence_failed":$warmup_cadence_failed,"warmup_sender_failed":$warmup_sender_failed,"warmup_delivery_failed":$warmup_delivery_failed,"cadence_failed":$cadence_failed,"sender_failed":$sender_failed,"delivery_failed":$delivery_failed,"warmup_attempted":$warmup_attempted,"warmup_success":$warmup_success,"warmup_partial":$warmup_partial,"warmup_error":$warmup_error,"warmup_missed":$warmup_missed,"measured_planned_ticks":$planned,"measured_attempted":$measured_attempted,"measured_success":$measured_success,"measured_partial":$measured_partial,"measured_error":$measured_error,"measured_missed":$measured_missed,"sender_success":$sender_success,"client_received":$received,"client_duplicate":$load_duplicate,"client_sequence_gap":$load_gap,"client_invalid":$load_invalid,"client_missing_per_reader_at_least":$load_missing,"client_reader_failures":$load_reader_failures,"gate_delivery_terminal_delta":$gate_terminal,"websocket_server_send_write_success_delta":$write_success,"profile_target":"$PROFILE_TARGET","evidence":{"metadata":"metadata.txt","phase_events":"phase-events.jsonl","commands":"commands.txt","metrics":"metrics/","os":"os/","redis_before":"redis-before.txt","redis_after":"redis-after.txt","redis_samples":"os/redis.tsv","pprof":"pprof/","warmup_result":"control/warmup-result.json","warmup_drained":"control/warmup-drained.json","binary_checksums":"checksums.txt","source_state":"source-state.txt"}}
 EOF
 	record_event "$dir/phase-events.jsonl" classified end "attempt-$CURRENT_ATTEMPT" ""
 }

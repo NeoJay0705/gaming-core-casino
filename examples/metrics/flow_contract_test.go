@@ -121,9 +121,11 @@ redis:
 	}
 	broadcastPayload := mustFlowMarshal(&protocol.EchoResponse{Payload: []byte("metrics-broadcast")})
 	broadcastCommand := &protocol.BroadcastRoomCommand{
-		RoomId:          "flow-room",
-		ClientCommandId: protocol.EchoResponseCommandID,
-		ClientPayload:   broadcastPayload,
+		RoomId: "flow-room",
+		Messages: []*protocol.BroadcastClientMessage{{
+			ClientCommandId: protocol.EchoResponseCommandID,
+			ClientPayload:   broadcastPayload,
+		}},
 	}
 	if err := writeFlowPacket(conn, protocol.BroadcastRoomCommandID, 3, mustFlowMarshal(broadcastCommand)); err != nil {
 		t.Fatalf("write room broadcast: %v", err)

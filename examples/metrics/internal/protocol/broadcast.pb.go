@@ -24,12 +24,11 @@ const (
 // BroadcastRoomCommand 是範例層的 room routing envelope。framework transport
 // 只傳遞此 message 的 opaque bytes；client_payload 不在 Gate 解碼。
 type BroadcastRoomCommand struct {
-	state           protoimpl.MessageState `protogen:"open.v1"`
-	RoomId          string                 `protobuf:"bytes,1,opt,name=room_id,json=roomId,proto3" json:"room_id,omitempty"`
-	ClientCommandId uint32                 `protobuf:"varint,2,opt,name=client_command_id,json=clientCommandId,proto3" json:"client_command_id,omitempty"`
-	ClientPayload   []byte                 `protobuf:"bytes,3,opt,name=client_payload,json=clientPayload,proto3" json:"client_payload,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	state         protoimpl.MessageState    `protogen:"open.v1"`
+	RoomId        string                    `protobuf:"bytes,1,opt,name=room_id,json=roomId,proto3" json:"room_id,omitempty"`
+	Messages      []*BroadcastClientMessage `protobuf:"bytes,2,rep,name=messages,proto3" json:"messages,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *BroadcastRoomCommand) Reset() {
@@ -69,14 +68,59 @@ func (x *BroadcastRoomCommand) GetRoomId() string {
 	return ""
 }
 
-func (x *BroadcastRoomCommand) GetClientCommandId() uint32 {
+func (x *BroadcastRoomCommand) GetMessages() []*BroadcastClientMessage {
+	if x != nil {
+		return x.Messages
+	}
+	return nil
+}
+
+type BroadcastClientMessage struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	ClientCommandId uint32                 `protobuf:"varint,1,opt,name=client_command_id,json=clientCommandId,proto3" json:"client_command_id,omitempty"`
+	ClientPayload   []byte                 `protobuf:"bytes,2,opt,name=client_payload,json=clientPayload,proto3" json:"client_payload,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *BroadcastClientMessage) Reset() {
+	*x = BroadcastClientMessage{}
+	mi := &file_examples_metrics_internal_protocol_broadcast_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BroadcastClientMessage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BroadcastClientMessage) ProtoMessage() {}
+
+func (x *BroadcastClientMessage) ProtoReflect() protoreflect.Message {
+	mi := &file_examples_metrics_internal_protocol_broadcast_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BroadcastClientMessage.ProtoReflect.Descriptor instead.
+func (*BroadcastClientMessage) Descriptor() ([]byte, []int) {
+	return file_examples_metrics_internal_protocol_broadcast_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *BroadcastClientMessage) GetClientCommandId() uint32 {
 	if x != nil {
 		return x.ClientCommandId
 	}
 	return 0
 }
 
-func (x *BroadcastRoomCommand) GetClientPayload() []byte {
+func (x *BroadcastClientMessage) GetClientPayload() []byte {
 	if x != nil {
 		return x.ClientPayload
 	}
@@ -87,11 +131,13 @@ var File_examples_metrics_internal_protocol_broadcast_proto protoreflect.FileDes
 
 const file_examples_metrics_internal_protocol_broadcast_proto_rawDesc = "" +
 	"\n" +
-	"2examples/metrics/internal/protocol/broadcast.proto\x12\x12metrics.example.v1\"\x82\x01\n" +
+	"2examples/metrics/internal/protocol/broadcast.proto\x12\x12metrics.example.v1\"w\n" +
 	"\x14BroadcastRoomCommand\x12\x17\n" +
-	"\aroom_id\x18\x01 \x01(\tR\x06roomId\x12*\n" +
-	"\x11client_command_id\x18\x02 \x01(\rR\x0fclientCommandId\x12%\n" +
-	"\x0eclient_payload\x18\x03 \x01(\fR\rclientPayloadBVZTgithub.com/NeoJay0705/gaming-core-casino/examples/metrics/internal/protocol;protocolb\x06proto3"
+	"\aroom_id\x18\x01 \x01(\tR\x06roomId\x12F\n" +
+	"\bmessages\x18\x02 \x03(\v2*.metrics.example.v1.BroadcastClientMessageR\bmessages\"k\n" +
+	"\x16BroadcastClientMessage\x12*\n" +
+	"\x11client_command_id\x18\x01 \x01(\rR\x0fclientCommandId\x12%\n" +
+	"\x0eclient_payload\x18\x02 \x01(\fR\rclientPayloadBVZTgithub.com/NeoJay0705/gaming-core-casino/examples/metrics/internal/protocol;protocolb\x06proto3"
 
 var (
 	file_examples_metrics_internal_protocol_broadcast_proto_rawDescOnce sync.Once
@@ -105,16 +151,18 @@ func file_examples_metrics_internal_protocol_broadcast_proto_rawDescGZIP() []byt
 	return file_examples_metrics_internal_protocol_broadcast_proto_rawDescData
 }
 
-var file_examples_metrics_internal_protocol_broadcast_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
+var file_examples_metrics_internal_protocol_broadcast_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
 var file_examples_metrics_internal_protocol_broadcast_proto_goTypes = []any{
-	(*BroadcastRoomCommand)(nil), // 0: metrics.example.v1.BroadcastRoomCommand
+	(*BroadcastRoomCommand)(nil),   // 0: metrics.example.v1.BroadcastRoomCommand
+	(*BroadcastClientMessage)(nil), // 1: metrics.example.v1.BroadcastClientMessage
 }
 var file_examples_metrics_internal_protocol_broadcast_proto_depIdxs = []int32{
-	0, // [0:0] is the sub-list for method output_type
-	0, // [0:0] is the sub-list for method input_type
-	0, // [0:0] is the sub-list for extension type_name
-	0, // [0:0] is the sub-list for extension extendee
-	0, // [0:0] is the sub-list for field type_name
+	1, // 0: metrics.example.v1.BroadcastRoomCommand.messages:type_name -> metrics.example.v1.BroadcastClientMessage
+	1, // [1:1] is the sub-list for method output_type
+	1, // [1:1] is the sub-list for method input_type
+	1, // [1:1] is the sub-list for extension type_name
+	1, // [1:1] is the sub-list for extension extendee
+	0, // [0:1] is the sub-list for field type_name
 }
 
 func init() { file_examples_metrics_internal_protocol_broadcast_proto_init() }
@@ -128,7 +176,7 @@ func file_examples_metrics_internal_protocol_broadcast_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_examples_metrics_internal_protocol_broadcast_proto_rawDesc), len(file_examples_metrics_internal_protocol_broadcast_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   1,
+			NumMessages:   2,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

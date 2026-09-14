@@ -7,6 +7,7 @@ import (
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/infra/redis"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/logging"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend/redisstore"
 	"go.uber.org/dig"
@@ -23,10 +24,20 @@ type gameFanoutConfig struct {
 }
 
 type gameServerSendBroadcastConfig struct {
-	Primary string `config:"primary" yaml:"primary"`
+	Primary               string `config:"primary" yaml:"primary"`
+	QueueCapacityMessages int    `config:"queue_capacity_messages" yaml:"queue_capacity_messages"`
+	QueueCapacityBytes    int    `config:"queue_capacity_bytes" yaml:"queue_capacity_bytes"`
+}
+
+type gameServerSendPlayerConfig struct {
+	QueueCapacityMessages int `config:"queue_capacity_messages" yaml:"queue_capacity_messages"`
+	QueueCapacityBytes    int `config:"queue_capacity_bytes" yaml:"queue_capacity_bytes"`
+	BatchMaxMessages      int `config:"batch_max_messages" yaml:"batch_max_messages"`
+	BatchMaxBytes         int `config:"batch_max_bytes" yaml:"batch_max_bytes"`
 }
 
 type gameServerSendConfig struct {
+	Player    gameServerSendPlayerConfig    `config:"player" yaml:"player"`
 	Broadcast gameServerSendBroadcastConfig `config:"broadcast" yaml:"broadcast"`
 }
 
@@ -68,12 +79,15 @@ func gameServerSendBroadcast(snapshot config.SourceSnapshot) (gameServerSendBroa
 	if !snapshot.Has("server_send") {
 		return defaultConfig, false, nil
 	}
-	if !snapshot.Has("server_send.broadcast") {
-		return gameServerSendBroadcastConfig{}, false, fmt.Errorf("game broadcast: server_send.broadcast is required")
-	}
 	var root gameServerSendConfig
 	if err := snapshot.Bind("server_send", &root, config.Strict()); err != nil {
+		if !snapshot.Has("server_send.broadcast") {
+			return gameServerSendBroadcastConfig{}, false, fmt.Errorf("game broadcast: server_send.broadcast is required: %w", err)
+		}
 		return gameServerSendBroadcastConfig{}, false, fmt.Errorf("game broadcast: bind server_send: %w", err)
+	}
+	if !snapshot.Has("server_send.broadcast") {
+		return defaultConfig, false, nil
 	}
 	cfg := root.Broadcast
 	cfg.Primary = strings.ToLower(strings.TrimSpace(cfg.Primary))
@@ -83,7 +97,44 @@ func gameServerSendBroadcast(snapshot config.SourceSnapshot) (gameServerSendBroa
 	if cfg.Primary != "redis" && cfg.Primary != "grpc" {
 		return gameServerSendBroadcastConfig{}, false, fmt.Errorf("game broadcast: primary %q is invalid", cfg.Primary)
 	}
+	queueConfig, err := serversend.NormalizeAsyncQueueConfig(serversend.AsyncQueueConfig{
+		QueueCapacityMessages: cfg.QueueCapacityMessages,
+		QueueCapacityBytes:    cfg.QueueCapacityBytes,
+	})
+	if err != nil {
+		return gameServerSendBroadcastConfig{}, false, fmt.Errorf("game broadcast: %w", err)
+	}
+	cfg.QueueCapacityMessages = queueConfig.QueueCapacityMessages
+	cfg.QueueCapacityBytes = queueConfig.QueueCapacityBytes
 	return cfg, true, nil
+}
+
+func gameServerSendPlayer(snapshot config.SourceSnapshot) (serversend.AsyncPlayerConfig, error) {
+	if snapshot == nil {
+		return serversend.AsyncPlayerConfig{}, fmt.Errorf("game player: config snapshot is nil")
+	}
+	if snapshot.Has("room_broadcast") {
+		return serversend.AsyncPlayerConfig{}, fmt.Errorf("game player: legacy room_broadcast key is unsupported; use server_send.broadcast")
+	}
+	var root gameServerSendConfig
+	if snapshot.Has("server_send") {
+		if err := snapshot.Bind("server_send", &root, config.Strict()); err != nil {
+			return serversend.AsyncPlayerConfig{}, fmt.Errorf("game player: bind server_send: %w", err)
+		}
+	}
+	player := root.Player
+	normalized, err := serversend.NormalizeAsyncPlayerConfig(serversend.AsyncPlayerConfig{
+		AsyncQueueConfig: serversend.AsyncQueueConfig{
+			QueueCapacityMessages: player.QueueCapacityMessages,
+			QueueCapacityBytes:    player.QueueCapacityBytes,
+		},
+		BatchMaxMessages: player.BatchMaxMessages,
+		BatchMaxBytes:    player.BatchMaxBytes,
+	})
+	if err != nil {
+		return serversend.AsyncPlayerConfig{}, fmt.Errorf("game player: %w", err)
+	}
+	return normalized, nil
 }
 
 func newGameServerSendTransport(cfg serversend.TransportConfig) (*serversend.GRPCTransport, error) {
@@ -106,8 +157,13 @@ func newGameGateFanoutDirectory(cfg gameFanoutConfig) (*serversend.DNSGateDirect
 	return serversend.NewDNSGateDirectory(cfg.Target, nil)
 }
 
-func newGameFanoutSender(cfg gameFanoutConfig, directory *serversend.DNSGateDirectory, transport *serversend.GRPCTransport) (*serversend.FanoutSender, error) {
-	return serversend.NewFanoutSender(directory, transport, serversend.FanoutConfig{MaxEndpoints: cfg.MaxEndpoints})
+func newGameFanoutSender(cfg gameFanoutConfig, directory *serversend.DNSGateDirectory, transport *serversend.GRPCTransport, metrics *gameMetrics) (*serversend.FanoutSender, error) {
+	sender, err := serversend.NewFanoutSender(directory, transport, serversend.FanoutConfig{MaxEndpoints: cfg.MaxEndpoints})
+	if err != nil {
+		return nil, err
+	}
+	sender.SetAsyncMetricsObserver(metrics)
+	return sender, nil
 }
 
 func newGameRequestPlayerSender(metrics *gameMetrics) (serversend.RequestPlayerSender, error) {
@@ -121,16 +177,18 @@ func newGameRequestPlayerSender(metrics *gameMetrics) (serversend.RequestPlayerS
 type gamePlayerSenderInputs struct {
 	dig.In
 
-	Presence  *serversend.RedisPresenceResolver
-	Directory *serversend.RedisGateDirectory
-	Fallback  *serversend.DNSGateDirectory
-	Config    gameFanoutConfig
-	Transport *serversend.GRPCTransport
-	Metrics   *gameMetrics
+	Presence    *serversend.RedisPresenceResolver
+	Directory   *serversend.RedisGateDirectory
+	Fallback    *serversend.DNSGateDirectory
+	Config      gameFanoutConfig
+	Transport   *serversend.GRPCTransport
+	Metrics     *gameMetrics
+	AsyncConfig serversend.AsyncPlayerConfig
+	Factory     *logging.Factory
 }
 
-func newGamePlayerSender(inputs gamePlayerSenderInputs) (serversend.PlayerSender, error) {
-	sender, err := serversend.NewBatchPlayerSender(
+func newGamePlayerSender(inputs gamePlayerSenderInputs) (*serversend.AsyncPlayerSender, error) {
+	delegate, err := serversend.NewBatchPlayerSender(
 		inputs.Presence,
 		inputs.Directory,
 		inputs.Fallback,
@@ -140,11 +198,24 @@ func newGamePlayerSender(inputs gamePlayerSenderInputs) (serversend.PlayerSender
 	if err != nil {
 		return nil, err
 	}
-	return &measuredPlayerSender{delegate: sender, metrics: inputs.Metrics}, nil
+	delegate.SetAsyncMetricsObserver(inputs.Metrics)
+	var logger *logging.Logger
+	if inputs.Factory != nil {
+		logger, err = inputs.Factory.Component("server_send.player")
+		if err != nil {
+			return nil, err
+		}
+	}
+	return serversend.NewAsyncPlayerSender(delegate, inputs.AsyncConfig, inputs.Metrics, logger)
 }
 
-func newGameRedisBroadcastSender(redisClient *redis.Client, keys serversend.Keyspace) (*serversend.RedisBroadcastSender, error) {
-	return serversend.NewRedisBroadcastSender(redisstore.New(redisClient), keys)
+func newGameRedisBroadcastSender(redisClient *redis.Client, keys serversend.Keyspace, metrics *gameMetrics) (*serversend.RedisBroadcastSender, error) {
+	sender, err := serversend.NewRedisBroadcastSender(redisstore.New(redisClient), keys)
+	if err != nil {
+		return nil, err
+	}
+	sender.SetAsyncMetricsObserver(metrics)
+	return sender, nil
 }
 
 type gameBroadcastSenderInputs struct {
@@ -154,9 +225,11 @@ type gameBroadcastSenderInputs struct {
 	Redis   *serversend.RedisBroadcastSender `optional:"true"`
 	Fanout  *serversend.FanoutSender         `optional:"true"`
 	Metrics *gameMetrics
+	Factory *logging.Factory
 }
 
-func newGameBroadcastSender(inputs gameBroadcastSenderInputs) (serversend.BroadcastSender, error) {
+func newGameBroadcastSender(inputs gameBroadcastSenderInputs) (*serversend.AsyncBroadcastSender, error) {
+	var delegate serversend.BroadcastSender
 	switch inputs.Config.Primary {
 	case "redis":
 		if inputs.Redis == nil {
@@ -169,13 +242,40 @@ func newGameBroadcastSender(inputs gameBroadcastSenderInputs) (serversend.Broadc
 		if err != nil {
 			return nil, err
 		}
-		return &measuredBroadcastSender{delegate: sender, metrics: inputs.Metrics}, nil
+		sender.SetAsyncMetricsObserver(inputs.Metrics)
+		delegate = sender
 	case "grpc":
 		if inputs.Fanout == nil {
 			return nil, fmt.Errorf("game broadcast: gRPC fan-out sender is not configured")
 		}
-		return &measuredBroadcastSender{delegate: inputs.Fanout, metrics: inputs.Metrics}, nil
+		delegate = inputs.Fanout
 	default:
 		return nil, fmt.Errorf("game broadcast: unsupported primary %q", inputs.Config.Primary)
 	}
+	var logger *logging.Logger
+	var err error
+	if inputs.Factory != nil {
+		logger, err = inputs.Factory.Component("server_send.broadcast")
+		if err != nil {
+			return nil, err
+		}
+	}
+	return serversend.NewAsyncBroadcastSender(delegate, serversend.AsyncQueueConfig{
+		QueueCapacityMessages: inputs.Config.QueueCapacityMessages,
+		QueueCapacityBytes:    inputs.Config.QueueCapacityBytes,
+	}, inputs.Metrics, logger)
+}
+
+func exposeGamePlayerSender(sender *serversend.AsyncPlayerSender, metrics *gameMetrics) (serversend.PlayerSender, error) {
+	if sender == nil {
+		return nil, fmt.Errorf("game server send: async player sender is not configured")
+	}
+	return &measuredPlayerSender{delegate: sender, metrics: metrics}, nil
+}
+
+func exposeGameBroadcastSender(sender *serversend.AsyncBroadcastSender, metrics *gameMetrics) (serversend.BroadcastSender, error) {
+	if sender == nil {
+		return nil, fmt.Errorf("game server send: async broadcast sender is not configured")
+	}
+	return &measuredBroadcastSender{delegate: sender, metrics: metrics}, nil
 }

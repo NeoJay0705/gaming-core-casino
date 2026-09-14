@@ -25,6 +25,19 @@ grpc:
         # max_endpoints: 256
 
 server_send:
+  player: {}
+    # 非必要：省略時使用 queue_capacity_messages=10000。
+    # queue_capacity_messages: 10000
+    # 非必要：省略時使用 queue_capacity_bytes=64MiB。
+    # queue_capacity_bytes: 67108864
+    # 非必要：Player worker 每輪最多處理的訊息數；省略時使用 10000。
+    # batch_max_messages: 10000
+    # 非必要：Player worker 每輪最多處理的 encoded bytes；省略時使用 8MiB。
+    # batch_max_bytes: 8388608
   broadcast:
     # 非必要：redis 或 grpc；預設 redis；Redis publish／subscriber 失敗時 fallback gRPC。
     primary: redis
+    # 非必要：Broadcast outer command queue；省略時使用 10000。
+    # queue_capacity_messages: 10000
+    # 非必要：Broadcast outer command queue bytes；省略時使用 64MiB。
+    # queue_capacity_bytes: 67108864

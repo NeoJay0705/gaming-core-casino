@@ -1,271 +1,315 @@
 # Server-send Broadcast／Player 效能驗證報告
 
-## 1. Executive conclusion
+## 1. 執行摘要
 
-本次正式 campaign 已完成，使用同一份 Game／Gate／load binary snapshot、Redis standalone、1000 條
-WebSocket connections、`GOMAXPROCS=4`，並依設計完成 correctness gate、四個 matrix case 各三次
-`evidence_valid` attempt，以及一次 Game profile-only（含 Go trace）。
+本報告更新自 async server-send batching 修正後重新執行的完整 campaign。實驗使用相同的
+`examples/metrics` workflow，重新編譯並在每個 attempt 重啟 Game、Gate、load；不是沿用舊 process
+或舊 binary。完整 campaign artifact root 為
+[`artifacts/server-send/20260914T030251Z`](artifacts/server-send/20260914T030251Z)，另有針對
+Broadcast 16ms 的 Game profile-only artifact
+[`artifacts/server-send-profile/20260914T032122Z`](artifacts/server-send-profile/20260914T032122Z)。
 
-- correctness gate：Broadcast 與 Player 均為 `delivery_complete`，各 10 connections、33ms、5 秒，
-  `151 × 10 = 1,510` 筆 client messages 全部收到。
-- Broadcast 33ms：3/3 `delivery_complete`，中位數約 30.3k messages/s，沒有 missed tick 或 client
-  protocol loss。
-- Player 33ms：3/3 `evidence_valid`，但全部 `cadence_failed`；每次少 1 個 tick，client 缺額正好
-  `1 × 1,000`。
-- Broadcast 16ms：3/3 `evidence_valid`，但 1 次 measured 少 4 ticks，另 2 次 warm-up 有 missed tick，
-  因此 0/3 `delivery_complete`。其餘 measured delivery counters 仍與 client 對齊。
-- Player 16ms：3/3 `cadence_failed`；measured missed ticks 為 19、30、34，中位數 30，client 缺額
-  正好是 `missed × 1,000`。
+結論先列如下：
 
-目前可以確認的第一個失守 boundary 是 Game 的 synchronous Player server-send producer cadence：
-`SendToPlayers` 的尾端 latency 在 16ms workload 下跨過下一個 scheduled tick。Player 16ms 的 sender
-latency p95 中位數為 10ms、p99 為 25ms bucket，與 measured missed ticks 同時出現。
+- correctness gate 的 Broadcast／Player 兩個 10-connection run 都 `delivery_complete`。
+- 四個 1000-connection matrix case 均取得 3/3 `evidence_valid` attempts。
+- Broadcast 33ms、Player 33ms、Player 16ms 各 3/3 `delivery_complete`。
+- Broadcast 16ms 有 2/3 `delivery_complete`，第 3 輪為 5 個 missed ticks；該輪沒有 sender、Gate 或
+  client error，缺額正好為 5,000（5 ticks × 1,000 targets）。原始 `run-status.json` 的
+  `delivery_failed=true` 是分類器把 planned 缺額重複算入 delivery；依實際 emitted ticks 的 terminal
+  counters，該輪應判定為純 `cadence_failed`。
+- async 修正後，Player 33ms 與 Player 16ms 的 producer cadence 在三輪都完整；`SendToPlayers`
+  caller admission 的三輪 mean 中位數約 0.091–0.096 ms（16ms 與 33ms），不再把 Redis／gRPC 等待留在
+  producer critical path。
+- Player background worker 仍可觀測到約 7.5–8.2 ms 的 dependency work；16ms 下 queue wait p99
+  為 0.5 ms、drain 後 queue／in-flight 均為 0。這是應持續監控的 capacity 指標，不代表目前已飽和。
+- 本次沒有足夠證據把根因定論為 gRPC implementation、Redis、macOS kernel 或硬體極限。Broadcast
+  16ms 單次 missed tick 是目前的候選邊界，不具三輪穩定性。
 
-目前不能把根因定論為「gRPC 本身」或「OS 已飽和」：
+與上一份舊 binary 報告相比，這次 Player 兩個 cadence case 由連續 missed 改為三輪完整；這是不同
+campaign，僅能作結果觀察，不能視為嚴格 A/B 因果證明。此次 binary 內含的必要修正是：Player
+admission 在 clone 前完成 count／bytes preflight 並只計算一次 accounting，以及 Player／Broadcast
+`Stop(ctx)` 在 deadline 到期後不再無限等待不合作的 delegate。
 
-- Gate delivery p99 維持 5ms bucket，client duplicate／gap／invalid／reader failure 全部為 0；
-  drain 後 queue 與 in-flight gauges 都回到 0。
-- Redis active-window CPU 約 0.95%～12.78%（Redis one-core equivalent）、pool wait/pending/timeout
-  全部為 0，沒有 connection pool exhaustion 證據。
-- macOS host idle 最低約 19.89%，Game／Gate／load sampled process CPU 最高約 18.7%／52.1%／44.7%，
-  不是硬體 CPU 已達滿載的證據。
-- Game CPU profile／trace 顯示 network、scheduler、Redis pipeline 與 gRPC call stack 的等待，
-  但單次 profile 無法分離 Redis routing、gRPC channel／stream、Gate 或 shared-host scheduling 的
-  個別貢獻。
+## 2. 實驗條件與執行方式
 
-因此本次可下的結論是：1000 connections 下，Broadcast 33ms 是目前唯一三輪完整穩定的 workload；
-Player 33ms 與兩個 16ms workload 已觀測到 producer cadence 壓力，但尚未建立穩定 capacity 上限，
-也不能宣稱已排除 application gRPC implementation。
+正式入口為：
 
-## 2. Test scope and method
-
-正式入口為 `examples/metrics/scripts/run-server-send-validation.sh --full-campaign`。本次 campaign
-artifact root 為 [artifacts/server-send/20260913T123552Z](artifacts/server-send/20260913T123552Z)。
+```sh
+examples/metrics/scripts/run-server-send-validation.sh \
+  --artifact-root artifacts/server-send/20260914T030251Z --full-campaign
+```
 
 固定條件：
 
 | 項目 | 值 |
 |---|---|
-| correctness | Broadcast／Player、10 connections、33ms、5s、固定 run-1 |
-| matrix | Broadcast／Player × 33ms／16ms、1000 connections |
-| measured duration | 30s |
+| connections | 1,000（每個 correctness case 為 10） |
+| cases | Broadcast／Player × 33ms／16ms |
+| measured | 30s；每 case 3 個 evidence-valid attempts |
 | warm-up／drain | 5s／10s |
-| application payload | 32 bytes；encoded payload 由 metadata 保存 |
+| payload | 32 bytes application payload；實際 encoded PushMessage 74/76 bytes |
 | process | Game、Gate、load 均 `GOMAXPROCS=4` |
-| scrape | Game／Gate／load `/metrics` 每秒；Redis INFO 每秒 |
-| host | macOS 14.5、Darwin arm64、Mac14,3、8 logical CPUs、16 GiB |
+| setup | 所有 WebSocket、Login、EnterRoom 與 reader ready 後才開始 workload |
+| Redis | `127.0.0.1:6379`、Redis 8.4.2、standalone、外部 OrbStack dependency |
+| host | macOS 14.5、Darwin arm64、8 logical CPUs、16 GiB |
 | runtime | Go 1.27.1、grpc-go v1.72.0、go-redis v9.18.0 |
-| Redis | 8.4.2、standalone、OrbStack、`127.0.0.1:6379` |
+| scrape | Game／Gate／load 每秒；Redis INFO 每秒；摘要只取 measured window |
 
-每個 formal campaign 只 build 一次；三個 binaries 的 SHA-256 為：
+Game、Gate、load 與 OrbStack 內的 Redis 共用同一台 macOS host；因此 host 數據只能描述 shared-host
+負載，不能單獨代表任一服務的 production capacity。
+
+campaign 只 build 一次，所有 attempt 使用同一份 binary snapshot：
 
 ```text
-game  daaafcf40a7ed2fbc3c9ff8573870dbc7b27cf084dc808d4dc3b4f9058625651
-gate  e76508f97f2890a5749daecd8a3a2acd2a7fe5aa7c973a5697c6b30ea4367358
-load  0809dfc1239ec0e83ad2368b96fc74eb604c4cfa59bbb31df9066a99419a9b6d
+game  0c4f0d038036179470c88755350b9ff95c3650dcd0c93eb0ad5307392338a74a
+gate  7832f4abbc47429c03164ab6e6eace3525b7d6367f16a06b343fee306b3e0add
+load  1674a86e67a504fb362b9771668316b0aeb9cebf6d854f9674f6f18f6c591d76
 ```
 
-來源：[binary-checksums.txt](artifacts/server-send/20260913T123552Z/binary-checksums.txt)、
-[source-state.txt](artifacts/server-send/20260913T123552Z/source-state.txt)。Redis 由既有 OrbStack
-dependency 管理；orchestration 只執行 PING／INFO，不停止或重啟 Redis。
+來源為 [`binary-checksums.txt`](artifacts/server-send/20260914T030251Z/binary-checksums.txt) 與
+各 attempt 的 `source-state.txt`。campaign 中所有 14 個 attempts（2 correctness + 12 matrix）
+均以：
 
-### 2.1 啟動問題與修正
-
-兩次 preflight 問題沒有計入正式結果：
-
-1. `20260913T123221Z` 在第一次 correctness 啟動時觸發 `set -u` 的 `timeout: unbound variable`；
-   `wait_for_marker` 同一個 `local` 宣告先使用尚未初始化的 `timeout`。已拆開初始化。
-2. `20260913T123305Z` 啟動後，Redis `INFO` 的標準 CRLF 使數值欄位含 `\r`，collector 將正常輸出誤判
-   為 `missing_field`。已在 parser 取得 INFO 後移除 CR，並加入 fake CRLF regression fixture。
-
-這兩次 artifacts 僅供故障稽核：[timeout failure](artifacts/server-send/20260913T123221Z)、
-[Redis CRLF failure](artifacts/server-send/20260913T123305Z)。正式數據只使用上述
-`20260913T123552Z` campaign。
-
-## 3. Correctness gate
-
-| workload | connections | interval | planned ticks | attempted | client received | duplicate/gap/invalid/readers | Gate delivery | result |
-|---|---:|---:|---:|---:|---:|---|---:|---|
-| Broadcast | 10 | 33ms | 151 | 151 | 1,510 | 0/0/0/0 | 1,510 | delivery_complete |
-| Player | 10 | 33ms | 151 | 151 | 1,510 | 0/0/0/0 | 1,510 | delivery_complete |
-
-兩個 correctness run 使用相同 campaign checksum；這是 matrix 開始的必要 gate。原始證據：
-
-- [Broadcast correctness](artifacts/server-send/20260913T123552Z/correctness/broadcast-33/run-1)
-- [Player correctness](artifacts/server-send/20260913T123552Z/correctness/player-33/run-1)
-- [correctness-gate.json](artifacts/server-send/20260913T123552Z/correctness-gate.json)
-
-## 4. Matrix per-run results
-
-`planned/attempted/missed` 是 measured 30 秒窗口；`client missing` 是每個 reader 至少缺少的訊息數。
-本次每條 connection 都是 1,000 個 room members／player targets，因此 missing 應等於
-`missed × 1,000`。partial、error、duplicate、gap、invalid、reader failure 在所有 rows 均為 0；
-Gate server-send write success 比 delivery 多 1，是 setup/control connection write，不是 push delivery。
-
-| case / attempt | workload status | warm-up missed | planned / attempted / missed | actual ticks/s | client msg/s | client missing | Gate delivery / WS write |
-|---|---|---:|---:|---:|---:|---:|---:|
-| [Broadcast 33 r1](artifacts/server-send/20260913T123552Z/matrix/broadcast-33/run-1) | delivery_complete | 0 | 909 / 909 / 0 | 30.300 | 30,300.0 | 0 | 909,000 / 909,001 |
-| [Broadcast 33 r2](artifacts/server-send/20260913T123552Z/matrix/broadcast-33/run-2) | delivery_complete | 0 | 909 / 909 / 0 | 30.300 | 30,300.0 | 0 | 909,000 / 909,001 |
-| [Broadcast 33 r3](artifacts/server-send/20260913T123552Z/matrix/broadcast-33/run-3) | delivery_complete | 0 | 909 / 909 / 0 | 30.300 | 30,300.0 | 0 | 909,000 / 909,001 |
-| [Player 33 r1](artifacts/server-send/20260913T123552Z/matrix/player-33/run-1) | cadence_failed | 0 | 909 / 908 / 1 | 30.267 | 30,266.7 | 1,000 | 908,000 / 908,001 |
-| [Player 33 r2](artifacts/server-send/20260913T123552Z/matrix/player-33/run-2) | cadence_failed | 0 | 909 / 908 / 1 | 30.267 | 30,266.7 | 1,000 | 908,000 / 908,001 |
-| [Player 33 r3](artifacts/server-send/20260913T123552Z/matrix/player-33/run-3) | cadence_failed | 0 | 909 / 908 / 1 | 30.267 | 30,266.7 | 1,000 | 908,000 / 908,001 |
-| [Broadcast 16 r1](artifacts/server-send/20260913T123552Z/matrix/broadcast-16/run-1) | cadence_failed | 0 | 1,875 / 1,871 / 4 | 62.367 | 62,366.7 | 4,000 | 1,871,000 / 1,871,001 |
-| [Broadcast 16 r2](artifacts/server-send/20260913T123552Z/matrix/broadcast-16/run-2) | cadence_failed | 3 | 1,875 / 1,875 / 0 | 62.500 | 62,500.0 | 0 | 1,875,000 / 1,875,001 |
-| [Broadcast 16 r3](artifacts/server-send/20260913T123552Z/matrix/broadcast-16/run-3) | cadence_failed | 1 | 1,875 / 1,875 / 0 | 62.500 | 62,500.0 | 0 | 1,875,000 / 1,875,001 |
-| [Player 16 r1](artifacts/server-send/20260913T123552Z/matrix/player-16/run-1) | cadence_failed | 1 | 1,875 / 1,856 / 19 | 61.867 | 61,866.7 | 19,000 | 1,856,000 / 1,856,001 |
-| [Player 16 r2](artifacts/server-send/20260913T123552Z/matrix/player-16/run-2) | cadence_failed | 4 | 1,875 / 1,845 / 30 | 61.500 | 61,500.0 | 30,000 | 1,845,000 / 1,845,001 |
-| [Player 16 r3](artifacts/server-send/20260913T123552Z/matrix/player-16/run-3) | cadence_failed | 7 | 1,875 / 1,841 / 34 | 61.367 | 61,366.7 | 34,000 | 1,841,000 / 1,841,001 |
-
-所有 rows 的 `run-status.json` 都是 `evidence_valid`，且每個 attempt 都通過事後唯讀驗證：
-
-```text
+```sh
 examples/metrics/scripts/run-server-send-validation.sh --validate-only <attempt-dir>
 ```
 
-14/14 directories（2 correctness + 12 matrix）回傳成功；profile-only 也回傳成功。
+重新驗證成功。測試期間未執行 Git staging 操作。
 
-Error rate：12 個 matrix attempts 的 sender `partial=0`、sender `error=0`，Gate delivery 與 WebSocket
-write 的 `result="error"` delta 為 0，client `duplicate=0`、`sequence_gap=0`、`invalid=0`、
-`reader_failures=0`。因此 application／delivery error rate 為 0；`cadence_failed` 是 scheduler missed
-tick 分類，不是 error counter，也不應被改寫成 server error。
+## 3. Correctness gate
 
-## 5. Three-run median and latency
+| workload | connections | interval | planned | attempted | client received | missing／duplicate／gap／invalid／reader failure | Gate delivery | result |
+|---|---:|---:|---:|---:|---:|---|---:|---|
+| Broadcast | 10 | 33ms | 151 | 151 | 1,510 | 0／0／0／0／0 | 1,510 | `delivery_complete` |
+| Player | 10 | 33ms | 151 | 151 | 1,510 | 0／0／0／0／0 | 1,510 | `delivery_complete` |
 
-下表 latency 來自 baseline 到 final Prometheus histogram counter delta。quantile 是 histogram bucket
-upper bound，不是插值後的精確百分位；單位為 ms。`sender` 是 Game synchronous server-send call，
-`Gate delivery` 是 Gate 對 room／player 的 enqueue delivery，`client` 是 Game push timestamp 到
-load reader 收到 frame 的端到端時間。
+原始證據：[`correctness-gate.json`](artifacts/server-send/20260914T030251Z/correctness-gate.json)、
+[`correctness/broadcast-33/run-1`](artifacts/server-send/20260914T030251Z/correctness/broadcast-33/run-1)、
+[`correctness/player-33/run-1`](artifacts/server-send/20260914T030251Z/correctness/player-33/run-1)。
 
-| case | status | ticks/s median (range) | client msg/s median (range) | missed median (range) | sender avg / p50 / p95 / p99 | Gate avg / p50 / p95 / p99 | client avg / p50 / p95 / p99 |
-|---|---|---:|---:|---:|---|---|---|
-| Broadcast 33ms | 3/3 complete | 30.300 (30.300–30.300) | 30,300 (30,300–30,300) | 0 (0–0) | 0.616 / 1 / 2.5 / 5 | 1.143 / 2.5 / 2.5 / 5 | 3.064 / 5 / 10 / 10 |
-| Player 33ms | 0/3 complete | 30.267 (30.267–30.267) | 30,266.7 (30,266.7–30,266.7) | 1 (1–1) | 8.077 / 10 / 25 / 25 | 1.107 / 1 / 2.5 / 5 | 6.858 / 10 / 10 / 25 |
-| Broadcast 16ms | 0/3 complete | 62.500 (62.367–62.500) | 62,500 (62,366.7–62,500) | 0 (0–4) | 0.590 / 0.5 / 1 / 5 | 1.042 / 1 / 2.5 / 5 | 2.949 / 5 / 10 / 10 |
-| Player 16ms | 0/3 complete | 61.500 (61.367–61.867) | 61,500 (61,366.7–61,866.7) | 30 (19–34) | 7.708 / 10 / 10 / 25 | 1.065 / 1 / 2.5 / 5 | 6.569 / 10 / 10 / 25 |
+## 4. Matrix 每輪結果
 
-核心比較：Player sender average 約 7.7–8.1ms，遠高於 Broadcast 約 0.59–0.62ms；Player 的 Redis
-batch lookup 與 endpoint grouping 會被納入 synchronous sender duration。雖然平均仍低於 16ms，
-histogram p99 已到 25ms bucket，且 missed tick 與 sender critical path 同時出現，表示 tail latency
-而非平均 latency 是目前 producer cadence 的壓力點。
+`planned`／`attempted`／`missed` 是 configured 30 秒 measured window；`ticks/s` 與 `client msg/s` 使用各輪
+`measured_running_start/end` 的實際 elapsed（約 29.965–29.989 秒），`client missing` 是每個 reader
+至少缺少的訊息數。所有 attempts 的 sender partial/error、Gate delivery error、WebSocket write error、
+client duplicate／gap／invalid／reader failure 都為 0。Gate write 比 delivery 多 1 是 setup/control
+connection write，不是 push delivery。
 
-## 6. Runtime and saturation data
+| case／attempt | workload status | planned／attempted／missed | ticks/s | client msg/s | client missing | Gate delivery／WS write |
+|---|---|---:|---:|---:|---:|---:|
+| [Broadcast 33 r1](artifacts/server-send/20260914T030251Z/matrix/broadcast-33/run-1) | delivery_complete | 909／909／0 | 30.334 | 30,334.4 | 0 | 909,000／909,001 |
+| [Broadcast 33 r2](artifacts/server-send/20260914T030251Z/matrix/broadcast-33/run-2) | delivery_complete | 909／909／0 | 30.334 | 30,334.2 | 0 | 909,000／909,001 |
+| [Broadcast 33 r3](artifacts/server-send/20260914T030251Z/matrix/broadcast-33/run-3) | delivery_complete | 909／909／0 | 30.336 | 30,335.8 | 0 | 909,000／909,001 |
+| [Player 33 r1](artifacts/server-send/20260914T030251Z/matrix/player-33/run-1) | delivery_complete | 909／909／0 | 30.335 | 30,334.5 | 0 | 909,000／909,001 |
+| [Player 33 r2](artifacts/server-send/20260914T030251Z/matrix/player-33/run-2) | delivery_complete | 909／909／0 | 30.335 | 30,335.0 | 0 | 909,000／909,001 |
+| [Player 33 r3](artifacts/server-send/20260914T030251Z/matrix/player-33/run-3) | delivery_complete | 909／909／0 | 30.334 | 30,334.2 | 0 | 909,000／909,001 |
+| [Broadcast 16 r1](artifacts/server-send/20260914T030251Z/matrix/broadcast-16/run-1) | delivery_complete | 1,875／1,875／0 | 62.529 | 62,529.4 | 0 | 1,875,000／1,875,001 |
+| [Broadcast 16 r2](artifacts/server-send/20260914T030251Z/matrix/broadcast-16/run-2) | delivery_complete | 1,875／1,875／0 | 62.523 | 62,522.9 | 0 | 1,875,000／1,875,001 |
+| [Broadcast 16 r3](artifacts/server-send/20260914T030251Z/matrix/broadcast-16/run-3) | cadence_failed | 1,875／1,870／5 | 62.365 | 62,364.7 | 5,000 | 1,870,000／1,870,001 |
+| [Player 16 r1](artifacts/server-send/20260914T030251Z/matrix/player-16/run-1) | delivery_complete | 1,875／1,875／0 | 62.530 | 62,530.1 | 0 | 1,875,000／1,875,001 |
+| [Player 16 r2](artifacts/server-send/20260914T030251Z/matrix/player-16/run-2) | delivery_complete | 1,875／1,875／0 | 62.531 | 62,531.3 | 0 | 1,875,000／1,875,001 |
+| [Player 16 r3](artifacts/server-send/20260914T030251Z/matrix/player-16/run-3) | delivery_complete | 1,875／1,875／0 | 62.530 | 62,530.5 | 0 | 1,875,000／1,875,001 |
 
-process CPU 是 macOS `top` measured-window 的最高 sampled `%CPU`；不是 host CPU time，也未除以
-`GOMAXPROCS`。host idle 是同一窗口最低 sampled idle。queue 是每秒 Prometheus scrape 的最高觀測值，
-不是每一瞬間的絕對最大值。
+Broadcast 16ms 的第 3 輪是 evidence-valid 但 workload `cadence_failed`，不是 environment-invalid；
+實際 emitted 的 1,870 ticks 全部完成 Gate／client delivery，因此不能把 planned 與 attempted 的差額
+改寫成 transport error，也不能從 campaign 移除。
 
-| case | Game / Gate / load CPU max median (range) | host idle min median (range) | Gate queue max median (range) | write in-flight max median (range) | Redis CPU median (range) | Redis commands/s median (range) |
-|---|---:|---:|---:|---:|---:|---:|
-| Broadcast 33ms | 0.5% / 23.8% / 22.3% (0.5–0.6 / 23.7–24.6 / 22.3–22.8) | 30.00% (19.77–46.70) | 0 (0–223) | 0 (0–1) | 0.95% (0.92–0.98) | 278 (274–279) |
-| Player 33ms | 9.3% / 26.7% / 22.3% (8.9–9.3 / 26.0–26.8 / 21.8–22.7) | 31.13% (27.87–43.82) | 269 (0–373) | 3 (0–9) | 7.28% (7.24–7.47) | 30,554 (30,527–30,613) |
-| Broadcast 16ms | 0.9% / 46.3% / 44.0% (0.9–1.1 / 45.6–46.7 / 43.8–44.1) | 31.78% (29.93–31.80) | 178 (0–372) | 1 (0–2) | 1.27% (1.20–1.29) | 310 (306–312) |
-| Player 16ms | 18.5% / 50.5% / 44.0% (18.2–18.7 / 49.9–52.1 / 42.6–44.7) | 22.15% (19.89–28.17) | 187 (7–383) | 1 (1–3) | 12.78% (12.67–13.13) | 61,920 (61,669–62,131) |
+## 5. Latency 與 async pipeline metrics
 
-共同資源指標：四個 case 的 Redis active samples 均為 28 個；`connected_clients` 最大 25、
-`blocked_clients=0`、`rejected_connections=0`。Game Redis pool 的 final snapshot 顯示
-`total_connections=11`、`idle_connections=11`、`pending_requests=0`、`wait_total=0`、
-`timeouts_total=0`。因此沒有 Redis pool wait 或連線耗盡證據。
+所有 latency 是 baseline 到 final Prometheus histogram counter／sum delta；quantile 是 bucket upper
+bound，不是插值精確百分位。欄位格式為「三輪 mean 的 median（各輪 min–max）」；單位皆為 ms。
 
-| case | final Game / Gate / load goroutines | final heap MB（Game / Gate / load） | `go_sched_latencies_seconds` p99 upper bucket（Game / Gate / load） |
-|---|---:|---:|---:|
-| Broadcast 33ms | 16 / 2,021 / 1,010 | 2.51 / 78.42 / 15.63 | 0.918ms / 10.486ms / 0.918ms |
-| Player 33ms | 20 / 2,024 / 1,010 | 5.33 / 82.31 / 14.19 | 0.082ms / 10.486ms / 10.486ms |
-| Broadcast 16ms | 15 / 2,021 / 1,010 | 2.53 / 52.84 / 13.45 | 0.082ms / 10.486ms / 0.918ms |
-| Player 16ms | 21 / 2,024 / 1,010 | 3.94 / 52.30 / 18.51 | 0.082ms / 10.486ms / 10.486ms |
+`Game admission` 只涵蓋 public sender validation、clone 與 queue admission；`queue wait` 是 admission
+到 worker 開始處理；`worker` 包含背景 sender delegate；Gate 是 delivery handler enqueue；client 是
+Game push timestamp 到 load reader 收到 frame。
 
-final goroutine／heap 是 drain 後仍保留 1000 readers 的 snapshot，不能直接解讀為 connection teardown
-後的 leak。所有 attempt drain 後 terminal gauges、write queue 與 readers contract 均通過 validator。
+| case | Game admission avg／p95／p99 | queue wait avg／p95／p99 | worker avg／p95／p99 | Gate avg／p95／p99 | client avg／p95／p99 |
+|---|---|---|---|---|---|
+| Broadcast 33ms | 0.006975 (0.006699–0.007464)／0.025／0.025 (0.025–0.050) | 0.006271 (0.006007–0.006449)／0.025／0.025 | 0.635123 (0.633926–0.657997)／1／2.5 (2.5–5) | 1.087590 (1.050954–1.108764)／2.5／5 | 3.024637 (2.990180–3.065388)／5 (5–10)／10 |
+| Player 33ms | 0.095457 (0.091520–0.096755)／0.25／0.5 | 0.050967 (0.044559–0.082109)／0.25 (0.1–0.25)／0.25 (0.25–0.5) | 8.128643 (8.128586–8.208141)／25／25 | 1.064064 (1.049578–1.124845)／2.5 (2.5–5)／5 | 7.052647 (7.023181–7.163247)／10／25 |
+| Broadcast 16ms | 0.005943 (0.005846–0.006353)／0.025／0.025 (0.025–0.050) | 0.008862 (0.006772–0.039164)／0.025／0.025 | 0.612639 (0.604718–0.647366)／1／5 (2.5–5) | 1.040218 (1.013101–1.057303)／2.5／5 | 3.006441 (2.986072–3.047176)／5／10 |
+| Player 16ms | 0.090892 (0.088401–0.093833)／0.25／0.5 (0.25–0.5) | 0.073301 (0.066004–0.122440)／0.25／0.5 | 7.473607 (7.469023–7.567594)／10／25 | 1.046161 (1.022790–1.050688)／2.5／5 | 6.561685 (6.524702–6.621130)／10／25 |
 
-## 7. Bottleneck diagnosis
+### 5.1 Player batching 與 dependency
 
-### 7.1 已由數據支持的判斷
+Player 每個 producer tick 仍只呼叫一次 `SendToPlayers`，輸入 1,000 個 login names。由於同一 run
+使用同一 detached trace，worker 只合併相鄰且同 trace 的 job；它不改變 command 或跨 trace 合併。
 
-1. **第一失守在 Game producer cadence。** Player 33ms 三次各 missed 1；Player 16ms 三次 missed
-   19/30/34。missing 數均為 `missed × 1,000`，且 Gate delivery、WebSocket write、client receive
-   完全相等，表示未在 Gate/client 端額外丟失。
-2. **Player routing path 成本顯著高於 Broadcast。** Player sender average 約 8ms、Redis commands/s
-   約 30.6k（16ms 約 61.9k）；Broadcast sender 約 0.6ms、Redis commands/s 約 0.3k。這符合 Player
-   的 Redis ownership／endpoint lookup、grouping、chunking 與 gRPC forwarding 都在同步 sender call
-   內的設計。
-3. **Gate/WebSocket 有 transient pressure，但目前不是 terminal saturation。** Queue sampled max
-   最高 383、write in-flight 最高 9；然而 drain 後都為 0，Gate delivery p99 仍在 5ms bucket，沒有
-   queue overflow 或永久累積證據。
-4. **目前沒有 host 或 Redis hard saturation 證據。** host 尚有 19.89% 最低 idle；Redis CPU、pool
-   wait、blocked/rejected connections 都未接近設計上的飽和判斷。這只能排除目前觀測到的明顯飽和，
-   不能排除 shared-host scheduling 的邊界影響。
+| case | worker batch observations（各輪） | messages total／batch avg | encoded bytes total／batch avg | Redis presence avg／p95／p99 | Redis endpoint avg／p95／p99 | gRPC avg／p95／p99 |
+|---|---:|---:|---:|---|---|---|
+| Player 33ms | 909／909／909 | 909,000／1,000 | 106,126,010／116,750 | 3.304／5／10 | 0.258／0.5／1 | 4.114／10／10 |
+| Player 16ms | 1,871／1,875／1,874 | 1,875,000／約1,000–1,002 | 219,041,750／116,822–117,072 | 2.856／5／10 | 0.244／0.5／1 | 3.938／10／10 |
 
-### 7.2 尚不能定論的部分
+Player 16ms 的 batch observation 少於 1,875 並非遺失：三輪 `messages total` 都是 1,875,000，
+且 client／Gate terminal counters 完全對齊；這是 immediate same-trace coalescing 的結果。
 
-- `Game server-send duration` 將 Redis routing 與 gRPC completion 一起計算；現有 metrics 沒有把
-  endpoint lookup、每批 gRPC RPC、channel queue／stream wait 分開，因此不能單憑該 histogram 判定
-  gRPC implementation 還是 Redis routing 是主要成本。
-- Game profile 的 gRPC `RecvMsg`、Redis `Pipelined` 與 `BatchPlayerSender` cumulative stack 有重疊；
-  cumulative time 不能相加，也不能視為 CPU 使用率。
-- 本次是單一 macOS host、單一 Redis standalone、單一 Gate／Game process；不能外推 production
-  capacity，也不能排除 OrbStack／macOS network scheduling 或背景負載。
+Broadcast 每個 outer command 都是一次 Redis publish；三輪 Redis publish avg／p95／p99 為：
+Broadcast 33ms `0.627／1／2.5 ms`，Broadcast 16ms `0.606／1／5 ms`（各數字為三輪中位數）。
 
-## 8. Game profile-only and Go trace
+## 6. Queue、delivery 與 saturation
 
-為針對第一失守邊界，另跑 [profile-only Player 16ms / Game](artifacts/server-send-profile/20260913T125941Z/profile/player-16/run-1)，
-條件為 1000 connections、30s measured、`GOMAXPROCS=4`、`--trace`。此 run 不計入 matrix median：
+queue 是每秒 scrape 的 sampled maximum，不是連續時間的絕對最大值；所有 attempt drain 後 Game
+queue、Gate write queue、in-flight 與 readers contract 都回到要求的 terminal state。
 
-- `1,875` planned、`1,853` attempted、`22` missed；client received `1,853,000`，Gate delivery
-  `1,853,000`，WebSocket server-send write `1,853,001`。
-- CPU profile：20.11s window，5.12s samples（25.46%）。主要 flat samples 為
-  `runtime.kevent` 36.52%、`runtime.pthread_cond_wait` 22.27%、`syscall.rawsyscalln` 16.99%。
-  application cumulative stack：`pushRunner.sendPlayers`／`BatchPlayerSender.SendToPlayers` 約 11.13%，
-  Redis `Pipelined` 約 10.35%；cumulative 值有重疊，不可相加。
-- Go trace net delay：9.89s，其中 `internal/poll.(*FD).Read` 5.72s、`Accept` 4.17s；sync delay
-  23.89s，其中 `runtime.selectgo` 13.78s、`runtime.chanrecv1` 8.92s。這是 goroutine blocking
-  duration，不是 CPU time。
-- Go trace syscall delay：51.17ms，其中 `syscall.syscall` 49.94ms；scheduler delay 95.50ms，
-  `runtime.systemstack_switch` 43.62ms。這支持等待／network／scheduler 候選方向，但沒有唯一指向
-  某個 gRPC syscall。
-- heap snapshot in-use 約 6.66MB；其中 gRPC buffer pool 約 35.56%。profile collector 自身的
-  `StartCPUProfile`／trace allocations 也在 snapshot 中，不能作 steady-state allocation 結論。
+| case | Game queue messages max（median／range） | Game queue bytes max（median／range） | Gate WebSocket write queue max（median／range） | write in-flight max（median／range） |
+|---|---:|---:|---:|---:|
+| Broadcast 33ms | 0／0–0 | 0／0–0 | 0／0–0 | 0／0–0 |
+| Player 33ms | 1,000／0–1,000 | 115,890／0–116,890 | 253／0–373 | 0／0–6 |
+| Broadcast 16ms | 0／0–0 | 0／0–0 | 276／248–457 | 1／0–1 |
+| Player 16ms | 0／0–1,000 | 0／0–116,890 | 386／77–516 | 1／0–2 |
 
-原始 pprof／trace：
+| case | Game／Gate／load process raw CPU max median（range） | host idle minimum median（range） | Redis one-core CPU average median（range） | Redis commands/s average median（range） |
+|---|---:|---:|---:|---:|
+| Broadcast 33ms | 0.6%／23.2%／22.4% (0.5–0.6／22.8–23.7／21.7–22.5) | 32.13% (30.80–38.28) | 0.97% (0.95–1.04) | 279.2 (276.6–282.3) |
+| Player 33ms | 11.1%／26.2%／22.2% (9.8–12.0／26.1–27.5／22.1–22.6) | 28.84% (22.44–29.32) | 7.31% (7.12–7.40) | 29,904.3 (29,003.2–29,966.5) |
+| Broadcast 16ms | 0.9%／44.4%／43.9% (0.8–0.9／43.2–44.9／42.7–44.2) | 23.97% (23.97–26.20) | 1.34% (1.33–1.35) | 313.7 (304.3–314.6) |
+| Player 16ms | 20.1%／49.1%／42.7% (20.1–20.5／48.4–49.8／42.6–45.2) | 23.63% (23.24–25.66) | 12.31% (11.80–12.78) | 61,481.0 (59,440.4–61,521.3) |
 
-- [CPU profile](artifacts/server-send-profile/20260913T125941Z/profile/player-16/run-1/pprof/game-cpu-20s.pb.gz)
-- [heap profile](artifacts/server-send-profile/20260913T125941Z/profile/player-16/run-1/pprof/game-heap.pb.gz)
-- [goroutine snapshot](artifacts/server-send-profile/20260913T125941Z/profile/player-16/run-1/pprof/game-goroutine.txt)
-- [Go trace](artifacts/server-send-profile/20260913T125941Z/profile/player-16/run-1/pprof/game-trace-5s.out)
-- [profile status/window](artifacts/server-send-profile/20260913T125941Z/profile/player-16/run-1/pprof/status.tsv)
+上述 process CPU 是 macOS `top` raw `%CPU`，100% 約等於一個 logical CPU，不是整台 host 使用率。
+`top` 原始 sample 只有秒級 timestamp；摘要只使用 measured window 內的 samples，邊界最多有一個
+collector interval 的時間解析度限制。
+由 measured window 邊界前後最近的 `process_cpu_seconds_total` scrape delta 除以 `GOMAXPROCS=4`，各
+case 的 Game／Gate／load normalized CPU average（各輪 median）為：Broadcast 33ms `0.11%／5.27%／5.05%`、
+Player 33ms `2.30%／5.75%／4.92%`、Broadcast 16ms `0.18%／10.14%／9.93%`、Player 16ms
+`4.59%／11.22%／9.76%`。Redis commands/s 使用 `total_commands_processed` counter delta；上表
+未使用 `instantaneous_ops_per_sec` 取代 active-window rate。Redis measured-window interval max median
+（各輪 min–max）依序為 Broadcast 33ms `1.56% (1.56–1.81%)`、Player 33ms `9.16% (8.69–9.98%)`、
+Broadcast 16ms `2.26% (2.12–2.34%)`、Player 16ms `14.39% (14.32–14.90%)`；commands/s interval max
+依序為 `343.7 (339.6–382.0)`、`31,556.8 (31,479.8–31,606.2)`、`414.5 (380.0–427.1)`、
+`63,709.2 (63,374.5–63,715.4)`。
 
-## 9. Evidence index and reproducibility
+四個 case 的 Redis active samples 都有效；`connected_clients` 最大 25、`blocked_clients=0`、
+`rejected_connections=0`。Game Redis pool final snapshot 為 `total_connections=11`、
+`idle_connections=11`、`pending_requests=0`、`wait_total=0`、`timeouts_total=0`。
 
-每個 attempt directory 都包含 `run-status.json`、`metadata.txt`、`phase-events.jsonl`、
-`commands.txt`、`metrics/`、`os/`、Redis before／after 與每秒 `os/redis.tsv`。完整 campaign manifest
-為 [evidence-manifest.tsv](artifacts/server-send/20260913T123552Z/evidence-manifest.tsv)。
+## 7. Go runtime metrics
 
-四個 case 的完整 artifacts：
+下表是 drain 後 final snapshot；1000 readers 尚存是 workload contract，不應直接解讀為 leak。scheduler
+p99 是 baseline-to-final measured delta 的 bucket upper bound。
 
-- [Broadcast 33ms](artifacts/server-send/20260913T123552Z/matrix/broadcast-33)
-- [Player 33ms](artifacts/server-send/20260913T123552Z/matrix/player-33)
-- [Broadcast 16ms](artifacts/server-send/20260913T123552Z/matrix/broadcast-16)
-- [Player 16ms](artifacts/server-send/20260913T123552Z/matrix/player-16)
+| case | Game goroutines／heap MB／sched p99 | Gate goroutines／heap MB／sched p99 | load goroutines／heap MB／sched p99 |
+|---|---|---|---|
+| Broadcast 33ms | 17／3.22 (3.09–3.42)／0.918ms | 2,021／66.52 (53.07–76.60)／10.486ms | 1,010／13.34 (11.96–15.75)／0.918ms |
+| Player 33ms | 22 (22–23)／4.15 (3.74–4.24)／0.918ms (0.082–0.918) | 2,024／80.43 (71.04–80.91)／10.486ms | 1,010／17.18 (16.58–18.84)／10.486ms |
+| Broadcast 16ms | 17／2.58 (2.55–2.64)／0.082ms (0.082–0.918) | 2,021／53.08 (44.72–57.22)／10.486ms | 1,010／15.83 (12.03–16.88)／0.918ms |
+| Player 16ms | 22 (22–23)／5.10 (4.26–5.42)／0.918ms (0.082–0.918) | 2,024 (2,024–2,025)／47.69 (46.74–63.78)／10.486ms | 1,010／20.30 (12.43–20.48)／10.486ms |
 
-核心資料來源欄位：
+Gate 的 scheduler p99 10.486ms bucket 與 WebSocket queue transient pressure 值得線上持續觀察，
+但因 queue drain 為 0、delivery p99 仍為 5ms bucket，這批數據尚未構成 terminal saturation。
 
-- RPS／missed／client correctness：各 attempt `run-status.json`。
-- sender／Gate delivery／client latency：`metrics/baseline-*.prom` 與 `metrics/final-*.prom` 的
-  histogram count／sum／bucket delta。
-- queue／in-flight／readers：`metrics/*.tsv` 對應 snapshots。
-- Go runtime：各 role final `/metrics` 的 goroutines、heap、GC、`go_sched_latencies_seconds`、
-  `process_cpu_seconds_total`。
-- process／host load：`os/process-top.txt`、`os/host-top.txt`、`os/vm-stat.txt`、`os/nettop.txt`、
-  `os/netstat-before.txt`／`after`、`os/lsof-*`。
+## 8. Profile-only（不納入 matrix median）
+
+為針對 Broadcast 16ms 第 3 輪的候選 producer boundary，另執行：
+
+```sh
+examples/metrics/scripts/run-server-send-validation.sh \
+  --artifact-root artifacts/server-send-profile/20260914T032122Z \
+  --workload broadcast --interval 16ms --connections 1000 --attempts 1 \
+  --duration 30s --warmup 5s --drain 10s --profile-target game --trace
+```
+
+profile-only attempt 為 `evidence_valid` 但有 observer effect：1,875 planned、1,873 attempted、2
+missed，client／Gate delivery 為 1,873,000，沒有 transport error。它只用來診斷，不加入上方三輪
+capacity 統計。由於正式 Broadcast 16ms baseline 只有 1/3 attempts 出現 cadence failure，尚未達到
+設計要求的同一失守邊界至少 2/3；因此這次 profile 只作 exploratory evidence，不可作 root-cause 結論。
+
+原始檔案：
+
+- [CPU profile](artifacts/server-send-profile/20260914T032122Z/profile/broadcast-16/run-1/pprof/game-cpu-20s.pb.gz)
+- [heap profile](artifacts/server-send-profile/20260914T032122Z/profile/broadcast-16/run-1/pprof/game-heap.pb.gz)
+- [goroutine snapshot](artifacts/server-send-profile/20260914T032122Z/profile/broadcast-16/run-1/pprof/game-goroutine.txt)
+- [Go trace](artifacts/server-send-profile/20260914T032122Z/profile/broadcast-16/run-1/pprof/game-trace-5s.out)
+- [profile status/window](artifacts/server-send-profile/20260914T032122Z/profile/broadcast-16/run-1/pprof/status.tsv)
+
+`go tool pprof -top` CPU profile 為 20.03s window、660ms samples（3.29%）；主要 flat samples 是
+`runtime.kevent` 46.97%、`runtime.pthread_cond_wait` 27.27%、`syscall.rawsyscalln` 7.58%。
+Application cumulative stack 中 `AsyncBroadcastSender` → `RedisBroadcastSender` → `redis.Store.Publish`
+約 80ms；cumulative 值有重疊，不能相加成 CPU 使用率。
+
+`go tool pprof -top` heap in-use 約 4.28MB；其中 profile／regex／allocator／Redis pool initialization
+本身佔主要項目，不能把該 snapshot 當成 steady-state allocation 結論。
+
+由 raw trace 以 `go tool trace -pprof=net`／`-pprof=sched` 檢視，net delay 主要是 HTTP `Accept`
+約 4,176.81ms（95.57%）與 `Read` 約 193.60ms；scheduler delay 約 3.67ms，主要為
+`runtime.chansend1`。這些是 goroutine blocking／delay samples，不是 CPU time，也沒有唯一指向
+某個 gRPC syscall。profile collector 的 HTTP endpoint 與 trace 本身會影響該 run，故只作方向性證據。
+
+## 9. Bottleneck 判讀
+
+### 已由數據支持
+
+1. **同步 producer boundary 已被移除。** Player admission p99 0.5ms 以內，且 Player 16ms 三輪
+   都完整；Redis routing／gRPC completion 出現在 worker metrics，而不是 caller latency。
+2. **Player worker 的主要可觀測成本是 dependency path。** Player 16ms worker avg 約 7.47ms；其中
+   Redis presence 約 2.86ms、endpoint 約 0.24ms、gRPC 約 3.94ms。這些值可用來設定線上告警與
+   capacity review，但仍未造成 queue 長時間累積。
+3. **Broadcast 16ms 的單次失守在 cadence，非 delivery error。** 該輪 5 missed ticks 對應 5,000
+   client missing；Gate delivery、WebSocket write 與 client protocol counters 對齊，queue drain
+   成功。
+4. **目前沒有明顯 Redis pool 或硬體 CPU 飽和。** Redis active-window CPU average 最高 case 中位數約
+   12.31%、interval max 約 14.39%，pool wait／timeout 為 0；host idle minimum 的最低跨輪約 23.24%，
+   不能稱 host CPU 已滿載。
+5. **Gate 有 transient load。** Player 16ms Gate process CPU max 中位數約 49.1%，write queue
+   sampled max 中位數 386（最高 516），但 terminal queue 為 0、delivery p99 為 5ms bucket；目前
+   只能稱候選壓力，不能稱永久 saturation。
+
+### 尚不能定論
+
+- Game worker `grpc` dependency histogram 仍涵蓋 channel／stream 等待與 Gate response；沒有拆出
+  gRPC transport 內部每階段，因此不能單靠它判定 grpc-go implementation 是根因。
+- profile 的 `kevent`、condition wait、Accept／Read 主要反映 event loop 等待與 profile endpoint；
+  它支持「等待／scheduler／network 方向」，不支持「OS 是唯一根因」。
+- 單一 macOS host、單一 Gate／Game process、Redis standalone 與固定 1,000 targets 不能外推
+  production capacity，也不能判定 `MaxConcurrentStreams` 或 channel 數量應立即修改。
+
+## 10. 線上可採取的觀測與後續
+
+優先持續觀察下列 bounded metrics：
+
+- `gaming_core_game_server_send_queue_messages/bytes{operation}`：長時間上升代表 producer rate
+  大於 worker service rate；先檢查 worker 與 dependency duration，再調整 rate／capacity。
+- `gaming_core_game_server_send_queue_wait_duration_seconds`：p95／p99 接近 cadence interval 時，
+  表示 backlog 已影響 latency。
+- `gaming_core_game_server_send_worker_duration_seconds{operation,result}` 與
+  `...dependency_duration_seconds{dependency,result}`：區分 Redis presence／endpoint、Redis publish
+  與 gRPC 候選成本。
+- Gate server-send delivery、WebSocket write queue／in-flight、client received／missing：確認問題
+  發生在 Gate delivery 還是 Game producer。
+- `go_sched_latencies_seconds`、process CPU、goroutines／heap、Redis pool wait／timeout 與 host
+  CPU／memory／socket collectors：只在 application metrics 指向相同窗口時再升級為 OS/profile
+  診斷。
+
+下一個唯一必要動作是只重跑 Broadcast 16ms 三個 `evidence_valid` attempts，使用相同 binary／config
+並盡量排除不相關 host background load；若相同 producer cadence failure 在三輪中至少出現 2/3，才針對
+Game scheduler／timer path 執行 profile-only。若 Player worker queue 開始持續累積，才另行評估 per-Gate
+worker 或 transport 調整。現有證據不足以直接加入 retry、Redis pipeline、增加 gRPC channel 或宣稱硬體極限。
+
+## 11. Evidence index
+
+每個 attempt 皆保存 `run-status.json`、`metadata.txt`、`phase-events.jsonl`、`commands.txt`、
+`metrics/`、`os/`、Redis before／after 與每秒 `os/redis.tsv`。完整 manifest：
+[`evidence-manifest.tsv`](artifacts/server-send/20260914T030251Z/evidence-manifest.tsv)。
+
+四組完整 artifacts：
+
+- [Broadcast 33ms](artifacts/server-send/20260914T030251Z/matrix/broadcast-33)
+- [Player 33ms](artifacts/server-send/20260914T030251Z/matrix/player-33)
+- [Broadcast 16ms](artifacts/server-send/20260914T030251Z/matrix/broadcast-16)
+- [Player 16ms](artifacts/server-send/20260914T030251Z/matrix/player-16)
+
+數據來源對照：
+
+- workload ticks、missed、client correctness、Gate terminal：各 attempt `run-status.json`。
+- admission／queue wait／worker／dependency／batch latency：Game `metrics/baseline-game.prom` 與
+  `final-game.prom` 的 histogram count／sum／bucket delta。
+- Gate delivery／WebSocket write／queue：Gate baseline/final snapshots 與 `metrics/*.tsv`。
+- client delivery／received：load baseline/final snapshots。
+- Go runtime：各 role final `/metrics` 的 goroutines、heap、scheduler histogram 與 process CPU。
+- host/process／socket：`os/process-top.txt`、`host-top.txt`、`vm-stat.txt`、`nettop.txt`、
+  `netstat-*`、`lsof-*`。
 - Redis：`os/redis.tsv`、`redis-before.txt`、`redis-before-measured.txt`、`redis-after.txt`。
-- pprof／trace：profile run `pprof/` 與 `status.tsv`／`window.tsv`。
+- pprof／trace：profile-only artifact 的 `pprof/`、`status.tsv`、`window.tsv`。
 
-本報告數字只引用持久化 artifacts；raw artifacts 應保留在 local／CI artifact storage，不應提交到
-Git source history。測試期間未執行任何 Git staging 操作。
-
-## 10. Next diagnostic boundary
-
-若要把目前的候選縮小到 application gRPC、Redis routing 或 OS scheduling，下一輪只需針對 Player
-16ms 做同條件對照：保留相同 1000 connections 與 collector，增加可區分「Redis lookup／grouping」
-與「gRPC forwarding／response wait」的 stage metrics，或以預先解析 endpoint 的 controlled run
-隔離 Redis lookup。現有數據已足以指出應先 profile Game Player sender，但不足以支持直接修改 gRPC
-max streams、channel 數量或宣稱 OS 是唯一根因。
+raw artifacts 應保留於 local／CI artifact storage，不提交 Git source history；本次只更新本報告，
+沒有把 artifacts 加入 staging。

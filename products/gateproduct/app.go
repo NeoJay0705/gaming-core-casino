@@ -168,11 +168,14 @@ func moduleWithSnapshot(snapshot config.SourceSnapshot) framework.Module {
 					return err
 				}
 			}
-			if err := r.Provide(newGateBroadcastSender); err != nil {
+			if err := r.ProvideManaged("gate-server-send-broadcast", framework.PhaseService, newGateBroadcastSender); err != nil {
+				return err
+			}
+			if err := r.Provide(exposeGateBroadcastSender); err != nil {
 				return err
 			}
 			if broadcastConfig.Primary == "redis" {
-				if err := r.ProvideManaged("gate-server-send-broadcast", framework.PhaseIngress, newGateServerSendBroadcastRuntimeWithLogger); err != nil {
+				if err := r.ProvideManaged("gate-server-send-broadcast-runtime", framework.PhaseIngress, newGateServerSendBroadcastRuntimeWithLogger); err != nil {
 					return err
 				}
 				if err := r.Configure(func(*gateServerSendBroadcastRuntime) error { return nil }); err != nil {

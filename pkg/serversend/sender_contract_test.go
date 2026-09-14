@@ -150,11 +150,18 @@ func TestBatchPlayerSenderFallsBackOnlyForRedisRouteFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	observer := &recordingAsyncMetricsObserver{}
+	sender.SetAsyncMetricsObserver(observer)
 	if _, err := sender.SendToPlayers(context.Background(), []PlayerMessage{{LoginName: "alice", Message: Message{CommandID: 14}}}); err != nil {
 		t.Fatalf("Redis fallback send: %v", err)
 	}
 	if fallbackCalls != 1 {
 		t.Fatalf("fallback list calls = %d, want 1", fallbackCalls)
+	}
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	if observer.fallbacks != 1 {
+		t.Fatalf("fallback observations = %d, want 1", observer.fallbacks)
 	}
 	assertPlayerBatch(t, receiver, []string{"alice"})
 }

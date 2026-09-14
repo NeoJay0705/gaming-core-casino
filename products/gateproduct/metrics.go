@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/NeoJay0705/gaming-core-casino/pkg/dispatcher"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/serversend"
 	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -82,6 +83,17 @@ type gateMetrics struct {
 
 	serverSendRequests         *prometheus.CounterVec
 	serverSendDeliveryDuration *prometheus.HistogramVec
+
+	asyncQueueMessages      *prometheus.GaugeVec
+	asyncQueueBytes         *prometheus.GaugeVec
+	asyncQueueCapacityMsgs  *prometheus.GaugeVec
+	asyncQueueCapacityBytes *prometheus.GaugeVec
+	asyncQueueRejected      *prometheus.CounterVec
+	asyncQueueWait          *prometheus.HistogramVec
+	asyncWorkerDuration     *prometheus.HistogramVec
+	asyncDependencyDuration *prometheus.HistogramVec
+	asyncFallback           *prometheus.CounterVec
+	asyncDiscarded          *prometheus.CounterVec
 
 	sessionOwnershipActiveLeases  prometheus.Gauge
 	sessionOwnershipRenewals      *prometheus.CounterVec
@@ -168,6 +180,49 @@ func newGateMetrics(registerer prometheus.Registerer) (*gateMetrics, error) {
 			Help:    "Gate server-send receive-to-write terminal duration in seconds.",
 			Buckets: fineDurationBuckets,
 		}, []string{"target", "result"}),
+		asyncQueueMessages: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "gaming_core_gate_server_send_outbound_queue_messages",
+			Help: "Current queued Gate outbound Broadcast commands.",
+		}, []string{"operation"}),
+		asyncQueueBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "gaming_core_gate_server_send_outbound_queue_bytes",
+			Help: "Current deterministic encoded bytes queued for Gate outbound Broadcast.",
+		}, []string{"operation"}),
+		asyncQueueCapacityMsgs: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "gaming_core_gate_server_send_outbound_queue_capacity_messages",
+			Help: "Configured Gate outbound Broadcast queue message capacity.",
+		}, []string{"operation"}),
+		asyncQueueCapacityBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "gaming_core_gate_server_send_outbound_queue_capacity_bytes",
+			Help: "Configured Gate outbound Broadcast queue byte capacity.",
+		}, []string{"operation"}),
+		asyncQueueRejected: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gaming_core_gate_server_send_outbound_queue_rejected_total",
+			Help: "Total rejected Gate outbound Broadcast queue admissions.",
+		}, []string{"operation", "reason"}),
+		asyncQueueWait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gaming_core_gate_server_send_outbound_queue_wait_duration_seconds",
+			Help:    "Time from Gate outbound Broadcast admission until worker processing starts.",
+			Buckets: fineDurationBuckets,
+		}, []string{"operation"}),
+		asyncWorkerDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gaming_core_gate_server_send_outbound_worker_duration_seconds",
+			Help:    "Background Gate outbound Broadcast worker duration.",
+			Buckets: fineDurationBuckets,
+		}, []string{"operation", "result"}),
+		asyncDependencyDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gaming_core_gate_server_send_outbound_dependency_duration_seconds",
+			Help:    "Gate outbound Broadcast dependency duration by bounded dependency and result.",
+			Buckets: fineDurationBuckets,
+		}, []string{"operation", "dependency", "result"}),
+		asyncFallback: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gaming_core_gate_server_send_outbound_fallback_total",
+			Help: "Total Gate outbound Broadcast fallback activations.",
+		}, []string{"operation", "reason"}),
+		asyncDiscarded: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gaming_core_gate_server_send_outbound_discarded_total",
+			Help: "Total Gate outbound Broadcast commands discarded during shutdown.",
+		}, []string{"operation", "reason"}),
 		sessionOwnershipActiveLeases: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "gaming_core_gate_session_ownership_active_leases",
 			Help: "Current number of active Gate session ownership leases.",
@@ -214,6 +269,16 @@ func newGateMetrics(registerer prometheus.Registerer) (*gateMetrics, error) {
 		m.writeQueueFull,
 		m.serverSendRequests,
 		m.serverSendDeliveryDuration,
+		m.asyncQueueMessages,
+		m.asyncQueueBytes,
+		m.asyncQueueCapacityMsgs,
+		m.asyncQueueCapacityBytes,
+		m.asyncQueueRejected,
+		m.asyncQueueWait,
+		m.asyncWorkerDuration,
+		m.asyncDependencyDuration,
+		m.asyncFallback,
+		m.asyncDiscarded,
 		m.sessionOwnershipActiveLeases,
 		m.sessionOwnershipRenewals,
 		m.sessionOwnershipBatchDuration,
@@ -287,3 +352,109 @@ func (m *gateMetrics) SetSessionOwnershipOverdueLeases(value float64) {
 		m.sessionOwnershipOverdueLeases.Set(value)
 	}
 }
+
+func gateAsyncOperation(operation string) (string, bool) {
+	if operation != "broadcast" {
+		return "", false
+	}
+	return operation, true
+}
+
+func gateAsyncResult(result string) (string, bool) {
+	switch result {
+	case "success", "partial", "error":
+		return result, true
+	default:
+		return "", false
+	}
+}
+
+func gateAsyncDependency(dependency string) (string, bool) {
+	switch dependency {
+	case "redis_publish", "grpc":
+		return dependency, true
+	default:
+		return "", false
+	}
+}
+
+func (m *gateMetrics) SetQueueCapacity(operation string, messages, bytes int) {
+	operation, ok := gateAsyncOperation(operation)
+	if m == nil || !ok {
+		return
+	}
+	m.asyncQueueCapacityMsgs.WithLabelValues(operation).Set(float64(messages))
+	m.asyncQueueCapacityBytes.WithLabelValues(operation).Set(float64(bytes))
+}
+
+func (m *gateMetrics) ObserveQueue(operation string, messages, bytes int) {
+	operation, ok := gateAsyncOperation(operation)
+	if m == nil || !ok {
+		return
+	}
+	m.asyncQueueMessages.WithLabelValues(operation).Set(float64(messages))
+	m.asyncQueueBytes.WithLabelValues(operation).Set(float64(bytes))
+}
+
+func (m *gateMetrics) ObserveQueueRejected(operation, reason string) {
+	operation, ok := gateAsyncOperation(operation)
+	if m == nil || !ok {
+		return
+	}
+	switch reason {
+	case "full", "too_large", "not_running":
+	default:
+		return
+	}
+	m.asyncQueueRejected.WithLabelValues(operation, reason).Inc()
+}
+
+func (m *gateMetrics) ObserveQueueWait(operation string, elapsed time.Duration) {
+	operation, ok := gateAsyncOperation(operation)
+	if m == nil || !ok {
+		return
+	}
+	m.asyncQueueWait.WithLabelValues(operation).Observe(elapsed.Seconds())
+}
+
+func (m *gateMetrics) ObserveWorker(operation, result string, elapsed time.Duration) {
+	operation, operationOK := gateAsyncOperation(operation)
+	result, resultOK := gateAsyncResult(result)
+	if m == nil || !operationOK || !resultOK {
+		return
+	}
+	m.asyncWorkerDuration.WithLabelValues(operation, result).Observe(elapsed.Seconds())
+}
+
+func (m *gateMetrics) ObservePlayerBatch(int, int) {}
+
+func (m *gateMetrics) ObserveDependency(operation, dependency, result string, elapsed time.Duration) {
+	operation, operationOK := gateAsyncOperation(operation)
+	dependency, dependencyOK := gateAsyncDependency(dependency)
+	result, resultOK := gateAsyncResult(result)
+	if m == nil || !operationOK || !dependencyOK || !resultOK {
+		return
+	}
+	m.asyncDependencyDuration.WithLabelValues(operation, dependency, result).Observe(elapsed.Seconds())
+}
+
+func (m *gateMetrics) ObserveFallback(operation, reason string) {
+	operation, ok := gateAsyncOperation(operation)
+	if m == nil || !ok {
+		return
+	}
+	if reason != "redis_error" && reason != "no_subscriber" {
+		return
+	}
+	m.asyncFallback.WithLabelValues(operation, reason).Inc()
+}
+
+func (m *gateMetrics) ObserveDiscarded(operation, reason string, messages, _ int) {
+	operation, ok := gateAsyncOperation(operation)
+	if m == nil || !ok || reason != "shutdown_timeout" || messages <= 0 {
+		return
+	}
+	m.asyncDiscarded.WithLabelValues(operation, reason).Add(float64(messages))
+}
+
+var _ serversend.AsyncMetricsObserver = (*gateMetrics)(nil)

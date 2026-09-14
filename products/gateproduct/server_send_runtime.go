@@ -19,7 +19,9 @@ import (
 )
 
 type gateServerSendBroadcastConfig struct {
-	Primary string `config:"primary" yaml:"primary"`
+	Primary               string `config:"primary" yaml:"primary"`
+	QueueCapacityMessages int    `config:"queue_capacity_messages" yaml:"queue_capacity_messages"`
+	QueueCapacityBytes    int    `config:"queue_capacity_bytes" yaml:"queue_capacity_bytes"`
 }
 
 type gateServerSendConfig struct {
@@ -79,6 +81,15 @@ func gateServerSendBroadcast(snapshot config.SourceSnapshot) (gateServerSendBroa
 	if cfg.Primary != "redis" && cfg.Primary != "grpc" {
 		return gateServerSendBroadcastConfig{}, false, fmt.Errorf("gate broadcast: primary %q is invalid", cfg.Primary)
 	}
+	queueConfig, err := serversend.NormalizeAsyncQueueConfig(serversend.AsyncQueueConfig{
+		QueueCapacityMessages: cfg.QueueCapacityMessages,
+		QueueCapacityBytes:    cfg.QueueCapacityBytes,
+	})
+	if err != nil {
+		return gateServerSendBroadcastConfig{}, false, fmt.Errorf("gate broadcast: %w", err)
+	}
+	cfg.QueueCapacityMessages = queueConfig.QueueCapacityMessages
+	cfg.QueueCapacityBytes = queueConfig.QueueCapacityBytes
 	return cfg, true, nil
 }
 
@@ -117,41 +128,79 @@ func newGateServerSendTransport(cfg serversend.TransportConfig) (*serversend.GRP
 	return serversend.NewGRPCTransport(cfg)
 }
 
-func newGateFanoutSender(cfg gateFanoutConfig, transport *serversend.GRPCTransport) (*serversend.FanoutSender, error) {
+func newGateFanoutSender(cfg gateFanoutConfig, transport *serversend.GRPCTransport, metrics *gateMetrics) (*serversend.FanoutSender, error) {
 	directory, err := serversend.NewDNSGateDirectory(cfg.Target, nil)
 	if err != nil {
 		return nil, err
 	}
-	return serversend.NewFanoutSender(directory, transport, serversend.FanoutConfig{MaxEndpoints: cfg.MaxEndpoints})
+	sender, err := serversend.NewFanoutSender(directory, transport, serversend.FanoutConfig{MaxEndpoints: cfg.MaxEndpoints})
+	if err != nil {
+		return nil, err
+	}
+	sender.SetAsyncMetricsObserver(metrics)
+	return sender, nil
 }
 
-func newGateRedisBroadcastSender(redisClient *redis.Client, keys serversend.Keyspace) (*serversend.RedisBroadcastSender, error) {
-	return serversend.NewRedisBroadcastSender(redisstore.New(redisClient), keys)
+func newGateRedisBroadcastSender(redisClient *redis.Client, keys serversend.Keyspace, metrics *gateMetrics) (*serversend.RedisBroadcastSender, error) {
+	sender, err := serversend.NewRedisBroadcastSender(redisstore.New(redisClient), keys)
+	if err != nil {
+		return nil, err
+	}
+	sender.SetAsyncMetricsObserver(metrics)
+	return sender, nil
 }
 
 type gateBroadcastSenderInputs struct {
 	dig.In
 
-	Config gateServerSendBroadcastConfig
-	Redis  *serversend.RedisBroadcastSender `optional:"true"`
-	Fanout *serversend.FanoutSender         `optional:"true"`
+	Config  gateServerSendBroadcastConfig
+	Redis   *serversend.RedisBroadcastSender `optional:"true"`
+	Fanout  *serversend.FanoutSender         `optional:"true"`
+	Metrics *gateMetrics
+	Factory *logging.Factory
 }
 
-func newGateBroadcastSender(inputs gateBroadcastSenderInputs) (serversend.BroadcastSender, error) {
+func newGateBroadcastSender(inputs gateBroadcastSenderInputs) (*serversend.AsyncBroadcastSender, error) {
 	if inputs.Fanout == nil {
 		return nil, fmt.Errorf("gate broadcast: gRPC fan-out sender is not configured")
 	}
+	var delegate serversend.BroadcastSender
 	switch inputs.Config.Primary {
 	case "redis":
 		if inputs.Redis == nil {
 			return nil, fmt.Errorf("gate broadcast: Redis sender is not configured")
 		}
-		return serversend.NewFallbackBroadcastSender(inputs.Redis, inputs.Fanout)
+		var err error
+		fallback, err := serversend.NewFallbackBroadcastSender(inputs.Redis, inputs.Fanout)
+		if err != nil {
+			return nil, err
+		}
+		fallback.SetAsyncMetricsObserver(inputs.Metrics)
+		delegate = fallback
 	case "grpc":
-		return inputs.Fanout, nil
+		delegate = inputs.Fanout
 	default:
 		return nil, fmt.Errorf("gate broadcast: unsupported primary %q", inputs.Config.Primary)
 	}
+	var logger *logging.Logger
+	var err error
+	if inputs.Factory != nil {
+		logger, err = inputs.Factory.Component("server_send.broadcast")
+		if err != nil {
+			return nil, err
+		}
+	}
+	return serversend.NewAsyncBroadcastSender(delegate, serversend.AsyncQueueConfig{
+		QueueCapacityMessages: inputs.Config.QueueCapacityMessages,
+		QueueCapacityBytes:    inputs.Config.QueueCapacityBytes,
+	}, inputs.Metrics, logger)
+}
+
+func exposeGateBroadcastSender(sender *serversend.AsyncBroadcastSender) (serversend.BroadcastSender, error) {
+	if sender == nil {
+		return nil, fmt.Errorf("gate broadcast: async sender is not configured")
+	}
+	return sender, nil
 }
 
 // gateGRPCEndpointRegistration publishes the address of the product-level

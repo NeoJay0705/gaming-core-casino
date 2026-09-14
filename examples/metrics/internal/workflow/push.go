@@ -367,7 +367,10 @@ func (r *pushRunner) run(ctx context.Context, workload pushWorkload, done chan<-
 			var receipt serversend.Receipt
 			switch workload.mode {
 			case protocol.PushMode_PUSH_MODE_BROADCAST:
-				receipt, err = BroadcastRoom(ctx, r.broadcast, workload.roomID, protocol.PushMessageCommandID, payload)
+				receipt, err = BroadcastRoom(ctx, r.broadcast, workload.roomID, []serversend.Message{{
+					CommandID: protocol.PushMessageCommandID,
+					Payload:   payload,
+				}})
 			case protocol.PushMode_PUSH_MODE_PLAYER:
 				receipt, err = r.sendPlayers(ctx, workload.loginNames, payload)
 			}

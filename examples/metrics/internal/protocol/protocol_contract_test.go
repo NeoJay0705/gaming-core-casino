@@ -65,17 +65,25 @@ func TestExampleCommandContractIDsAndDescriptors(t *testing.T) {
 			}
 		})
 	}
-	if fields := (&BroadcastRoomCommand{}).ProtoReflect().Descriptor().Fields(); fields.Len() != 3 {
-		t.Fatalf("BroadcastRoomCommand field count = %d, want 3", fields.Len())
+	if fields := (&BroadcastRoomCommand{}).ProtoReflect().Descriptor().Fields(); fields.Len() != 2 {
+		t.Fatalf("BroadcastRoomCommand field count = %d, want 2", fields.Len())
 	}
 	for name, number := range map[protoreflect.Name]protoreflect.FieldNumber{
-		"room_id":           1,
-		"client_command_id": 2,
-		"client_payload":    3,
+		"room_id":  1,
+		"messages": 2,
 	} {
 		field := (&BroadcastRoomCommand{}).ProtoReflect().Descriptor().Fields().ByName(name)
 		if field == nil || field.Number() != number {
 			t.Fatalf("BroadcastRoomCommand.%s = %v, want field number %d", name, field, number)
+		}
+	}
+	for name, number := range map[protoreflect.Name]protoreflect.FieldNumber{
+		"client_command_id": 1,
+		"client_payload":    2,
+	} {
+		field := (&BroadcastClientMessage{}).ProtoReflect().Descriptor().Fields().ByName(name)
+		if field == nil || field.Number() != number {
+			t.Fatalf("BroadcastClientMessage.%s = %v, want field number %d", name, field, number)
 		}
 	}
 	for name, number := range map[protoreflect.Name]protoreflect.FieldNumber{

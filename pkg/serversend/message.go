@@ -48,6 +48,15 @@ var (
 	// ErrFanoutLimitExceeded indicates that a gRPC fan-out would exceed its
 	// configured endpoint bound.
 	ErrFanoutLimitExceeded = errors.New("server send: fan-out endpoint limit exceeded")
+	// ErrQueueFull indicates that an async sender cannot accept the complete
+	// request without exceeding its configured queue capacity.
+	ErrQueueFull = errors.New("server send: async queue is full")
+	// ErrEnqueueTooLarge indicates that one request is larger than the async
+	// sender's configured queue capacity and cannot ever be accepted.
+	ErrEnqueueTooLarge = errors.New("server send: enqueue exceeds queue capacity")
+	// ErrSenderNotRunning indicates an async sender that has not started or is
+	// already stopping/stopped.
+	ErrSenderNotRunning = errors.New("server send: async sender is not running")
 )
 
 // LoginName is a caller-authenticated canonical player identity. It is opaque:
@@ -151,9 +160,11 @@ func (m RequestPlayerMessage) clone() RequestPlayerMessage {
 }
 
 // Receipt records that the sender accepted a message for its documented
-// delivery path. For RequestPlayerSender, it means the message was accepted
-// into the current Gate-to-Game unary response; it does not mean Gate queued or
-// a browser received the WebSocket frame.
+// delivery path. For AsyncPlayerSender／AsyncBroadcastSender, it means the
+// defensive copy entered the process-local bounded queue; for
+// RequestPlayerSender, it means the message was accepted into the current
+// Gate-to-Game unary response. It never means a Gate queued or a browser
+// received the WebSocket frame.
 type Receipt struct{ AcceptedAt time.Time }
 
 func newReceipt() Receipt { return Receipt{AcceptedAt: time.Now()} }

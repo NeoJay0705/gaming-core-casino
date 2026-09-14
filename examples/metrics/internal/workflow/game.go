@@ -56,11 +56,24 @@ func GameModule() framework.Module {
 				return err
 			}
 			return commandDispatcher.Register(gameproduct.GateRequestChannel, dispatcher.CommandID(protocol.BroadcastRoomCommandID), func(ctx context.Context, payload []byte) error {
+				if len(payload) > serversend.DefaultMaxPayloadBytes {
+					return serversend.ErrPayloadTooLarge
+				}
 				command := new(protocol.BroadcastRoomCommand)
 				if err := proto.Unmarshal(payload, command); err != nil {
 					return fmt.Errorf("decode broadcast room command: %w", err)
 				}
-				if _, err := BroadcastRoom(ctx, broadcastSender, command.GetRoomId(), command.GetClientCommandId(), command.GetClientPayload()); err != nil {
+				messages := make([]serversend.Message, 0, len(command.GetMessages()))
+				for index, message := range command.GetMessages() {
+					if message == nil {
+						return fmt.Errorf("broadcast room message %d is nil", index)
+					}
+					messages = append(messages, serversend.Message{
+						CommandID: message.GetClientCommandId(),
+						Payload:   append([]byte(nil), message.GetClientPayload()...),
+					})
+				}
+				if _, err := BroadcastRoom(ctx, broadcastSender, command.GetRoomId(), messages); err != nil {
 					return fmt.Errorf("broadcast room: %w", err)
 				}
 				return nil
@@ -92,25 +105,37 @@ func startPushHandler(ctx context.Context, payload []byte, runner *pushRunner, s
 }
 
 // BroadcastRoom 封裝範例 Game producer 的最小 room command。outer command
-// 由 Gate handler 解碼；clientPayload 在 transport 與 Gate handler 內保持
-// opaque bytes。
-func BroadcastRoom(ctx context.Context, sender serversend.BroadcastSender, roomID string, clientCommandID uint32, clientPayload []byte) (serversend.Receipt, error) {
+// 由 Gate handler 解碼；每個 client payload 在 transport 與 Gate handler 內
+// 保持 opaque bytes。
+func BroadcastRoom(ctx context.Context, sender serversend.BroadcastSender, roomID string, messages []serversend.Message) (serversend.Receipt, error) {
 	if sender == nil {
 		return serversend.Receipt{}, fmt.Errorf("broadcast sender is required")
 	}
 	if roomID == "" {
 		return serversend.Receipt{}, fmt.Errorf("room id is required")
 	}
-	if clientCommandID == 0 {
-		return serversend.Receipt{}, fmt.Errorf("client command id is required")
+	if len(messages) == 0 {
+		return serversend.Receipt{}, fmt.Errorf("broadcast messages are required")
+	}
+	commandMessages := make([]*protocol.BroadcastClientMessage, 0, len(messages))
+	for index, message := range messages {
+		if err := message.Validate(); err != nil {
+			return serversend.Receipt{}, fmt.Errorf("broadcast message %d: %w", index, err)
+		}
+		commandMessages = append(commandMessages, &protocol.BroadcastClientMessage{
+			ClientCommandId: message.CommandID,
+			ClientPayload:   append([]byte(nil), message.Payload...),
+		})
 	}
 	payload, err := proto.Marshal(&protocol.BroadcastRoomCommand{
-		RoomId:          roomID,
-		ClientCommandId: clientCommandID,
-		ClientPayload:   append([]byte(nil), clientPayload...),
+		RoomId:   roomID,
+		Messages: commandMessages,
 	})
 	if err != nil {
 		return serversend.Receipt{}, fmt.Errorf("encode broadcast room command: %w", err)
+	}
+	if len(payload) > serversend.DefaultMaxPayloadBytes {
+		return serversend.Receipt{}, fmt.Errorf("broadcast room command: %w", serversend.ErrPayloadTooLarge)
 	}
 	return sender.Broadcast(ctx, serversend.Message{CommandID: protocol.BroadcastRoomCommandID, Payload: payload})
 }
