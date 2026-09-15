@@ -16,11 +16,9 @@ import (
 func UnaryServerInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, request any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		traceparent := ""
-		if values, ok := metadata.FromIncomingContext(ctx); ok {
-			parents := values.Get(traceParentHeader)
-			if len(parents) == 1 {
-				traceparent = parents[0]
-			}
+		parents := metadata.ValueFromIncomingContext(ctx, traceParentHeader)
+		if len(parents) == 1 {
+			traceparent = parents[0]
 		}
 		traced, err := ContinueOrNew(ctx, traceparent)
 		if err != nil {

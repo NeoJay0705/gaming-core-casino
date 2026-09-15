@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -112,7 +113,13 @@ func newGRPCLoadObserver(listenAddr string) (*grpcLoadObserver, error) {
 	}
 	registry := prometheus.NewRegistry()
 	for _, collector := range []prometheus.Collector{
-		collectors.NewGoCollector(),
+		collectors.NewGoCollector(
+			collectors.WithGoCollectorRuntimeMetrics(
+				collectors.GoRuntimeMetricsRule{
+					Matcher: regexp.MustCompile(`^/sched/latencies:seconds$`),
+				},
+			),
+		),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	} {
 		if err := registry.Register(collector); err != nil {

@@ -34,6 +34,7 @@ type grpcLoadConfig struct {
 	requestTimeout    time.Duration
 	metricsAddr       string
 	pprofAddr         string
+	orchestrationDir  string
 }
 
 func main() {
@@ -47,6 +48,7 @@ func main() {
 	flag.DurationVar(&config.requestTimeout, "request-timeout", 10*time.Second, "timeout for one unary request")
 	flag.StringVar(&config.metricsAddr, "metrics-addr", "127.0.0.1:22082", "private load metrics listen address")
 	flag.StringVar(&config.pprofAddr, "pprof-addr", "", "optional loopback pprof listen address")
+	flag.StringVar(&config.orchestrationDir, "orchestration-dir", "", "optional example-only measurement orchestration directory")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -94,6 +96,10 @@ func run(ctx context.Context, config grpcLoadConfig) error {
 	if err := validateGRPCLoadConfig(config); err != nil {
 		return err
 	}
+	orchestration, err := newGRPCLoadOrchestration(config.orchestrationDir)
+	if err != nil {
+		return err
+	}
 
 	profileServer, err := profilehttp.Start(config.pprofAddr)
 	if err != nil {
@@ -133,7 +139,28 @@ func run(ctx context.Context, config grpcLoadConfig) error {
 	if err := warmupGRPCLoadClients(ctx, clients, requestPayload, payload, config); err != nil {
 		return fmt.Errorf("warm up gRPC clients: %w", err)
 	}
-	return runMeasuredGRPCLoad(ctx, clients, requestPayload, payload, config, observer.metrics)
+	if err := orchestration.writeReady(config.clientConnections, config.warmupRequests); err != nil {
+		return fmt.Errorf("write gRPC load orchestration ready marker: %w", err)
+	}
+	if err := orchestration.waitForStart(ctx, grpcLoadOrchestrationGrace); err != nil {
+		return fmt.Errorf("wait for gRPC load orchestration start: %w", err)
+	}
+	result, runErr := runMeasuredGRPCLoadResult(ctx, clients, requestPayload, payload, config, observer.metrics)
+	if orchestration != nil {
+		if markerErr := orchestration.writeMeasured(result); markerErr != nil {
+			if runErr != nil {
+				return errors.Join(runErr, fmt.Errorf("write gRPC load orchestration measured marker: %w", markerErr))
+			}
+			return fmt.Errorf("write gRPC load orchestration measured marker: %w", markerErr)
+		}
+		if finalErr := orchestration.waitForFinalScraped(ctx, grpcLoadOrchestrationGrace); finalErr != nil {
+			if runErr != nil {
+				return errors.Join(runErr, fmt.Errorf("wait for gRPC load orchestration final scrape: %w", finalErr))
+			}
+			return fmt.Errorf("wait for gRPC load orchestration final scrape: %w", finalErr)
+		}
+	}
+	return runErr
 }
 
 func newGRPCLoadClients(config grpcLoadConfig) ([]*gatelink.Client, error) {
@@ -226,7 +253,22 @@ func warmupGRPCLoadClients(ctx context.Context, clients []*gatelink.Client, requ
 	return ctx.Err()
 }
 
+// measuredGRPCLoadResult 描述一次 measured admission 與 terminal drain，供
+// orchestration marker 與 standalone log 共用同一組時間邊界。
+type measuredGRPCLoadResult struct {
+	measurementStart time.Time
+	admissionEnd     time.Time
+	measurementEnd   time.Time
+	successful       uint64
+	failed           uint64
+}
+
 func runMeasuredGRPCLoad(ctx context.Context, clients []*gatelink.Client, requestPayload, expectedPayload []byte, config grpcLoadConfig, metrics *grpcLoadMetrics) error {
+	_, err := runMeasuredGRPCLoadResult(ctx, clients, requestPayload, expectedPayload, config, metrics)
+	return err
+}
+
+func runMeasuredGRPCLoadResult(ctx context.Context, clients []*gatelink.Client, requestPayload, expectedPayload []byte, config grpcLoadConfig, metrics *grpcLoadMetrics) (measuredGRPCLoadResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -267,20 +309,23 @@ func runMeasuredGRPCLoad(ctx context.Context, clients []*gatelink.Client, reques
 	close(startBarrier)
 	wg.Wait()
 	measurementEnd := time.Now()
-	result := struct {
-		successful uint64
-		failed     uint64
-	}{successful: successfulRequests.Load(), failed: failedWorkers.Load()}
-	measuredDuration := measurementEnd.Sub(measurementStart)
-	completedRPS := float64(result.successful) / measuredDuration.Seconds()
-	log.Printf("gRPC load complete: client_connections=%d concurrency=%d warmup_requests=%d successful_requests=%d failed_workers=%d measurement_start=%s admission_end=%s measurement_end=%s measured_duration=%s completed_rps=%.3f", config.clientConnections, config.concurrency, config.warmupRequests, result.successful, result.failed, measurementStart.Format(time.RFC3339Nano), admissionEnd.Format(time.RFC3339Nano), measurementEnd.Format(time.RFC3339Nano), measuredDuration.Round(time.Millisecond), completedRPS)
+	result := measuredGRPCLoadResult{
+		measurementStart: measurementStart,
+		admissionEnd:     admissionEnd,
+		measurementEnd:   measurementEnd,
+		successful:       successfulRequests.Load(),
+		failed:           failedWorkers.Load(),
+	}
+	measuredDuration := result.measurementEnd.Sub(result.measurementStart)
+	completedRPS := float64(result.successful) / result.admissionEnd.Sub(result.measurementStart).Seconds()
+	log.Printf("gRPC load complete: client_connections=%d concurrency=%d warmup_requests=%d successful_requests=%d failed_workers=%d measurement_start=%s admission_end=%s measurement_end=%s measured_duration=%s completed_rps=%.3f", config.clientConnections, config.concurrency, config.warmupRequests, result.successful, result.failed, result.measurementStart.Format(time.RFC3339Nano), result.admissionEnd.Format(time.RFC3339Nano), result.measurementEnd.Format(time.RFC3339Nano), measuredDuration.Round(time.Millisecond), completedRPS)
 	errorMu.Lock()
 	err := firstErr
 	errorMu.Unlock()
 	if err != nil {
-		return err
+		return result, err
 	}
-	return ctx.Err()
+	return result, ctx.Err()
 }
 
 func runMeasuredGRPCWorker(ctx context.Context, client *gatelink.Client, requestPayload, expectedPayload []byte, workerIndex int, admissionEnd time.Time, config grpcLoadConfig, metrics *grpcLoadMetrics) (uint64, error) {

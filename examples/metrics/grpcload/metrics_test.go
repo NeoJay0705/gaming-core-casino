@@ -109,6 +109,9 @@ func TestGRPCLoadObserverServesOnlyMetricsAndShutsDown(t *testing.T) {
 	if !strings.Contains(string(body), "go_goroutines ") {
 		t.Fatalf("metrics body does not contain Go runtime metrics:\n%s", body)
 	}
+	if !strings.Contains(string(body), "go_sched_latencies_seconds_bucket") {
+		t.Fatalf("metrics body does not contain scheduler latency metrics:\n%s", body)
+	}
 
 	response, err = client.Get("http://" + observer.Addr() + "/ready")
 	if err != nil {

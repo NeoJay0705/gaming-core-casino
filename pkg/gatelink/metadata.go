@@ -149,15 +149,19 @@ func withIncomingRequestContext(ctx context.Context) (context.Context, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	metadataValues, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return nil, errors.New("gatelink: request metadata is required")
-	}
-	connectionID, err := singleMetadataValue(metadataValues, connectionIDMetadataKey, true)
+	connectionID, err := singleMetadataValues(
+		metadata.ValueFromIncomingContext(ctx, connectionIDMetadataKey),
+		connectionIDMetadataKey,
+		true,
+	)
 	if err != nil {
 		return nil, err
 	}
-	gateID, err := singleMetadataValue(metadataValues, gateIDMetadataKey, false)
+	gateID, err := singleMetadataValues(
+		metadata.ValueFromIncomingContext(ctx, gateIDMetadataKey),
+		gateIDMetadataKey,
+		false,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -166,8 +170,10 @@ func withIncomingRequestContext(ctx context.Context) (context.Context, error) {
 	}), nil
 }
 
-func singleMetadataValue(values metadata.MD, key string, required bool) (string, error) {
-	entries := values.Get(key)
+// singleMetadataValues 驗證 bounded lookup 取得的單一 metadata key。
+// 仍保留原本的 duplicate、空值與錯誤文字 contract；呼叫端不需要建立
+// 完整 metadata.MD copy。
+func singleMetadataValues(entries []string, key string, required bool) (string, error) {
 	if len(entries) == 0 {
 		if required {
 			return "", errors.New("gatelink: request source connection_id is required")

@@ -29,6 +29,9 @@ type Config struct {
 	// WriteBufferSizeBytes 為正值時設定每條 gRPC transport 的 write buffer；
 	// 0 不傳入 option，保留 grpc-go default。
 	WriteBufferSizeBytes int `config:"write_buffer_size_bytes" yaml:"write_buffer_size_bytes"`
+	// StreamWorkers 為正值時啟用 grpc-go reusable stream workers；0 保留
+	// grpc-go default。此 option 只降低 goroutine stack churn，不限制並行 RPC。
+	StreamWorkers uint32 `config:"stream_workers" yaml:"stream_workers"`
 }
 
 // Server owns one listener and one grpc.Server. Services must be registered
@@ -71,12 +74,15 @@ func newServer(cfg Config, logger *logging.Logger) (*Server, error) {
 	if cfg.WriteBufferSizeBytes < 0 {
 		return nil, errors.New("grpc server: write_buffer_size_bytes must not be negative")
 	}
-	serverOptions := make([]grpc.ServerOption, 0, 3)
+	serverOptions := make([]grpc.ServerOption, 0, 4)
 	if cfg.MaxConcurrentStreams > 0 {
 		serverOptions = append(serverOptions, grpc.MaxConcurrentStreams(cfg.MaxConcurrentStreams))
 	}
 	if cfg.WriteBufferSizeBytes > 0 {
 		serverOptions = append(serverOptions, grpc.WriteBufferSize(cfg.WriteBufferSizeBytes))
+	}
+	if cfg.StreamWorkers > 0 {
+		serverOptions = append(serverOptions, grpc.NumStreamWorkers(cfg.StreamWorkers))
 	}
 	serverOptions = append(serverOptions, grpc.ChainUnaryInterceptor(
 		logging.UnaryServerInterceptor(),

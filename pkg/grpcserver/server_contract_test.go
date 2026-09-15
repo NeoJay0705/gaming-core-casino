@@ -3,6 +3,9 @@ package grpcserver
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,12 +26,94 @@ func TestNewValidatesListenAddress(t *testing.T) {
 			}
 		})
 	}
-	server, err := New(Config{ListenAddr: " 127.0.0.1:0 ", MaxConcurrentStreams: 7, WriteBufferSizeBytes: 64 * 1024})
+	server, err := New(Config{ListenAddr: " 127.0.0.1:0 ", MaxConcurrentStreams: 7, WriteBufferSizeBytes: 64 * 1024, StreamWorkers: 4})
 	if err != nil {
 		t.Fatalf("New(valid) error = %v", err)
 	}
-	if server.cfg.ListenAddr != "127.0.0.1:0" || server.cfg.MaxConcurrentStreams != 7 || server.cfg.WriteBufferSizeBytes != 64*1024 {
+	if server.cfg.ListenAddr != "127.0.0.1:0" || server.cfg.MaxConcurrentStreams != 7 || server.cfg.WriteBufferSizeBytes != 64*1024 || server.cfg.StreamWorkers != 4 {
 		t.Fatalf("normalized config = %#v", server.cfg)
+	}
+}
+
+func TestStreamWorkersVariantsServeUnary(t *testing.T) {
+	for _, workers := range []uint32{0, 1, 4} {
+		t.Run(fmt.Sprintf("workers-%d", workers), func(t *testing.T) {
+			server := newContractServer(t, 0, workers)
+			registerTestService(t, server, "contract.Workers")
+			if err := server.Start(context.Background()); err != nil {
+				t.Fatalf("start: %v", err)
+			}
+			t.Cleanup(func() { _ = server.Stop(context.Background()) })
+			conn, err := grpc.NewClient(server.Addr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				t.Fatalf("new client: %v", err)
+			}
+			t.Cleanup(func() { _ = conn.Close() })
+			response := new(wrapperspb.StringValue)
+			if err := conn.Invoke(context.Background(), "/contract.Workers/Ping", new(emptypb.Empty), response); err != nil {
+				t.Fatalf("invoke: %v", err)
+			}
+			if response.GetValue() != "ok" {
+				t.Fatalf("response = %q, want ok", response.GetValue())
+			}
+		})
+	}
+}
+
+func TestStreamWorkersDoNotBecomeConcurrencyLimit(t *testing.T) {
+	server := newContractServer(t, 0, 1)
+	var calls atomic.Int32
+	var releaseOnce sync.Once
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseFirst) }) })
+	registerTestServiceWithHandler(t, server, "contract.Blocking", func(ctx context.Context, _ *emptypb.Empty) (*wrapperspb.StringValue, error) {
+		if calls.Add(1) == 1 {
+			close(firstEntered)
+			select {
+			case <-releaseFirst:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return &wrapperspb.StringValue{Value: "ok"}, nil
+	})
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+	conn, err := grpc.NewClient(server.Addr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	firstDone := make(chan error, 1)
+	go func() {
+		response := new(wrapperspb.StringValue)
+		firstDone <- conn.Invoke(context.Background(), "/contract.Blocking/Ping", new(emptypb.Empty), response)
+	}()
+	select {
+	case <-firstEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first blocking RPC did not enter handler")
+	}
+	secondContext, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	secondResponse := new(wrapperspb.StringValue)
+	if err := conn.Invoke(secondContext, "/contract.Blocking/Ping", new(emptypb.Empty), secondResponse); err != nil {
+		t.Fatalf("second RPC error = %v; stream workers must not be a hard limit", err)
+	}
+	if secondResponse.GetValue() != "ok" {
+		t.Fatalf("second response = %q, want ok", secondResponse.GetValue())
+	}
+	releaseOnce.Do(func() { close(releaseFirst) })
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first RPC error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first RPC did not finish after release")
 	}
 }
 
@@ -209,9 +294,13 @@ var contractUnaryServiceDesc = grpc.ServiceDesc{
 	}},
 }
 
-func newContractServer(t *testing.T, maxStreams uint32) *Server {
+func newContractServer(t *testing.T, maxStreams uint32, workers ...uint32) *Server {
 	t.Helper()
-	server, err := New(Config{ListenAddr: "127.0.0.1:0", MaxConcurrentStreams: maxStreams})
+	cfg := Config{ListenAddr: "127.0.0.1:0", MaxConcurrentStreams: maxStreams}
+	if len(workers) > 0 {
+		cfg.StreamWorkers = workers[0]
+	}
+	server, err := New(cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

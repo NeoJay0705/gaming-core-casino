@@ -47,6 +47,35 @@ func TestUnaryServerInterceptorContractDuplicateParentStartsNewTrace(t *testing.
 	}
 }
 
+func TestUnaryServerInterceptorContractMissingOrMalformedParentStartsNewTrace(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		values []string
+	}{
+		{name: "missing"},
+		{name: "malformed", values: []string{"not-a-traceparent"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := metadata.NewIncomingContext(context.Background(), metadata.MD{})
+			if len(test.values) > 0 {
+				ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(traceParentHeader, test.values[0]))
+			}
+			called := false
+			_, err := UnaryServerInterceptor()(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/demo.Service/Forward"}, func(ctx context.Context, _ any) (any, error) {
+				called = true
+				traceID, spanID, ok := IDsFromContext(ctx)
+				if !ok || traceID == "" || spanID == "" {
+					t.Fatalf("root trace IDs = %q/%q/%t", traceID, spanID, ok)
+				}
+				return nil, nil
+			})
+			if err != nil || !called {
+				t.Fatalf("interceptor result = called:%t error:%v", called, err)
+			}
+		})
+	}
+}
+
 func TestUnaryClientInterceptorContractInjectsChildAndPreservesMetadata(t *testing.T) {
 	parentCtx, err := ContinueOrNew(context.Background(), contractTraceparent)
 	if err != nil {

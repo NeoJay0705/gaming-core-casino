@@ -14,6 +14,8 @@ grpc:
     listen_addr: "127.0.0.1:19090"
     # 非必要：每條 HTTP/2 connection 的 concurrent streams；0 使用 grpc-go default（default）。
     # max_concurrent_streams: 0
+    # 非必要：experimental reusable stream workers；0 保留 grpc-go default，且不限制 RPC concurrency。
+    # stream_workers: 0
     # 非必要：每條 Game gRPC connection 的 write buffer bytes；0 保留 grpc-go default。
     # write_buffer_size_bytes: 0
   clients:

@@ -72,6 +72,39 @@ func TestGameProductRegistersGateRequestOnProductGRPCServer(t *testing.T) {
 	}
 }
 
+func TestGameProductGRPCServerConfigBindsStreamWorkersStrictly(t *testing.T) {
+	writeConfig := func(serverField string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "game.yaml")
+		contents := observabilityTestYAML + "grpc:\n  server:\n    listen_addr: 127.0.0.1:0\n" + serverField
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	path := writeConfig("    stream_workers: 4\n")
+	snapshot, err := config.LoadInputs(context.Background(), config.ConfigInputs{MergedPaths: []string{path}}, "CORE_CASINO_GAME_GRPC_STREAM_WORKERS_BIND_TEST__")
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	cfg, err := gameGRPCServerConfig(snapshot)
+	if err != nil {
+		t.Fatalf("gameGRPCServerConfig(valid): %v", err)
+	}
+	if cfg.StreamWorkers != 4 {
+		t.Fatalf("stream_workers = %d, want 4", cfg.StreamWorkers)
+	}
+
+	unknownPath := writeConfig("    stream_workers_typo: 4\n")
+	unknownSnapshot, err := config.LoadInputs(context.Background(), config.ConfigInputs{MergedPaths: []string{unknownPath}}, "CORE_CASINO_GAME_GRPC_STREAM_WORKERS_UNKNOWN_TEST__")
+	if err != nil {
+		t.Fatalf("load unknown config: %v", err)
+	}
+	if _, err := gameGRPCServerConfig(unknownSnapshot); err == nil || !strings.Contains(err.Error(), "unknown config paths") {
+		t.Fatalf("unknown stream_workers field error = %v, want strict config error", err)
+	}
+}
+
 func TestGameProductAllowsMissingHandlerUntilDispatcherIsInstalled(t *testing.T) {
 	path := writeGameGRPCConfig(t, "")
 	var server *grpcserver.Server

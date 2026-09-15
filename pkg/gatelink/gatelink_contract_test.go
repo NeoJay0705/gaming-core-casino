@@ -252,6 +252,49 @@ func TestContractRejectsDuplicateGateIDMetadata(t *testing.T) {
 	}
 }
 
+func TestContractIncomingMetadataBoundedLookupPreservesValidation(t *testing.T) {
+	cases := []struct {
+		name       string
+		connection []string
+		gate       []string
+		want       RequestSource
+		wantError  string
+	}{
+		{name: "trimmed values", connection: []string{" connection-1 "}, gate: []string{" gate-a "}, want: RequestSource{ConnectionID: "connection-1", GateID: "gate-a"}},
+		{name: "optional gate missing", connection: []string{"connection-1"}, want: RequestSource{ConnectionID: "connection-1"}},
+		{name: "missing connection", gate: []string{"gate-a"}, wantError: "gatelink: request source connection_id is required"},
+		{name: "empty connection", connection: []string{"   "}, wantError: "gatelink: request source connection_id is required"},
+		{name: "duplicate connection", connection: []string{"a", "b"}, wantError: "duplicate " + connectionIDMetadataKey},
+		{name: "duplicate gate", connection: []string{"connection-1"}, gate: []string{"a", "b"}, wantError: "duplicate " + gateIDMetadataKey},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pairs := make([]string, 0, len(tc.connection)+len(tc.gate))
+			for _, value := range tc.connection {
+				pairs = append(pairs, connectionIDMetadataKey, value)
+			}
+			for _, value := range tc.gate {
+				pairs = append(pairs, gateIDMetadataKey, value)
+			}
+			ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(pairs...))
+			got, err := withIncomingRequestContext(ctx)
+			if tc.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("error = %v, want %q", err, tc.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("withIncomingRequestContext: %v", err)
+			}
+			requestContext, ok := GateRequestContextFrom(got)
+			if !ok || requestContext.Source != tc.want {
+				t.Fatalf("source = %#v/%t, want %#v/true", requestContext.Source, ok, tc.want)
+			}
+		})
+	}
+}
+
 func TestContractRequiresClientTarget(t *testing.T) {
 	_, err := NewClient(ClientConfig{})
 	if err == nil || !strings.Contains(err.Error(), "target is required") {
