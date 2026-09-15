@@ -7,6 +7,7 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/infra/database"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/infra/localmq"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/infra/redis"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/infra/rocketmq"
 	"github.com/prometheus/client_golang/prometheus"
@@ -20,6 +21,12 @@ type redisInputs struct {
 }
 
 type databaseInputs struct {
+	dig.In
+	Snapshot   config.SourceSnapshot
+	Registerer prometheus.Registerer `optional:"true"`
+}
+
+type localMQInputs struct {
 	dig.In
 	Snapshot   config.SourceSnapshot
 	Registerer prometheus.Registerer `optional:"true"`
@@ -51,6 +58,19 @@ func newDatabase(inputs databaseInputs) (*database.Client, error) {
 	return client, nil
 }
 
+func newLocalMQ(inputs localMQInputs) (*localmq.Client, error) {
+	client, err := localmq.New(inputs.Snapshot)
+	if err != nil {
+		return nil, err
+	}
+	if inputs.Registerer != nil {
+		if err := client.RegisterMetrics(inputs.Registerer); err != nil {
+			return nil, fmt.Errorf("infra localmq metrics: %w", err)
+		}
+	}
+	return client, nil
+}
+
 // Module registers the common infrastructure resources. Each resource remains
 // lazy: it is constructed and enters the lifecycle only if an application hook
 // actually depends on its concrete type.
@@ -67,5 +87,8 @@ func Module(r framework.Registry) error {
 	if err := r.ProvideManaged("database", framework.PhaseInfrastructure, newDatabase); err != nil {
 		return err
 	}
-	return r.ProvideManaged("rocketmq", framework.PhaseInfrastructure, rocketmq.New)
+	if err := r.ProvideManaged("rocketmq", framework.PhaseInfrastructure, rocketmq.New); err != nil {
+		return err
+	}
+	return r.ProvideManaged("localmq", framework.PhaseInfrastructure, newLocalMQ)
 }

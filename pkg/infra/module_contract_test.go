@@ -12,6 +12,7 @@ import (
 	"github.com/NeoJay0705/gaming-core-casino/pkg/config"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/framework"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/infra/database"
+	"github.com/NeoJay0705/gaming-core-casino/pkg/infra/localmq"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/infra/redis"
 	"github.com/NeoJay0705/gaming-core-casino/pkg/infra/rocketmq"
 	"github.com/alicebob/miniredis/v2"
@@ -23,16 +24,17 @@ func TestModuleContractRegistersAllInfrastructureAsManagedResources(t *testing.T
 	if err := Module(registry); err != nil {
 		t.Fatalf("register infra module: %v", err)
 	}
-	if got, want := registry.names, []string{"redis", "database", "rocketmq"}; !reflect.DeepEqual(got, want) {
+	if got, want := registry.names, []string{"redis", "database", "rocketmq", "localmq"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("managed names = %v, want %v", got, want)
 	}
-	if got, want := registry.phases, []framework.Phase{framework.PhaseInfrastructure, framework.PhaseInfrastructure, framework.PhaseInfrastructure}; !reflect.DeepEqual(got, want) {
+	if got, want := registry.phases, []framework.Phase{framework.PhaseInfrastructure, framework.PhaseInfrastructure, framework.PhaseInfrastructure, framework.PhaseInfrastructure}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("managed phases = %v, want %v", got, want)
 	}
 	for i, want := range []reflect.Type{
 		reflect.TypeOf((*redis.Client)(nil)),
 		reflect.TypeOf((*database.Client)(nil)),
 		reflect.TypeOf((*rocketmq.Client)(nil)),
+		reflect.TypeOf((*localmq.Client)(nil)),
 	} {
 		got := reflect.TypeOf(registry.constructors[i]).Out(0)
 		if got != want {
@@ -199,6 +201,9 @@ func TestExampleConfigBuildsAllInfrastructureResources(t *testing.T) {
 	}
 	if _, err := rocketmq.New(snapshot); err != nil {
 		t.Fatalf("build RocketMQ resource: %v", err)
+	}
+	if _, err := localmq.New(snapshot); err != nil {
+		t.Fatalf("build local MQ resource: %v", err)
 	}
 }
 

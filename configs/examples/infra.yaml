@@ -62,3 +62,33 @@ rocketmq:
   # namespace: ""
   # access_key: ""
   # secret_key: ""
+
+local_mq:
+  # 必填：已由 maintenance bootstrap 建立的 RWX durable root。
+  root_path: "/var/lib/gaming-core/local-mq"
+
+  # 必填：同一個 RWX storage root 的 immutable identity，必須是 UUIDv7。
+  storage_id: "01993e11-8d3a-7c8f-a7ce-2ab21df8d410"
+
+  # bytes/records；root control 建立後不可由 pod 設定靜默覆寫。
+  publish_queue_capacity: 4096
+  group_commit_max_messages: 256
+  group_commit_max_bytes: 1048576
+  group_commit_max_wait: "2ms"
+  segment_max_bytes: 134217728
+  segment_max_age: "1h"
+  producer_stop_free_bytes: 1073741824
+  recovery_reserve_bytes: 536870912
+  max_clock_skew: "1s"
+
+  consumer:
+    heartbeat_interval: "3s"
+    membership_timeout: "15s"
+    reconcile_interval: "5s"
+    worker_concurrency: 8
+    batch_max_messages: 500
+    batch_max_bytes: 4194304
+    batch_max_wait: "10ms"
+    handler_timeout: "30s"
+    checkpoint_max_records: 5000
+    checkpoint_max_delay: "100ms"
